@@ -7,10 +7,13 @@
 #
 #   iwr https://raw.githubusercontent.com/vonzelle-vzt/vzt-flow/main/scripts/install.ps1 -UseBasicParsing | iex
 #
+# The repo is public, so no authentication is needed for the default path.
+#
 # Env / params:
 #   -InstallYes         never prompt
-#   $env:GITHUB_TOKEN    used for asset download when `gh` isn't available
-#                        (required while the repo is private)
+#   $env:GITHUB_TOKEN    optional; only needed as a fallback if `gh` isn't
+#                        installed and unauthenticated GitHub API requests
+#                        are rate-limited (60/hr per IP), or for a private fork
 
 param(
     [switch]$InstallYes
@@ -44,24 +47,19 @@ function Get-LatestSetupExe {
         return
     }
 
+    # Repo is public — GITHUB_TOKEN is optional. Set it to lift GitHub's
+    # 60/hr-per-IP unauthenticated API rate limit, or to fetch from a
+    # private fork.
     $token = $env:GITHUB_TOKEN
-    if (-not $token) {
-        throw "repo is private and 'gh' is not installed — set `$env:GITHUB_TOKEN` (a PAT with 'repo' scope) or install gh: https://cli.github.com"
-    }
-
-    Write-Host "==> downloading via GitHub REST API (GITHUB_TOKEN)"
-    $headers = @{
-        Authorization = "Bearer $token"
-        Accept        = "application/vnd.github+json"
-    }
+    Write-Host "==> downloading via GitHub REST API$(if ($token) { ' (authenticated)' })"
+    $headers = @{ Accept = "application/vnd.github+json" }
+    if ($token) { $headers["Authorization"] = "Bearer $token" }
     $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest" -Headers $headers
     $asset = $release.assets | Where-Object { $_.name -like "*-setup.exe" } | Select-Object -First 1
     if (-not $asset) { throw "no *-setup.exe asset found on latest release" }
 
-    $dlHeaders = @{
-        Authorization = "Bearer $token"
-        Accept        = "application/octet-stream"
-    }
+    $dlHeaders = @{ Accept = "application/octet-stream" }
+    if ($token) { $dlHeaders["Authorization"] = "Bearer $token" }
     $outFile = Join-Path $DestDir $asset.name
     Invoke-WebRequest -Uri $asset.url -Headers $dlHeaders -OutFile $outFile
 }

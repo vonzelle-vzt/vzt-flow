@@ -8,11 +8,14 @@
 # MCP server to ~/.vzt-flow/mcp (registering it with `claude mcp add` when
 # the `claude` CLI is present).
 #
+# The repo is public, so no authentication is needed for the default path.
+#
 # Env flags:
 #   INSTALL_YES=1   never prompt (assume yes to overwrite prompts)
 #   NO_LAUNCH=1     skip `open -a "VZT Flow"` at the end
-#   GITHUB_TOKEN    used for asset download when `gh` isn't available
-#                   (required while the repo is private)
+#   GITHUB_TOKEN    optional; only needed as a fallback if `gh` isn't
+#                   installed and unauthenticated GitHub API requests are
+#                   rate-limited (60/hr per IP), or for a private fork
 set -euo pipefail
 
 REPO="vonzelle-vzt/vzt-flow"
@@ -40,13 +43,13 @@ cleanup() { rm -rf "$WORKDIR"; }
 trap cleanup EXIT
 
 # --- download helpers -----------------------------------------------------
-# Two download paths: `gh release download` (works out of the box for the
-# repo owner / anyone with `gh auth login`, and transparently handles the
-# private-repo case), or plain curl against the GitHub REST API using a
-# GITHUB_TOKEN (needed for private-repo asset downloads without `gh`).
-# Both branches leave files in $WORKDIR; the script works unchanged once
-# the repo goes public since `gh` needs no auth for public repos and the
-# curl path degrades to unauthenticated requests.
+# Two download paths: `gh release download` (no auth needed for this public
+# repo — works out of the box whether or not you've run `gh auth login`),
+# or plain curl against the GitHub REST API, authenticated with
+# GITHUB_TOKEN if set, otherwise falling back to an unauthenticated request
+# (fine for occasional installs; GitHub rate-limits unauthenticated API
+# calls to 60/hr per IP, which GITHUB_TOKEN lifts). Both branches leave
+# files in $WORKDIR.
 
 HAVE_GH=0
 if command -v gh >/dev/null 2>&1; then
@@ -61,12 +64,16 @@ download_with_gh() {
 download_with_token() {
   local pattern="$1"
   local token="${GITHUB_TOKEN:-}"
-  [ -n "$token" ] || die "repo is private and 'gh' is not installed — set GITHUB_TOKEN (a PAT with 'repo' scope) or install gh: https://cli.github.com"
+  # Repo is public — GITHUB_TOKEN is optional. Set it to lift GitHub's
+  # 60/hr-per-IP unauthenticated API rate limit, or to fetch from a
+  # private fork.
+  local auth_header=()
+  [ -n "$token" ] && auth_header=(-H "Authorization: Bearer ${token}")
 
   local api="https://api.github.com/repos/${REPO}/releases/latest"
   local assets_json
-  assets_json="$(curl -fsSL -H "Authorization: Bearer ${token}" -H "Accept: application/vnd.github+json" "$api")" \
-    || die "failed to query GitHub releases API for ${REPO} — check GITHUB_TOKEN and repo access"
+  assets_json="$(curl -fsSL "${auth_header[@]}" -H "Accept: application/vnd.github+json" "$api")" \
+    || die "failed to query GitHub releases API for ${REPO} (rate-limited? set GITHUB_TOKEN) or install gh: https://cli.github.com"
 
   # Portable enough without jq: pull "browser_download_url" / "id" / "name"
   # lines and match by simple glob translated to a regex.
@@ -77,7 +84,7 @@ download_with_token() {
   while IFS=$'\t' read -r name url; do
     if [[ "$name" =~ ^${regex}$ ]]; then
       log "downloading $name"
-      curl -fsSL -H "Authorization: Bearer ${token}" \
+      curl -fsSL "${auth_header[@]}" \
         -H "Accept: application/octet-stream" \
         -o "$WORKDIR/$name" "$url"
       return 0
