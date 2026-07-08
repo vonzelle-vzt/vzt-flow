@@ -15,7 +15,7 @@ pub type Snippets = HashMap<String, String>;
 
 pub fn seed_snippets() -> Snippets {
     let mut map = HashMap::new();
-    map.insert("my email".to_string(), "vonzelle@vzttechconsulting.com".to_string());
+    map.insert("my email".to_string(), "you@example.com".to_string());
     map
 }
 
@@ -89,14 +89,14 @@ mod tests {
 
     #[test]
     fn expands_bare_trigger() {
-        assert_eq!(expand("my email", &snippets()), Some("vonzelle@vzttechconsulting.com".to_string()));
+        assert_eq!(expand("my email", &snippets()), Some("you@example.com".to_string()));
     }
 
     #[test]
     fn expands_with_insert_prefix() {
         assert_eq!(
             expand("insert my email", &snippets()),
-            Some("vonzelle@vzttechconsulting.com".to_string())
+            Some("you@example.com".to_string())
         );
     }
 
@@ -104,11 +104,11 @@ mod tests {
     fn is_case_and_punctuation_insensitive() {
         assert_eq!(
             expand("My Email!", &snippets()),
-            Some("vonzelle@vzttechconsulting.com".to_string())
+            Some("you@example.com".to_string())
         );
         assert_eq!(
             expand("Insert, My Email.", &snippets()),
-            Some("vonzelle@vzttechconsulting.com".to_string())
+            Some("you@example.com".to_string())
         );
     }
 

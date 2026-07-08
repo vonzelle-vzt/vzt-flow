@@ -3,8 +3,25 @@ name: build
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "**.md"
+      - "scripts/**"
+      - "LICENSE"
   pull_request:
     branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "**.md"
+      - "scripts/**"
+      - "LICENSE"
+
+# A new push supersedes any still-running build for the same ref — Windows
+# and macOS runners are expensive (2x/10x minute multipliers on private
+# repos) and a stale commit's result is worthless.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
