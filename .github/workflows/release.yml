@@ -53,12 +53,25 @@ jobs:
           echo "path=$DMG" >> "$GITHUB_OUTPUT"
           echo "name=$(basename "$DMG")" >> "$GITHUB_OUTPUT"
 
-      - name: Package CLI tarball (flow binary + mcp/dist)
+      - name: Prune MCP node_modules to production deps
+        # dist/index.js imports @modelcontextprotocol/sdk and zod at
+        # runtime — those live in node_modules, not dist/, so the release
+        # tarball needs them alongside dist/ or `node dist/index.js` fails
+        # with ERR_MODULE_NOT_FOUND on a machine that never ran `npm ci`.
+        # `npm ci` above installed devDependencies too (needed for the
+        # `npm run build` typecheck/compile); prune them now that dist/
+        # is already built.
+        working-directory: mcp
+        run: npm prune --omit=dev
+
+      - name: Package CLI tarball (flow binary + mcp/dist + mcp/node_modules)
         run: |
           STAGE=$(mktemp -d)/vzt-flow-cli-macos-aarch64
           mkdir -p "$STAGE/bin" "$STAGE/mcp"
           cp target/aarch64-apple-darwin/release/flow "$STAGE/bin/flow"
           cp -R mcp/dist "$STAGE/mcp/dist"
+          cp -R mcp/node_modules "$STAGE/mcp/node_modules"
+          cp mcp/package.json "$STAGE/mcp/package.json"
           cat > "$STAGE/mcp/README-snippet.md" <<'EOF'
           # VZT Flow MCP server
 
@@ -67,7 +80,8 @@ jobs:
               claude mcp add vzt-flow --scope user -- node <path-to>/mcp/dist/index.js
 
           The `flow` CLI must be on your PATH (or set VZT_FLOW_BIN) for the
-          MCP server's listen/transcribe tools to work.
+          MCP server's listen/transcribe tools to work. node_modules/ is
+          bundled alongside dist/ — dist/index.js needs it at runtime.
           EOF
           tar -C "$(dirname "$STAGE")" -czf vzt-flow-cli-macos-aarch64.tar.gz "$(basename "$STAGE")"
 

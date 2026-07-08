@@ -176,7 +176,16 @@ MCP_DEST="$HOME/.vzt-flow/mcp"
 log "installing MCP server to $MCP_DEST"
 mkdir -p "$HOME/.vzt-flow"
 rm -rf "$MCP_DEST"
+# Flatten dist/'s contents directly into $MCP_DEST so the entry point is
+# ~/.vzt-flow/mcp/index.js (not .../mcp/dist/index.js) — that's the path
+# `claude mcp add` below registers.
 cp -R "$CLI_SRC_DIR/mcp/dist" "$MCP_DEST"
+# node_modules is bundled alongside dist/ in the release tarball — the
+# compiled JS imports @modelcontextprotocol/sdk and zod at runtime, so it
+# won't run standalone without them. Place it as a sibling of index.js so
+# Node's module resolution finds it immediately.
+[ -d "$CLI_SRC_DIR/mcp/node_modules" ] && cp -R "$CLI_SRC_DIR/mcp/node_modules" "$MCP_DEST/node_modules"
+[ -f "$CLI_SRC_DIR/mcp/package.json" ] && cp "$CLI_SRC_DIR/mcp/package.json" "$MCP_DEST/package.json"
 cp "$CLI_SRC_DIR/mcp/README-snippet.md" "$HOME/.vzt-flow/mcp-README.md" 2>/dev/null || true
 
 MCP_ENTRY="$MCP_DEST/index.js"
