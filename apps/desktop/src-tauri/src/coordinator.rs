@@ -36,6 +36,10 @@ pub enum CoordinatorMsg {
         /// where the user actually was when they finished talking.
         app_bundle_id: Option<String>,
         profile: ProfileRule,
+        /// Set when this recording was triggered by the daemon socket's
+        /// `listen` command: the pipeline finishes by replying here instead
+        /// of pasting.
+        listen_reply: Option<Sender<Result<ListenOutcome, String>>>,
     },
     /// The cleanup pipeline (LLM or timeout/fallback) finished; carries
     /// everything needed to paste + log history.
@@ -45,12 +49,33 @@ pub enum CoordinatorMsg {
         mode_label: String,
         audio_duration: Duration,
         app_bundle_id: Option<String>,
+        listen_reply: Option<Sender<Result<ListenOutcome, String>>>,
     },
     /// Manual toggle from the tray menu item — behaves like a hotkey tap.
     TrayToggleDictation,
     /// Cycles the overlay through its states for visual verification,
     /// without touching the microphone or transcriber.
     TestOverlay,
+    /// Daemon socket `listen` command: record now (hands-free semantics —
+    /// RMS auto-stop, duration cap), run the full pipeline, and reply with
+    /// the result instead of pasting. `mode` overrides the resolved
+    /// profile's mode for this one recording; `max_secs` overrides the
+    /// hands-free duration cap.
+    DaemonListen {
+        mode: Option<String>,
+        max_secs: Option<u64>,
+        reply: Sender<Result<ListenOutcome, String>>,
+    },
+}
+
+/// Result of a daemon-triggered `listen` — mirrors what would have been
+/// pasted, but handed back over the socket instead.
+#[derive(Debug, Clone)]
+pub struct ListenOutcome {
+    pub raw: String,
+    pub text: String,
+    pub mode: String,
+    pub duration_s: f64,
 }
 
 /// Spawns the audio worker, model manager, and hotkey monitor threads, then
@@ -315,12 +340,21 @@ fn run_coordinator(
                 state.set_dictation_state(DictationState::Transcribing);
                 tray::refresh_menu(&app);
 
+                // A daemon `listen` command's reply channel (+ optional mode
+                // override), if this recording was triggered that way rather
+                // than via the hotkey/tray toggle.
+                let listen_pending = state.pending_listen.lock().unwrap().take();
+
                 // Frontmost app + resolved profile, captured now (right as
                 // recording ends) rather than after ASR completes — that's
                 // both a more accurate "at paste time" reading and lets the
                 // overlay show the mode badge immediately.
                 let app_bundle_id = permissions::frontmost_bundle_id();
-                let profile = state.profiles.lock().unwrap().resolve(app_bundle_id.as_deref());
+                let mut profile = state.profiles.lock().unwrap().resolve(app_bundle_id.as_deref());
+                if let Some((_, Some(mode_override))) = &listen_pending {
+                    profile.mode = mode_override.clone();
+                }
+                let listen_reply = listen_pending.map(|(tx, _)| tx);
                 overlay::emit_overlay(&app, OverlayEvent::Transcribing { mode: profile.mode.clone() });
 
                 let (reply_tx, reply_rx) = mpsc::channel();
@@ -330,6 +364,9 @@ fn run_coordinator(
                     reply: reply_tx,
                 });
                 if sent.is_err() {
+                    if let Some(tx) = &listen_reply {
+                        let _ = tx.send(Err("transcriber unavailable".to_string()));
+                    }
                     state.set_dictation_state(DictationState::Idle);
                     overlay::hide_overlay(&app);
                     continue;
@@ -351,6 +388,7 @@ fn run_coordinator(
                             audio_duration: duration,
                             app_bundle_id,
                             profile,
+                            listen_reply,
                         });
                     }
                 });
@@ -364,6 +402,9 @@ fn run_coordinator(
                 hold.consumed.store(true, Ordering::Relaxed);
                 if samples.is_empty() {
                     eprintln!("[vzt-flow] microphone disconnected mid-recording; nothing to salvage");
+                    if let Some((tx, _)) = state.pending_listen.lock().unwrap().take() {
+                        let _ = tx.send(Err("microphone disconnected".to_string()));
+                    }
                     state.set_dictation_state(DictationState::Idle);
                     overlay::emit_overlay(
                         &app,
@@ -387,11 +428,17 @@ fn run_coordinator(
                 }
             }
             CoordinatorMsg::Audio(AudioReply::Cancelled) => {
+                if let Some((tx, _)) = state.pending_listen.lock().unwrap().take() {
+                    let _ = tx.send(Err("recording cancelled".to_string()));
+                }
                 state.set_dictation_state(DictationState::Idle);
                 overlay::hide_overlay(&app);
             }
             CoordinatorMsg::Audio(AudioReply::Error(e)) => {
                 eprintln!("[vzt-flow] audio error: {e}");
+                if let Some((tx, _)) = state.pending_listen.lock().unwrap().take() {
+                    let _ = tx.send(Err(e.clone()));
+                }
                 state.set_dictation_state(DictationState::Idle);
                 overlay::emit_overlay(&app, OverlayEvent::Message { text: e });
                 let app2 = app.clone();
@@ -400,13 +447,16 @@ fn run_coordinator(
                     overlay::hide_overlay(&app2);
                 });
             }
-            CoordinatorMsg::TranscribeResult { result, audio_duration, app_bundle_id, profile } => {
+            CoordinatorMsg::TranscribeResult { result, audio_duration, app_bundle_id, profile, listen_reply } => {
                 match result {
                     Ok(transcript) => {
-                        run_pipeline(&app, transcript.text, audio_duration, app_bundle_id, profile);
+                        run_pipeline(&app, transcript.text, audio_duration, app_bundle_id, profile, listen_reply);
                     }
                     Err(e) => {
                         eprintln!("[vzt-flow] transcription error: {e}");
+                        if let Some(tx) = listen_reply {
+                            let _ = tx.send(Err(e));
+                        }
                         state.set_dictation_state(DictationState::Idle);
                         // Surface the failure briefly instead of silently
                         // vanishing, then dismiss (F2).
@@ -423,8 +473,16 @@ fn run_coordinator(
                 }
                 tray::refresh_menu(&app);
             }
-            CoordinatorMsg::CleanupDone { raw_text, result, mode_label, audio_duration, app_bundle_id } => {
-                finalize_dictation(&app, &raw_text, &result.text, &mode_label, audio_duration, app_bundle_id);
+            CoordinatorMsg::CleanupDone { raw_text, result, mode_label, audio_duration, app_bundle_id, listen_reply } => {
+                finalize_dictation(
+                    &app,
+                    &raw_text,
+                    &result.text,
+                    &mode_label,
+                    audio_duration,
+                    app_bundle_id,
+                    listen_reply,
+                );
             }
             CoordinatorMsg::Model(ModelStatusEvent::Loading) => {
                 *state.model_lifecycle.lock().unwrap() = ModelLifecycle::Loading;
@@ -445,12 +503,33 @@ fn run_coordinator(
                 tray::refresh_menu(&app);
             }
             // cleanup_manager already logs its own lifecycle to stderr;
-            // this is just a hook point for a future tray affordance.
+            // mirrored into `cleanup_lifecycle` so the daemon socket's
+            // `status` command can report `cleanup_loaded`.
             CoordinatorMsg::Cleanup(status) => {
-                let _ = status;
+                let lifecycle = match status {
+                    CleanupStatusEvent::Loading => ModelLifecycle::Loading,
+                    CleanupStatusEvent::Loaded { .. } => ModelLifecycle::Loaded,
+                    CleanupStatusEvent::LoadFailed(_) => ModelLifecycle::Unloaded,
+                    CleanupStatusEvent::Unloaded => ModelLifecycle::Unloaded,
+                };
+                *state.cleanup_lifecycle.lock().unwrap() = lifecycle;
             }
             CoordinatorMsg::TestOverlay => {
                 run_overlay_self_test(&app);
+            }
+            CoordinatorMsg::DaemonListen { mode, max_secs, reply } => {
+                if *state.dictation_state.lock().unwrap() != DictationState::Idle {
+                    let _ = reply.send(Err("already recording or transcribing".to_string()));
+                    continue;
+                }
+                let cap = max_secs.unwrap_or_else(|| max_handsfree_secs(&app));
+                *state.pending_listen.lock().unwrap() = Some((reply, mode));
+                // Behaves like a hands-free (tap-to-toggle) recording: RMS
+                // auto-stop is enabled by `start_recording` whenever
+                // `hands_free_active` is set, and there's no hotkey press
+                // in flight to consume, so no `hold` bookkeeping is needed.
+                state.hands_free_active.store(true, Ordering::Relaxed);
+                start_recording(&app, cap);
             }
         }
     }
@@ -508,6 +587,7 @@ fn run_pipeline(
     audio_duration: Duration,
     app_bundle_id: Option<String>,
     profile: ProfileRule,
+    listen_reply: Option<Sender<Result<ListenOutcome, String>>>,
 ) {
     let state = app.state::<AppState>();
     let dict = state.dictionary.lock().unwrap().clone();
@@ -515,7 +595,7 @@ fn run_pipeline(
 
     if profile.mode == "code" {
         let final_text = codemode::transform(&corrected);
-        finalize_dictation(app, &raw_text, &final_text, "code", audio_duration, app_bundle_id);
+        finalize_dictation(app, &raw_text, &final_text, "code", audio_duration, app_bundle_id, listen_reply);
         return;
     }
 
@@ -524,7 +604,7 @@ fn run_pipeline(
 
     if mode == Mode::Raw {
         // No LLM involved at all in raw mode; finish synchronously.
-        finalize_dictation(app, &raw_text, &corrected, &mode_label, audio_duration, app_bundle_id);
+        finalize_dictation(app, &raw_text, &corrected, &mode_label, audio_duration, app_bundle_id, listen_reply);
         return;
     }
 
@@ -534,7 +614,7 @@ fn run_pipeline(
     let cleanup_tx = state.cleanup_cmd_tx.lock().unwrap().clone();
 
     let Some(cleanup_tx) = cleanup_tx else {
-        finalize_dictation(app, &raw_text, &corrected, &mode_label, audio_duration, app_bundle_id);
+        finalize_dictation(app, &raw_text, &corrected, &mode_label, audio_duration, app_bundle_id, listen_reply);
         return;
     };
 
@@ -547,7 +627,7 @@ fn run_pipeline(
         reply: reply_tx,
     });
     if sent.is_err() {
-        finalize_dictation(app, &raw_text, &corrected, &mode_label, audio_duration, app_bundle_id);
+        finalize_dictation(app, &raw_text, &corrected, &mode_label, audio_duration, app_bundle_id, listen_reply);
         return;
     }
 
@@ -566,6 +646,7 @@ fn run_pipeline(
                 mode_label,
                 audio_duration,
                 app_bundle_id,
+                listen_reply,
             });
         }
     });
@@ -578,6 +659,7 @@ fn finalize_dictation(
     mode_label: &str,
     audio_duration: Duration,
     app_bundle_id: Option<String>,
+    listen_reply: Option<Sender<Result<ListenOutcome, String>>>,
 ) {
     let state = app.state::<AppState>();
 
@@ -586,16 +668,29 @@ fn finalize_dictation(
 
     *state.last_transcript.lock().unwrap() = Some(final_text.clone());
 
-    let outcome = insert::paste_text(&final_text);
-    let message = match &outcome {
-        Ok(insert::PasteOutcome::Pasted) => None,
-        Ok(insert::PasteOutcome::SkippedSecureField) => {
-            Some("Secure field — transcript on clipboard".to_string())
+    // A daemon `listen` command never pastes — it hands the text back over
+    // the socket instead. Everything else (history logging, overlay
+    // Done flash, state reset) is identical to a normal dictation.
+    let message = if let Some(tx) = listen_reply {
+        let _ = tx.send(Ok(ListenOutcome {
+            raw: raw_text.to_string(),
+            text: final_text.clone(),
+            mode: mode_label.to_string(),
+            duration_s: audio_duration.as_secs_f64(),
+        }));
+        None
+    } else {
+        let outcome = insert::paste_text(&final_text);
+        match &outcome {
+            Ok(insert::PasteOutcome::Pasted) => None,
+            Ok(insert::PasteOutcome::SkippedSecureField) => {
+                Some("Secure field — transcript on clipboard".to_string())
+            }
+            Ok(insert::PasteOutcome::SkippedNoAccessibility) => {
+                Some("No Accessibility permission — transcript on clipboard".to_string())
+            }
+            Err(e) => Some(format!("Paste failed: {e}")),
         }
-        Ok(insert::PasteOutcome::SkippedNoAccessibility) => {
-            Some("No Accessibility permission — transcript on clipboard".to_string())
-        }
-        Err(e) => Some(format!("Paste failed: {e}")),
     };
 
     let entry = history::HistoryEntry {

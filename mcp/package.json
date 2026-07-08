@@ -1,0 +1,20 @@
+{
+  "name": "vzt-flow-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "description": "MCP server exposing VZT Flow voice dictation (listen, transcribe_file, dictation_history) to Claude Code.",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc -p .",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.7.4",
+    "typescript": "^5.6.2"
+  }
+}

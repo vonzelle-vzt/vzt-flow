@@ -11,15 +11,25 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Record from the mic until Enter is pressed, then transcribe.
+    /// Record from the mic and transcribe. Daemon-first (records through
+    /// the running desktop app, driving its overlay) with a standalone
+    /// fallback when no daemon is running.
     Listen {
-        /// Auto-stop after this many seconds instead of waiting for Enter.
+        /// Pipeline mode: raw|clean|polish|code. Defaults to the daemon's
+        /// per-app profile when a daemon is running, else "clean".
         #[arg(long)]
-        seconds: Option<u64>,
+        mode: Option<String>,
+        /// Hard cap on recording duration. Standalone mode also accepts no
+        /// value and waits for Enter instead.
+        #[arg(long)]
+        max_secs: Option<u64>,
     },
     /// Transcribe an existing audio file (wav, or anything ffmpeg can read).
     Transcribe {
         file: std::path::PathBuf,
+        /// Run the transcript through cleanup/code-mode: raw|clean|polish|code.
+        #[arg(long, alias = "clean")]
+        mode: Option<String>,
     },
     /// Manage local models.
     Models {
@@ -28,6 +38,19 @@ enum Commands {
     },
     /// Print environment/model/device diagnostics.
     Doctor,
+    /// Query the running daemon's status (idle/recording/transcribing,
+    /// models loaded, version). Reports "daemon not running" if unreachable.
+    Status,
+    /// Start/stop a hands-free recording on the running daemon (same as
+    /// the tray's Start/Stop dictation item).
+    Toggle,
+    /// Cancel the daemon's in-progress recording, if any.
+    Cancel,
+    /// Show recent dictation history.
+    History {
+        #[arg(short = 'n', long, default_value_t = 20)]
+        n: usize,
+    },
     /// Hidden: exercise the clipboard save/set/paste/restore pipeline in
     /// isolation without needing the desktop app running.
     #[command(hide = true)]
@@ -67,12 +90,16 @@ enum ModelsAction {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Listen { seconds } => commands::listen::run(seconds),
-        Commands::Transcribe { file } => commands::transcribe::run(&file),
+        Commands::Listen { mode, max_secs } => commands::listen::run(mode, max_secs),
+        Commands::Transcribe { file, mode } => commands::transcribe::run(&file, mode.as_deref()),
         Commands::Models { action } => match action {
             ModelsAction::Download { model, force } => commands::models::download(&model, force),
         },
         Commands::Doctor => commands::doctor::run(),
+        Commands::Status => commands::status::run(),
+        Commands::Toggle => commands::toggle::run(),
+        Commands::Cancel => commands::cancel::run(),
+        Commands::History { n } => commands::history::run(n),
         Commands::PasteTest { text } => commands::paste_test::run(&text),
         Commands::CleanTest { text, mode, timeout_ms } => commands::clean_test::run(&text, &mode, timeout_ms),
         Commands::CodeTest { text } => commands::code_test::run(&text),

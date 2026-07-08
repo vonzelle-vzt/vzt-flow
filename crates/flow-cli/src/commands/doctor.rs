@@ -1,6 +1,9 @@
+use std::time::Duration;
+
 use anyhow::Result;
 use flow_core::audio::default_input_device_info;
-use flow_core::models::{check_parakeet_model, model_root_dir};
+use flow_core::ipc::{unix, Request};
+use flow_core::models::{check_cleanup_model, check_parakeet_model, model_root_dir};
 
 pub fn run() -> Result<()> {
     println!("VZT Flow doctor");
@@ -50,6 +53,47 @@ pub fn run() -> Result<()> {
             println!("ffmpeg: {first_line}");
         }
         _ => println!("ffmpeg: NOT FOUND on PATH"),
+    }
+
+    match check_cleanup_model() {
+        Ok(true) => println!("Cleanup model: PRESENT"),
+        Ok(false) => println!("Cleanup model: MISSING (run: flow models download cleanup)"),
+        Err(e) => println!("Cleanup model: error checking status ({e})"),
+    }
+
+    match flow_core::ipc::socket_path() {
+        Ok(path) => {
+            if !path.exists() {
+                println!("Daemon socket: not present ({})", path.display());
+            } else if unix::is_alive(&path) {
+                println!("Daemon socket: PRESENT and alive ({})", path.display());
+                match unix::call(&path, &Request::Status, Some(Duration::from_secs(5))) {
+                    Ok(resp) if resp.ok => {
+                        println!("Daemon version: {}", resp.version.as_deref().unwrap_or("unknown"));
+                        println!("Daemon state: {}", resp.state.as_deref().unwrap_or("unknown"));
+                    }
+                    Ok(resp) => println!("Daemon status query failed: {}", resp.error.as_deref().unwrap_or("?")),
+                    Err(e) => println!("Daemon status query failed: {e}"),
+                }
+            } else {
+                println!("Daemon socket: STALE file present, nothing listening ({})", path.display());
+            }
+        }
+        Err(e) => println!("Daemon socket: error determining path ({e})"),
+    }
+
+    match std::process::Command::new("claude").args(["mcp", "list"]).output() {
+        Ok(out) if out.status.success() => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            if stdout.contains("vzt-flow") {
+                println!("MCP registration: vzt-flow IS registered with `claude mcp`");
+            } else {
+                println!("MCP registration: `claude` binary found, but vzt-flow is NOT registered");
+                println!("  Run: claude mcp add vzt-flow --scope user -- node <path to mcp/dist/index.js>");
+            }
+        }
+        Ok(_) => println!("MCP registration: `claude mcp list` exited non-zero; could not check"),
+        Err(_) => println!("MCP registration: `claude` binary not found on PATH; skipping check"),
     }
 
     Ok(())

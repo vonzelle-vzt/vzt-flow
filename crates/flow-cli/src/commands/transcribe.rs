@@ -4,9 +4,10 @@ use std::time::Instant;
 use anyhow::Result;
 use flow_core::{dictionary, parakeet_model_dir, ParakeetTranscriber, Transcriber};
 
+use super::listen::apply_standalone_pipeline;
 use super::load_audio_as_f32;
 
-pub fn run(file: &Path) -> Result<()> {
+pub fn run(file: &Path, mode: Option<&str>) -> Result<()> {
     println!("Loading audio: {}", file.display());
     let (samples, duration) = load_audio_as_f32(file)?;
     println!("Audio duration: {:.2}s", duration.as_secs_f64());
@@ -29,8 +30,13 @@ pub fn run(file: &Path) -> Result<()> {
     let dict = dictionary::load_or_seed().unwrap_or_default();
     let corrected = dictionary::correct(&transcript.text, &dict);
 
+    let final_text = match mode {
+        Some(m) => apply_standalone_pipeline(&corrected, m),
+        None => corrected,
+    };
+
     println!("\n--- Transcript ---");
-    println!("{corrected}");
+    println!("{final_text}");
     println!("------------------\n");
     println!(
         "Transcription wall time: {:.3}s | audio: {:.2}s | realtime factor: {:.3}x",

@@ -1,5 +1,6 @@
 mod commands;
 mod coordinator;
+mod daemon;
 mod overlay;
 mod settings;
 mod state;
@@ -59,6 +60,15 @@ pub fn run() {
                 );
             }
 
+            // Daemon control socket: started after the coordinator so
+            // `AppState.coordinator_tx` is already populated for the
+            // toggle/cancel/listen handlers. A bind failure (e.g. another
+            // instance already running) is logged but not fatal — the app
+            // still works, just not scriptably.
+            if let Err(e) = daemon::spawn(handle.clone()) {
+                eprintln!("[vzt-flow] daemon control socket failed to start: {e}");
+            }
+
             // Pre-create (hidden) so the first `show_overlay` call has no
             // window-creation latency mid-recording.
             let _ = overlay::ensure_overlay(&handle);
@@ -73,10 +83,16 @@ pub fn run() {
             // handler calling `app.exit(0)` (which reports `Some(0)`).
             // Since this is a menu-bar app with no real windows to close,
             // only the tray's Quit should ever end the process.
-            if let tauri::RunEvent::ExitRequested { api, code, .. } = event {
-                if code.is_none() {
-                    api.prevent_exit();
+            match event {
+                tauri::RunEvent::ExitRequested { api, code, .. } => {
+                    if code.is_none() {
+                        api.prevent_exit();
+                    }
                 }
+                tauri::RunEvent::Exit => {
+                    daemon::cleanup();
+                }
+                _ => {}
             }
         });
 }

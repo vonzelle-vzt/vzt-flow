@@ -106,7 +106,7 @@ impl AudioRecorder {
             stop_clone.store(true, Ordering::SeqCst);
         });
 
-        println!("Recording... press Enter to stop{}.",
+        eprintln!("Recording... press Enter to stop{}.",
             max_seconds.map(|s| format!(" (auto-stops after {s}s)")).unwrap_or_default());
 
         let started = Instant::now();
@@ -431,6 +431,71 @@ fn run_one_recording(
         auto_stopped_silence,
     });
     Ok(())
+}
+
+/// Loads an arbitrary audio file (wav directly via `hound`; anything else
+/// shelled out to the system `ffmpeg`) and returns 16kHz mono f32 PCM plus
+/// its real-world duration. Shared by the CLI's `transcribe`/`clean-test`
+/// commands and the daemon's `transcribe` socket command so both go through
+/// identical file-loading logic.
+pub fn load_audio_file_as_f32(path: &std::path::Path) -> Result<(Vec<f32>, Duration)> {
+    let is_wav = path.extension().map(|e| e.eq_ignore_ascii_case("wav")).unwrap_or(false);
+
+    let wav_path: std::path::PathBuf = if is_wav {
+        path.to_path_buf()
+    } else {
+        let tmp = std::env::temp_dir().join(format!("flow-convert-{}.wav", std::process::id()));
+        let status = std::process::Command::new("ffmpeg")
+            .args(["-y", "-i"])
+            .arg(path)
+            .args(["-ar", "16000", "-ac", "1", "-f", "wav"])
+            .arg(&tmp)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .context("failed to invoke ffmpeg (is it installed and on PATH?)")?;
+        if !status.success() {
+            anyhow::bail!("ffmpeg conversion failed for {}", path.display());
+        }
+        tmp
+    };
+
+    let mut reader = hound::WavReader::open(&wav_path)
+        .with_context(|| format!("failed to open wav {}", wav_path.display()))?;
+    let spec = reader.spec();
+    let duration = Duration::from_secs_f64(reader.duration() as f64 / spec.sample_rate as f64);
+
+    let raw_samples: Vec<f32> = match spec.sample_format {
+        hound::SampleFormat::Float => reader
+            .samples::<f32>()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("failed to read f32 wav samples")?,
+        hound::SampleFormat::Int => {
+            let max = (1i64 << (spec.bits_per_sample - 1)) as f32;
+            reader
+                .samples::<i32>()
+                .map(|s| s.map(|v| v as f32 / max))
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .context("failed to read int wav samples")?
+        }
+    };
+
+    let mono = if spec.channels > 1 {
+        raw_samples
+            .chunks(spec.channels as usize)
+            .map(|frame| frame.iter().sum::<f32>() / frame.len() as f32)
+            .collect()
+    } else {
+        raw_samples
+    };
+
+    let resampled = resample_linear(&mono, spec.sample_rate, TARGET_SAMPLE_RATE);
+
+    if !is_wav {
+        let _ = std::fs::remove_file(&wav_path);
+    }
+
+    Ok((resampled, duration))
 }
 
 fn downmix_to_mono(samples: &[f32], channels: usize) -> Vec<f32> {

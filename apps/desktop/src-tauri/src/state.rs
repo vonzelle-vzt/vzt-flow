@@ -30,6 +30,18 @@ impl DictationState {
             DictationState::Done => "Done",
         }
     }
+
+    /// Lowercase label for the daemon socket's `status` command, per the
+    /// protocol's `idle|recording|transcribing` enum — `Done` (the brief
+    /// post-paste flash before the coordinator returns to `Idle`) reports
+    /// as `"idle"` since it isn't one of the three wire states.
+    pub fn daemon_label(&self) -> &'static str {
+        match self {
+            DictationState::Idle | DictationState::Done => "idle",
+            DictationState::Recording => "recording",
+            DictationState::Transcribing => "transcribing",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +56,16 @@ pub enum ModelLifecycle {
 pub struct AppState {
     pub dictation_state: Mutex<DictationState>,
     pub model_lifecycle: Mutex<ModelLifecycle>,
+    /// Mirrors `model_lifecycle` for the cleanup LLM, populated from
+    /// `CleanupStatusEvent`s the coordinator receives — used by the daemon
+    /// socket's `status` command (`cleanup_loaded`).
+    pub cleanup_lifecycle: Mutex<ModelLifecycle>,
+    /// Set by `CoordinatorMsg::DaemonListen` while a daemon-triggered
+    /// recording is in flight: the reply channel to send the final
+    /// `ListenOutcome` on (instead of pasting) plus an optional mode
+    /// override for that one recording. Taken (cleared) as soon as the
+    /// recording stops and pipeline processing begins.
+    pub pending_listen: Mutex<Option<(Sender<Result<crate::coordinator::ListenOutcome, String>>, Option<String>)>>,
     /// The most recent *final* (dictionary-corrected, code-mode/cleaned)
     /// text — what "Copy last transcript" copies and what Settings shows.
     pub last_transcript: Mutex<Option<String>>,
@@ -86,6 +108,8 @@ impl AppState {
         Self {
             dictation_state: Mutex::new(DictationState::Idle),
             model_lifecycle: Mutex::new(ModelLifecycle::Unloaded),
+            cleanup_lifecycle: Mutex::new(ModelLifecycle::Unloaded),
+            pending_listen: Mutex::new(None),
             last_transcript: Mutex::new(None),
             config: Mutex::new(config),
             dictionary: Mutex::new(dictionary),
