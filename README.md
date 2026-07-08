@@ -1,7 +1,6 @@
-# VZT Flow
+<p align="center"><img src="docs/assets/banner.png" alt="VZT Flow — Local. Private. On-Device Voice Dictation." width="100%"></p>
 
-**Local, private, $0 voice dictation for macOS & Windows.** Hold a key,
-speak, get clean text pasted wherever your cursor is — entirely on-device.
+# VZT Flow
 
 [![Build](https://github.com/vonzelle-vzt/vzt-flow/actions/workflows/build.yml/badge.svg)](https://github.com/vonzelle-vzt/vzt-flow/actions/workflows/build.yml)
 [![Release](https://img.shields.io/github/v/release/vonzelle-vzt/vzt-flow)](https://github.com/vonzelle-vzt/vzt-flow/releases)
@@ -9,13 +8,12 @@ speak, get clean text pasted wherever your cursor is — entirely on-device.
 ![macOS](https://img.shields.io/badge/macOS-Apple%20Silicon-black?logo=apple)
 ![Windows](https://img.shields.io/badge/Windows-experimental-blue?logo=windows)
 
-Hold-to-talk (or tap for hands-free) → local ASR (Parakeet TDT) → optional
-local LLM cleanup (Qwen3) → paste. Also works headless as a CLI and as an
-MCP voice-input tool for [Claude Code](https://claude.com/claude-code).
-
-<p align="center">
-  <img src="docs/assets/overlay-recording.png" alt="VZT Flow's recording overlay pill, floating over the Dock" width="640">
-</p>
+Hold a key, talk, and the transcript lands wherever your cursor is — no
+subscription, no word limits, and nothing but the model *downloads* ever
+touch the network. Hold-to-talk (or tap for hands-free) → local ASR
+(Parakeet TDT) → optional local LLM cleanup (Qwen3) → paste. Also works
+headless as a CLI and as an MCP voice-input tool for
+[Claude Code](https://claude.com/claude-code).
 
 ## Why
 
