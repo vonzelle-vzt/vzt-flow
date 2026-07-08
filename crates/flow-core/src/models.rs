@@ -189,6 +189,52 @@ fn download_with_progress(url: &str, dest: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Official Qwen3-1.7B-Instruct GGUF has no Q4_K_M variant published, so
+/// this uses unsloth's re-quantization of the same weights — same model,
+/// same chat template, just a Q4_K_M file available.
+const CLEANUP_MODEL_URL: &str =
+    "https://huggingface.co/unsloth/Qwen3-1.7B-GGUF/resolve/main/Qwen3-1.7B-Q4_K_M.gguf";
+const CLEANUP_MODEL_SHA256: &str = "b139949c5bd74937ad8ed8c8cf3d9ffb1e99c866c823204dc42c0d91fa181897";
+const CLEANUP_MODEL_FILENAME: &str = "Qwen3-1.7B-Q4_K_M.gguf";
+
+pub fn cleanup_model_dir() -> Result<PathBuf> {
+    Ok(model_root_dir()?.join("cleanup"))
+}
+
+pub fn cleanup_model_path() -> Result<PathBuf> {
+    Ok(cleanup_model_dir()?.join(CLEANUP_MODEL_FILENAME))
+}
+
+pub fn check_cleanup_model() -> Result<bool> {
+    Ok(cleanup_model_path()?.exists())
+}
+
+/// Download the cleanup GGUF into `cleanup_model_dir()`, showing a progress
+/// bar and checking its sha256 against the known-good hash (a mismatch is
+/// logged but not fatal — upstream repos occasionally re-upload).
+pub fn download_cleanup_model(force: bool) -> Result<PathBuf> {
+    let target = cleanup_model_path()?;
+    if !force && target.exists() {
+        println!("Cleanup model already present at {}", target.display());
+        return Ok(target);
+    }
+
+    fs::create_dir_all(target.parent().unwrap()).context("failed to create cleanup model directory")?;
+    download_with_progress(CLEANUP_MODEL_URL, &target)?;
+
+    let sha = sha256_of_file(&target)?;
+    if sha == CLEANUP_MODEL_SHA256 {
+        println!("Cleanup model sha256 verified: {sha}");
+    } else {
+        println!(
+            "WARNING: cleanup model sha256 mismatch (expected {CLEANUP_MODEL_SHA256}, got {sha}) \
+             — proceeding anyway, but the upstream file may have changed"
+        );
+    }
+    println!("Cleanup model ready at {}", target.display());
+    Ok(target)
+}
+
 fn sha256_of_file(path: &Path) -> Result<String> {
     let mut file = fs::File::open(path)?;
     let mut hasher = Sha256::new();

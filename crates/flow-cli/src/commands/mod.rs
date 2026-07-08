@@ -1,3 +1,5 @@
+pub mod clean_test;
+pub mod code_test;
 pub mod doctor;
 pub mod listen;
 pub mod models;

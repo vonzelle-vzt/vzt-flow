@@ -20,6 +20,8 @@ toml = "1"
 arboard = "3"
 enigo = "0.6"
 core-graphics = "0.25"
+strsim = "0.11"
+encoding_rs = "0.8"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
@@ -27,3 +29,7 @@ objc2-foundation = "0.3"
 objc2-app-kit = { version = "0.3", features = ["NSWorkspace", "NSRunningApplication"] }
 objc2-application-services = "0.3"
 core-foundation = "0.10"
+llama-cpp-2 = { version = "0.1", features = ["metal"] }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+llama-cpp-2 = "0.1"

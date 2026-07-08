@@ -37,6 +37,14 @@ pub struct Config {
     /// Launch the app at login (mirrors tauri-plugin-autostart state; kept
     /// here too so Settings can render it without an async round-trip).
     pub launch_at_login: bool,
+    /// Hard deadline (ms) for the LLM cleanup pass. If generation (model
+    /// load + inference) hasn't produced a result by this deadline, the
+    /// raw (dictionary-corrected) transcript is pasted instead — cleanup
+    /// must never add more than this much latency to a dictation.
+    pub cleanup_timeout_ms: u64,
+    /// Seconds of continuous sub-threshold audio (following at least one
+    /// loud frame) before a hands-free recording auto-stops.
+    pub handsfree_silence_secs: f64,
 }
 
 impl Default for Config {
@@ -49,6 +57,8 @@ impl Default for Config {
             max_hold_secs: 120,
             max_handsfree_secs: 300,
             launch_at_login: false,
+            cleanup_timeout_ms: 2500,
+            handsfree_silence_secs: 2.5,
         }
     }
 }

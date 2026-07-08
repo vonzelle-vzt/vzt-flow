@@ -57,7 +57,7 @@ event.listen("overlay://state", (e) => {
       show();
       setLeading("transcribing");
       bars.style.display = "none";
-      label.textContent = "Transcribing…";
+      label.textContent = payload.mode ? `Transcribing… (${payload.mode})` : "Transcribing…";
       break;
     case "done":
       show();

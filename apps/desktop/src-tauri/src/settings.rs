@@ -11,8 +11,8 @@ pub fn show_settings(app: &AppHandle) {
 
     let _ = WebviewWindowBuilder::new(app, SETTINGS_LABEL, WebviewUrl::App("settings.html".into()))
         .title("VZT Flow Settings")
-        .inner_size(480.0, 520.0)
-        .resizable(false)
+        .inner_size(480.0, 760.0)
+        .resizable(true)
         .minimizable(false)
         .visible(true)
         .center()

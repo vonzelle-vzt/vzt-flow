@@ -5,11 +5,15 @@
 use std::sync::atomic::Ordering;
 
 use flow_core::config::Config;
+use flow_core::history::HistoryEntry;
 use flow_core::permissions;
 use serde::Serialize;
 use tauri::{AppHandle, Manager, State};
 
 use crate::state::AppState;
+
+/// How many rows the Settings History section shows.
+const HISTORY_DISPLAY_COUNT: usize = 20;
 
 #[derive(Serialize)]
 pub struct PermissionStatus {
@@ -69,6 +73,27 @@ pub fn copy_last_transcript(state: State<AppState>) -> bool {
         if let Ok(mut clipboard) = arboard::Clipboard::new() {
             return clipboard.set_text(text).is_ok();
         }
+    }
+    false
+}
+
+/// Last 20 dictations, newest first, for the Settings History section.
+#[tauri::command]
+pub fn get_history() -> Vec<HistoryEntry> {
+    flow_core::history::read_recent(HISTORY_DISPLAY_COUNT).unwrap_or_default()
+}
+
+/// The on-disk path to `profiles.toml`, shown (read-only) in Settings so
+/// the user knows where to hand-edit per-app mode/tone rules.
+#[tauri::command]
+pub fn get_profiles_path() -> Option<String> {
+    flow_core::profiles::profiles_path().ok().map(|p| p.display().to_string())
+}
+
+#[tauri::command]
+pub fn copy_text(text: String) -> bool {
+    if let Ok(mut clipboard) = arboard::Clipboard::new() {
+        return clipboard.set_text(text).is_ok();
     }
     false
 }

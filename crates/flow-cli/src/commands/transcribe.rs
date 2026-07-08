@@ -2,7 +2,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use anyhow::Result;
-use flow_core::{parakeet_model_dir, ParakeetTranscriber, Transcriber};
+use flow_core::{dictionary, parakeet_model_dir, ParakeetTranscriber, Transcriber};
 
 use super::load_audio_as_f32;
 
@@ -26,8 +26,11 @@ pub fn run(file: &Path) -> Result<()> {
         0.0
     };
 
+    let dict = dictionary::load_or_seed().unwrap_or_default();
+    let corrected = dictionary::correct(&transcript.text, &dict);
+
     println!("\n--- Transcript ---");
-    println!("{}", transcript.text);
+    println!("{corrected}");
     println!("------------------\n");
     println!(
         "Transcription wall time: {:.3}s | audio: {:.2}s | realtime factor: {:.3}x",

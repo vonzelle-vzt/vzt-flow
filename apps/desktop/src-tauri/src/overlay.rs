@@ -101,7 +101,9 @@ pub enum OverlayEvent {
     #[allow(dead_code)]
     Hidden,
     Recording { level: f32 },
-    Transcribing,
+    /// `mode` is the resolved pipeline mode ("raw"/"clean"/"polish"/"code")
+    /// for the frontmost app, shown as a small badge while transcribing.
+    Transcribing { mode: String },
     Done,
     Message { text: String },
 }

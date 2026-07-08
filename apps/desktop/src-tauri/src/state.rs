@@ -3,8 +3,12 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
 use flow_core::audio::AudioCommand;
+use flow_core::cleanup_manager::CleanupCommand;
 use flow_core::config::Config;
+use flow_core::dictionary::DictionaryTerm;
 use flow_core::model_manager::ModelCommand;
+use flow_core::profiles::Profiles;
+use flow_core::snippets::Snippets;
 
 use crate::coordinator::CoordinatorMsg;
 
@@ -40,8 +44,14 @@ pub enum ModelLifecycle {
 pub struct AppState {
     pub dictation_state: Mutex<DictationState>,
     pub model_lifecycle: Mutex<ModelLifecycle>,
+    /// The most recent *final* (dictionary-corrected, code-mode/cleaned)
+    /// text — what "Copy last transcript" copies and what Settings shows.
     pub last_transcript: Mutex<Option<String>>,
     pub config: Mutex<Config>,
+    pub dictionary: Mutex<Vec<DictionaryTerm>>,
+    pub profiles: Mutex<Profiles>,
+    pub snippets: Mutex<Snippets>,
+    pub cleanup_cmd_tx: Mutex<Option<Sender<CleanupCommand>>>,
     /// True while a hands-free (tap-to-toggle) recording is active, as
     /// opposed to a hold-to-talk recording.
     pub hands_free_active: AtomicBool,
@@ -61,11 +71,27 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(config: Config, is_recording: Arc<AtomicBool>) -> Self {
+        let dictionary = flow_core::dictionary::load_or_seed().unwrap_or_else(|e| {
+            eprintln!("[vzt-flow] failed to load dictionary, using seed defaults: {e}");
+            flow_core::dictionary::seed_dictionary()
+        });
+        let profiles = flow_core::profiles::load_or_seed().unwrap_or_else(|e| {
+            eprintln!("[vzt-flow] failed to load profiles, using seed defaults: {e}");
+            flow_core::profiles::seed_profiles()
+        });
+        let snippets = flow_core::snippets::load_or_seed().unwrap_or_else(|e| {
+            eprintln!("[vzt-flow] failed to load snippets, using seed defaults: {e}");
+            flow_core::snippets::seed_snippets()
+        });
         Self {
             dictation_state: Mutex::new(DictationState::Idle),
             model_lifecycle: Mutex::new(ModelLifecycle::Unloaded),
             last_transcript: Mutex::new(None),
             config: Mutex::new(config),
+            dictionary: Mutex::new(dictionary),
+            profiles: Mutex::new(profiles),
+            snippets: Mutex::new(snippets),
+            cleanup_cmd_tx: Mutex::new(None),
             hands_free_active: AtomicBool::new(false),
             is_recording,
             hotkey_keycode_handle: Mutex::new(None),

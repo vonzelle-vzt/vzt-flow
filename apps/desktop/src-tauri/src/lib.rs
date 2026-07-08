@@ -26,6 +26,9 @@ pub fn run() {
             commands::open_accessibility_settings,
             commands::get_last_transcript,
             commands::copy_last_transcript,
+            commands::get_history,
+            commands::get_profiles_path,
+            commands::copy_text,
             commands::test_overlay,
         ])
         .setup(|app| {

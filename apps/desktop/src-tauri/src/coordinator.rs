@@ -9,10 +9,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use flow_core::audio::{AudioCommand, AudioReply};
+use flow_core::cleanup::{CleanupContext, Mode};
+use flow_core::cleanup_manager::{CleanupCommand, CleanupResult, CleanupStatusEvent};
 use flow_core::config::Config;
 use flow_core::hotkey::HotkeyEvent;
 use flow_core::model_manager::{ModelCommand, ModelStatusEvent};
-use flow_core::{history, insert, permissions};
+use flow_core::profiles::ProfileRule;
+use flow_core::{codemode, dictionary, history, insert, permissions, snippets};
 use tauri::{AppHandle, Manager};
 
 use crate::overlay::{self, OverlayEvent};
@@ -23,9 +26,25 @@ pub enum CoordinatorMsg {
     Hotkey(HotkeyEvent),
     Audio(AudioReply),
     Model(ModelStatusEvent),
+    Cleanup(CleanupStatusEvent),
     TranscribeResult {
         result: Result<flow_core::Transcript, String>,
         audio_duration: Duration,
+        /// Frontmost app + resolved profile, captured when the recording
+        /// stopped (not after transcription) so the overlay's mode badge
+        /// can show immediately and "frontmost app at paste time" reflects
+        /// where the user actually was when they finished talking.
+        app_bundle_id: Option<String>,
+        profile: ProfileRule,
+    },
+    /// The cleanup pipeline (LLM or timeout/fallback) finished; carries
+    /// everything needed to paste + log history.
+    CleanupDone {
+        raw_text: String,
+        result: CleanupResult,
+        mode_label: String,
+        audio_duration: Duration,
+        app_bundle_id: Option<String>,
     },
     /// Manual toggle from the tray menu item — behaves like a hotkey tap.
     TrayToggleDictation,
@@ -83,6 +102,29 @@ pub fn spawn(
             }
         });
     }
+
+    // --- cleanup manager ---
+    let cleanup_model_path = flow_core::models::cleanup_model_path()
+        .expect("could not determine cleanup model path (no home dir?)");
+    let (cleanup_cmd_tx, cleanup_cmd_rx) = mpsc::channel::<CleanupCommand>();
+    let (cleanup_status_tx, cleanup_status_rx) = mpsc::channel::<CleanupStatusEvent>();
+    flow_core::cleanup_manager::spawn(
+        cleanup_model_path,
+        Duration::from_secs(config.idle_unload_secs),
+        cleanup_cmd_rx,
+        cleanup_status_tx,
+    );
+    {
+        let tx = unified_tx.clone();
+        std::thread::spawn(move || {
+            while let Ok(status) = cleanup_status_rx.recv() {
+                if tx.send(CoordinatorMsg::Cleanup(status)).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    *app.state::<AppState>().cleanup_cmd_tx.lock().unwrap() = Some(cleanup_cmd_tx);
 
     // --- hotkey monitor ---
     let (hotkey_tx, hotkey_rx) = mpsc::channel::<HotkeyEvent>();
@@ -255,7 +297,7 @@ fn run_coordinator(
             CoordinatorMsg::Audio(AudioReply::Level(level)) => {
                 overlay::emit_overlay(&app, OverlayEvent::Recording { level });
             }
-            CoordinatorMsg::Audio(AudioReply::Stopped { samples, duration, capped }) => {
+            CoordinatorMsg::Audio(AudioReply::Stopped { samples, duration, capped, auto_stopped_silence }) => {
                 if capped {
                     // The worker auto-stopped at the max-duration cap while the
                     // key may still be physically held. Reset the mode flag and
@@ -264,10 +306,22 @@ fn run_coordinator(
                     state.hands_free_active.store(false, Ordering::Relaxed);
                     hold.consumed.store(true, Ordering::Relaxed);
                     eprintln!("[vzt-flow] recording hit max-duration cap; transcribing what was captured");
+                } else if auto_stopped_silence {
+                    // Hands-free VAD auto-stop: same reset as the cap path, but
+                    // it's not a max-duration hit, just the end of speech.
+                    state.hands_free_active.store(false, Ordering::Relaxed);
+                    hold.consumed.store(true, Ordering::Relaxed);
                 }
                 state.set_dictation_state(DictationState::Transcribing);
                 tray::refresh_menu(&app);
-                overlay::emit_overlay(&app, OverlayEvent::Transcribing);
+
+                // Frontmost app + resolved profile, captured now (right as
+                // recording ends) rather than after ASR completes — that's
+                // both a more accurate "at paste time" reading and lets the
+                // overlay show the mode badge immediately.
+                let app_bundle_id = permissions::frontmost_bundle_id();
+                let profile = state.profiles.lock().unwrap().resolve(app_bundle_id.as_deref());
+                overlay::emit_overlay(&app, OverlayEvent::Transcribing { mode: profile.mode.clone() });
 
                 let (reply_tx, reply_rx) = mpsc::channel();
                 let sent = model_cmd_tx.send(ModelCommand::Transcribe {
@@ -295,6 +349,8 @@ fn run_coordinator(
                         let _ = tx.send(CoordinatorMsg::TranscribeResult {
                             result,
                             audio_duration: duration,
+                            app_bundle_id,
+                            profile,
                         });
                     }
                 });
@@ -325,6 +381,7 @@ fn run_coordinator(
                             samples,
                             duration,
                             capped: false,
+                            auto_stopped_silence: false,
                         }));
                     }
                 }
@@ -343,10 +400,10 @@ fn run_coordinator(
                     overlay::hide_overlay(&app2);
                 });
             }
-            CoordinatorMsg::TranscribeResult { result, audio_duration } => {
+            CoordinatorMsg::TranscribeResult { result, audio_duration, app_bundle_id, profile } => {
                 match result {
                     Ok(transcript) => {
-                        handle_transcript(&app, &transcript.text, audio_duration);
+                        run_pipeline(&app, transcript.text, audio_duration, app_bundle_id, profile);
                     }
                     Err(e) => {
                         eprintln!("[vzt-flow] transcription error: {e}");
@@ -366,6 +423,9 @@ fn run_coordinator(
                 }
                 tray::refresh_menu(&app);
             }
+            CoordinatorMsg::CleanupDone { raw_text, result, mode_label, audio_duration, app_bundle_id } => {
+                finalize_dictation(&app, &raw_text, &result.text, &mode_label, audio_duration, app_bundle_id);
+            }
             CoordinatorMsg::Model(ModelStatusEvent::Loading) => {
                 *state.model_lifecycle.lock().unwrap() = ModelLifecycle::Loading;
                 tray::refresh_menu(&app);
@@ -383,6 +443,11 @@ fn run_coordinator(
             CoordinatorMsg::Model(ModelStatusEvent::Unloaded) => {
                 *state.model_lifecycle.lock().unwrap() = ModelLifecycle::Unloaded;
                 tray::refresh_menu(&app);
+            }
+            // cleanup_manager already logs its own lifecycle to stderr;
+            // this is just a hook point for a future tray affordance.
+            CoordinatorMsg::Cleanup(status) => {
+                let _ = status;
             }
             CoordinatorMsg::TestOverlay => {
                 run_overlay_self_test(&app);
@@ -406,9 +471,25 @@ fn start_recording(app: &AppHandle, max_secs: u64) {
     tray::refresh_menu(app);
     overlay::show_overlay(app);
     overlay::emit_overlay(app, OverlayEvent::Recording { level: 0.0 });
+    // Energy-based auto-stop only applies to hands-free recordings — a
+    // hold-to-talk recording's only stop signal is releasing the key.
+    let handsfree_silence_secs = if state.hands_free_active.load(Ordering::Relaxed) {
+        Some(state.config.lock().unwrap().handsfree_silence_secs)
+    } else {
+        None
+    };
     let tx = state.audio_cmd_tx.lock().unwrap().clone();
     if let Some(tx) = tx {
-        let _ = tx.send(AudioCommand::Start { max_secs });
+        let _ = tx.send(AudioCommand::Start { max_secs, handsfree_silence_secs });
+    }
+
+    // Kick off cleanup-model load + Metal warm-up now, in parallel with the
+    // user speaking, so it's already warm by the time transcription
+    // finishes and the real (deadline-bound) cleanup call runs. The manager
+    // no-ops if it's already loaded/warmed.
+    let cleanup_tx = state.cleanup_cmd_tx.lock().unwrap().clone();
+    if let Some(cleanup_tx) = cleanup_tx {
+        let _ = cleanup_tx.send(CleanupCommand::Warmup);
     }
 }
 
@@ -416,11 +497,96 @@ fn stop_and_transcribe(audio_cmd_tx: &Sender<AudioCommand>) {
     let _ = audio_cmd_tx.send(AudioCommand::Stop);
 }
 
-fn handle_transcript(app: &AppHandle, text: &str, audio_duration: Duration) {
+/// Runs the post-ASR pipeline: dictionary correction, then either code
+/// mode (deterministic, no LLM, synchronous) or the cleanup LLM (async,
+/// deadline-bound — see `cleanup_manager`). Either branch ends by calling
+/// [`finalize_dictation`], directly for code mode or via
+/// `CoordinatorMsg::CleanupDone` for the LLM path.
+fn run_pipeline(
+    app: &AppHandle,
+    raw_text: String,
+    audio_duration: Duration,
+    app_bundle_id: Option<String>,
+    profile: ProfileRule,
+) {
     let state = app.state::<AppState>();
-    *state.last_transcript.lock().unwrap() = Some(text.to_string());
+    let dict = state.dictionary.lock().unwrap().clone();
+    let corrected = dictionary::correct(&raw_text, &dict);
 
-    let outcome = insert::paste_text(text);
+    if profile.mode == "code" {
+        let final_text = codemode::transform(&corrected);
+        finalize_dictation(app, &raw_text, &final_text, "code", audio_duration, app_bundle_id);
+        return;
+    }
+
+    let mode = Mode::parse(&profile.mode);
+    let mode_label = mode.label().to_string();
+
+    if mode == Mode::Raw {
+        // No LLM involved at all in raw mode; finish synchronously.
+        finalize_dictation(app, &raw_text, &corrected, &mode_label, audio_duration, app_bundle_id);
+        return;
+    }
+
+    let timeout_ms = state.config.lock().unwrap().cleanup_timeout_ms;
+    let dictionary_terms: Vec<String> = dict.iter().map(|d| d.term.clone()).collect();
+    let ctx = CleanupContext { app_name: app_bundle_id.clone(), tone: profile.tone.clone(), dictionary_terms };
+    let cleanup_tx = state.cleanup_cmd_tx.lock().unwrap().clone();
+
+    let Some(cleanup_tx) = cleanup_tx else {
+        finalize_dictation(app, &raw_text, &corrected, &mode_label, audio_duration, app_bundle_id);
+        return;
+    };
+
+    let (reply_tx, reply_rx) = mpsc::channel();
+    let sent = cleanup_tx.send(CleanupCommand::Clean {
+        raw: corrected.clone(),
+        mode,
+        ctx,
+        timeout_ms,
+        reply: reply_tx,
+    });
+    if sent.is_err() {
+        finalize_dictation(app, &raw_text, &corrected, &mode_label, audio_duration, app_bundle_id);
+        return;
+    }
+
+    let forward_tx = state.coordinator_tx.lock().unwrap().clone();
+    std::thread::spawn(move || {
+        // The cleanup manager itself enforces the deadline internally and
+        // always replies; this is just a backstop in case its reply
+        // channel is ever dropped without a send (e.g. a manager panic).
+        let result = reply_rx
+            .recv_timeout(Duration::from_millis(timeout_ms + 2_000))
+            .unwrap_or(CleanupResult { text: corrected, used_llm: false });
+        if let Some(tx) = forward_tx {
+            let _ = tx.send(CoordinatorMsg::CleanupDone {
+                raw_text,
+                result,
+                mode_label,
+                audio_duration,
+                app_bundle_id,
+            });
+        }
+    });
+}
+
+fn finalize_dictation(
+    app: &AppHandle,
+    raw_text: &str,
+    cleaned_text: &str,
+    mode_label: &str,
+    audio_duration: Duration,
+    app_bundle_id: Option<String>,
+) {
+    let state = app.state::<AppState>();
+
+    let snips = state.snippets.lock().unwrap().clone();
+    let final_text = snippets::expand(cleaned_text, &snips).unwrap_or_else(|| cleaned_text.to_string());
+
+    *state.last_transcript.lock().unwrap() = Some(final_text.clone());
+
+    let outcome = insert::paste_text(&final_text);
     let message = match &outcome {
         Ok(insert::PasteOutcome::Pasted) => None,
         Ok(insert::PasteOutcome::SkippedSecureField) => {
@@ -432,13 +598,14 @@ fn handle_transcript(app: &AppHandle, text: &str, audio_duration: Duration) {
         Err(e) => Some(format!("Paste failed: {e}")),
     };
 
-    let app_bundle_id = permissions::frontmost_bundle_id();
     let entry = history::HistoryEntry {
         ts: history::now_unix(),
         app: app_bundle_id,
-        raw_text: text.to_string(),
+        raw_text: raw_text.to_string(),
         duration_s: audio_duration.as_secs_f64(),
         rtf: 0.0, // logged to stderr by the model manager; not recomputed here
+        clean_text: final_text,
+        mode: mode_label.to_string(),
     };
     if let Err(e) = history::append(&entry) {
         eprintln!("[vzt-flow] failed to append history: {e}");
@@ -471,7 +638,7 @@ fn run_overlay_self_test(app: &AppHandle) {
             overlay::emit_overlay(&app2, OverlayEvent::Recording { level });
             std::thread::sleep(Duration::from_millis(250));
         }
-        overlay::emit_overlay(&app2, OverlayEvent::Transcribing);
+        overlay::emit_overlay(&app2, OverlayEvent::Transcribing { mode: "clean".to_string() });
         std::thread::sleep(Duration::from_millis(700));
         overlay::emit_overlay(&app2, OverlayEvent::Done);
         std::thread::sleep(Duration::from_millis(900));

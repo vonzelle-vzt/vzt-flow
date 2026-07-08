@@ -1,5 +1,9 @@
 pub mod audio;
+pub mod cleanup;
+pub mod cleanup_manager;
+pub mod codemode;
 pub mod config;
+pub mod dictionary;
 pub mod engine;
 pub mod history;
 pub mod hotkey;
@@ -7,6 +11,8 @@ pub mod insert;
 pub mod model_manager;
 pub mod models;
 pub mod permissions;
+pub mod profiles;
+pub mod snippets;
 
 pub use audio::{AudioCommand, AudioRecorder, AudioReply};
 pub use config::Config;

@@ -159,7 +159,13 @@ pub enum AudioCommand {
     /// Open the input stream and start accumulating samples. `max_secs` is a
     /// hard cap: once the recording reaches it the worker auto-stops and
     /// delivers what it captured (see [`AudioReply::Stopped`] `capped`).
-    Start { max_secs: u64 },
+    /// `handsfree_silence_secs`, when set, enables energy-based auto-stop:
+    /// once at least one loud frame has been seen, this many seconds of
+    /// continuous sub-threshold audio afterward auto-stops the recording
+    /// (see [`AudioReply::Stopped`] `auto_stopped_silence`). `None` for
+    /// hold-to-talk recordings, where releasing the key is the only stop
+    /// signal.
+    Start { max_secs: u64, handsfree_silence_secs: Option<f64> },
     /// Stop the current recording and reply with the resampled 16kHz mono
     /// audio plus its real-world duration.
     Stop,
@@ -173,10 +179,14 @@ pub enum AudioReply {
     /// A recording finished. `capped` is true when it ended because it hit
     /// the max-duration cap rather than a user Stop — the coordinator uses
     /// that to reset mode flags and mark the in-flight key press consumed.
+    /// `auto_stopped_silence` is true when it ended because the hands-free
+    /// VAD detected trailing silence; the coordinator treats it the same as
+    /// `capped` (system-initiated stop) but logs a distinct message.
     Stopped {
         samples: Vec<f32>,
         duration: Duration,
         capped: bool,
+        auto_stopped_silence: bool,
     },
     Cancelled,
     /// The input device faulted mid-recording (unplugged, format change,
@@ -221,8 +231,10 @@ pub fn spawn_audio_worker(
         .spawn(move || {
             while let Ok(cmd) = cmd_rx.recv() {
                 match cmd {
-                    AudioCommand::Start { max_secs } => {
-                        if let Err(e) = run_one_recording(&cmd_rx, &reply_tx, max_secs) {
+                    AudioCommand::Start { max_secs, handsfree_silence_secs } => {
+                        if let Err(e) =
+                            run_one_recording(&cmd_rx, &reply_tx, max_secs, handsfree_silence_secs)
+                        {
                             let _ = reply_tx.send(AudioReply::Error(e.to_string()));
                         }
                     }
@@ -242,6 +254,7 @@ fn run_one_recording(
     cmd_rx: &mpsc::Receiver<AudioCommand>,
     reply_tx: &mpsc::Sender<AudioReply>,
     max_secs: u64,
+    handsfree_silence_secs: Option<f64>,
 ) -> Result<()> {
     let host = cpal::default_host();
     let device = host
@@ -309,11 +322,16 @@ fn run_one_recording(
     let mut last_level_sent = Instant::now();
     let mut cancelled = false;
     let mut capped = false;
+    let mut auto_stopped_silence = false;
     let mut disconnected = false;
 
     let started = Instant::now();
     let max_elapsed = Duration::from_secs(max_secs);
     let raw_sample_cap = max_raw_samples(max_secs, in_rate, in_channels);
+
+    let mut silence_detector = handsfree_silence_secs.map(SilenceDetector::new);
+    let frame_len_samples = (in_rate as usize / 10).max(1) * in_channels; // ~100ms of interleaved samples
+    let mut frame_accum: Vec<f32> = Vec::new();
 
     'capture: loop {
         // A device fault reported by cpal's error callback takes priority:
@@ -340,7 +358,19 @@ fn run_one_recording(
                     let _ = reply_tx.send(AudioReply::Level(peak));
                     last_level_sent = Instant::now();
                 }
+                if let Some(detector) = silence_detector.as_mut() {
+                    frame_accum.extend_from_slice(&chunk);
+                    while frame_accum.len() >= frame_len_samples {
+                        let frame: Vec<f32> = frame_accum.drain(..frame_len_samples).collect();
+                        if detector.push_frame(rms(&frame)) {
+                            auto_stopped_silence = true;
+                        }
+                    }
+                }
                 raw_samples.extend(chunk);
+                if auto_stopped_silence {
+                    break 'capture;
+                }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break 'capture,
@@ -386,11 +416,19 @@ fn run_one_recording(
         return Ok(());
     }
 
+    if auto_stopped_silence {
+        eprintln!(
+            "[vzt-flow] hands-free recording auto-stopped after {:.1}s of trailing silence",
+            duration.as_secs_f64()
+        );
+    }
+
     let resampled = resample_linear(&mono, in_rate, TARGET_SAMPLE_RATE);
     let _ = reply_tx.send(AudioReply::Stopped {
         samples: resampled,
         duration,
         capped,
+        auto_stopped_silence,
     });
     Ok(())
 }
@@ -428,6 +466,89 @@ pub fn resample_linear(input: &[f32], in_rate: u32, out_rate: u32) -> Vec<f32> {
     output
 }
 
+/// Root-mean-square energy of a frame of samples, used by the hands-free
+/// silence detector. Independent of `downmix_to_mono`/resampling — this
+/// runs on raw (possibly multi-channel, native sample rate) frames.
+fn rms(frame: &[f32]) -> f32 {
+    if frame.is_empty() {
+        return 0.0;
+    }
+    let sum_sq: f32 = frame.iter().map(|s| s * s).sum();
+    (sum_sq / frame.len() as f32).sqrt()
+}
+
+/// Number of ~100ms frames the initial noise-floor calibration spans.
+const CALIBRATION_FRAMES: usize = 3; // ~300ms
+
+/// How far above the calibrated noise floor a frame's RMS must be to count
+/// as "loud" (speech), and the absolute floor under which we never treat a
+/// frame as loud regardless of a near-zero noise floor.
+const LOUD_MULTIPLIER: f32 = 4.0;
+const MIN_LOUD_THRESHOLD: f32 = 0.01;
+
+/// Energy-based voice activity detector for hands-free auto-stop: after
+/// calibrating a noise floor from the first [`CALIBRATION_FRAMES`] frames,
+/// it watches for at least one "loud" (speech) frame, then counts
+/// consecutive quiet frames afterward. Once that trailing-silence run
+/// reaches the configured duration, [`Self::push_frame`] returns `true`.
+///
+/// Deliberately simple (energy threshold, no spectral/ML VAD) per the
+/// brief — good enough for "did the user stop talking", and avoids an ONNX
+/// VAD dependency in this phase.
+pub struct SilenceDetector {
+    calibration_sum: f32,
+    calibration_count: usize,
+    noise_floor: Option<f32>,
+    loud_threshold: f32,
+    had_loud_frame: bool,
+    quiet_frames: usize,
+    stop_after_quiet_frames: usize,
+}
+
+impl SilenceDetector {
+    /// `silence_secs` is the trailing-silence duration required to trigger
+    /// a stop; frames are assumed to be ~100ms each (matching the caller's
+    /// `frame_len_samples` = sample_rate/10 * channels).
+    pub fn new(silence_secs: f64) -> Self {
+        Self {
+            calibration_sum: 0.0,
+            calibration_count: 0,
+            noise_floor: None,
+            loud_threshold: MIN_LOUD_THRESHOLD,
+            had_loud_frame: false,
+            quiet_frames: 0,
+            stop_after_quiet_frames: ((silence_secs * 10.0).round() as usize).max(1),
+        }
+    }
+
+    /// Feeds one ~100ms frame's RMS energy. Returns `true` once enough
+    /// trailing silence has elapsed following at least one loud frame.
+    pub fn push_frame(&mut self, frame_rms: f32) -> bool {
+        if self.noise_floor.is_none() {
+            self.calibration_sum += frame_rms;
+            self.calibration_count += 1;
+            if self.calibration_count >= CALIBRATION_FRAMES {
+                let floor = self.calibration_sum / self.calibration_count as f32;
+                self.noise_floor = Some(floor);
+                self.loud_threshold = (floor * LOUD_MULTIPLIER).max(MIN_LOUD_THRESHOLD);
+            }
+            return false; // never trigger mid-calibration
+        }
+
+        if frame_rms > self.loud_threshold {
+            self.had_loud_frame = true;
+            self.quiet_frames = 0;
+            false
+        } else {
+            if !self.had_loud_frame {
+                return false; // haven't heard speech yet; nothing to end
+            }
+            self.quiet_frames += 1;
+            self.quiet_frames >= self.stop_after_quiet_frames
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -456,5 +577,70 @@ mod tests {
         // Guards the >1s salvage decision used on device disconnect.
         assert!(0.5 < MIN_SALVAGE_SECS);
         assert!(1.5 >= MIN_SALVAGE_SECS);
+    }
+
+    #[test]
+    fn rms_of_silence_is_zero() {
+        assert_eq!(rms(&[0.0; 100]), 0.0);
+    }
+
+    #[test]
+    fn rms_of_constant_amplitude_equals_that_amplitude() {
+        let frame = vec![0.5f32; 100];
+        assert!((rms(&frame) - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn silence_detector_never_fires_during_calibration() {
+        let mut d = SilenceDetector::new(2.5);
+        // Even loud frames during the first CALIBRATION_FRAMES must not
+        // trigger a stop — they're establishing the noise floor, not
+        // counted as "heard speech yet".
+        assert!(!d.push_frame(0.9));
+        assert!(!d.push_frame(0.9));
+        assert!(!d.push_frame(0.9));
+    }
+
+    #[test]
+    fn silence_detector_requires_a_loud_frame_before_it_can_fire() {
+        let mut d = SilenceDetector::new(0.3); // 3 quiet frames to trigger
+        // Calibrate on near-silence.
+        for _ in 0..CALIBRATION_FRAMES {
+            d.push_frame(0.001);
+        }
+        // Continuing quiet frames with no loud frame ever seen must never
+        // trigger — there's no speech to end yet.
+        for _ in 0..20 {
+            assert!(!d.push_frame(0.001));
+        }
+    }
+
+    #[test]
+    fn silence_detector_fires_after_configured_trailing_silence() {
+        let mut d = SilenceDetector::new(0.3); // 3 quiet (100ms) frames
+        for _ in 0..CALIBRATION_FRAMES {
+            d.push_frame(0.001); // calibrate on near-silence
+        }
+        assert!(!d.push_frame(0.5)); // loud (speech) frame
+        assert!(!d.push_frame(0.001)); // quiet frame 1
+        assert!(!d.push_frame(0.001)); // quiet frame 2
+        assert!(d.push_frame(0.001)); // quiet frame 3 -> trailing silence complete
+    }
+
+    #[test]
+    fn silence_detector_resets_the_quiet_run_on_renewed_speech() {
+        let mut d = SilenceDetector::new(0.3);
+        for _ in 0..CALIBRATION_FRAMES {
+            d.push_frame(0.001);
+        }
+        assert!(!d.push_frame(0.5));
+        assert!(!d.push_frame(0.001));
+        assert!(!d.push_frame(0.001));
+        // Speech resumes right before the silence run would have fired —
+        // the quiet counter must reset instead of firing on the next frame.
+        assert!(!d.push_frame(0.5));
+        assert!(!d.push_frame(0.001));
+        assert!(!d.push_frame(0.001));
+        assert!(d.push_frame(0.001)); // now 3 quiet frames since the last loud one
     }
 }
