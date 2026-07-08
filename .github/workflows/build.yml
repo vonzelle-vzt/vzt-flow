@@ -60,7 +60,15 @@ jobs:
       - name: Locate dmg artifact
         id: find_dmg
         run: |
-          DMG=$(find apps/desktop/src-tauri/target/aarch64-apple-darwin/release/bundle/dmg -name '*.dmg' | head -n1)
+          # Cargo workspace: the bundle lands under the workspace-root
+          # target/ dir, not apps/desktop/src-tauri/target/, even though
+          # `tauri build` was invoked from apps/desktop.
+          DMG=$(find target/aarch64-apple-darwin/release/bundle/dmg -name '*.dmg' | head -n1)
+          if [ -z "$DMG" ]; then
+            echo "No .dmg found — bundle tree:" >&2
+            find target -maxdepth 5 -name bundle -type d >&2 || true
+            exit 1
+          fi
           echo "path=$DMG" >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@v4
@@ -101,8 +109,11 @@ jobs:
         id: find_installers
         shell: bash
         run: |
+          # Cargo workspace: the bundle lands under the workspace-root
+          # target/ dir, not apps/desktop/src-tauri/target/, even though
+          # `tauri build` was invoked from apps/desktop.
           mkdir -p /tmp/vzt-flow-windows-artifacts
-          find apps/desktop/src-tauri/target/x86_64-pc-windows-msvc/release/bundle \
+          find target/x86_64-pc-windows-msvc/release/bundle \
             \( -name '*.msi' -o -name '*.exe' \) -exec cp {} /tmp/vzt-flow-windows-artifacts/ \;
           ls -la /tmp/vzt-flow-windows-artifacts
 
