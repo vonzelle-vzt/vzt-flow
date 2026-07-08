@@ -45,105 +45,6 @@ Hold-to-talk (or tap for hands-free) → local ASR (Parakeet TDT) → optional l
 - **`apps/desktop`** — the Tauri 2 menu-bar app: tray icon, recording overlay, Settings window, the hold-to-talk hotkey, and the daemon control socket that the CLI/MCP server drive.
 - **`mcp/`** — a small Node/TypeScript MCP server (`listen`, `transcribe_file`, `dictation_history` tools) so Claude Code can take voice input, going through the daemon socket when the desktop app is running, or the standalone CLI otherwise.
 
-## Install (build from source)
-
-Models are **not** bundled — they download on first run (or via `flow models download`).
-
-### Prerequisites
-- Rust (stable) — `rustup default stable`
-- Node 24+
-- macOS: Xcode command line tools (for the `ApplicationServices`/`AppKit` frameworks and Metal)
-- `ffmpeg` on PATH (optional — only needed for `flow transcribe` on non-wav files)
-
-### Build
-
-```bash
-git clone https://github.com/<you>/vzt-flow.git
-cd vzt-flow
-
-# CLI
-cargo build --release -p flow-cli
-./target/release/flow doctor        # sanity check + points out anything missing
-./target/release/flow models download parakeet-v3
-./target/release/flow models download cleanup   # optional, needed for clean/polish modes
-
-# Desktop app (macOS)
-cd apps/desktop
-npm install
-cargo install tauri-cli --version "^2"
-cargo tauri build          # unsigned/local build; fine for personal use
-open src-tauri/target/release/bundle/dmg/*.dmg
-```
-
-### macOS permissions
-
-The desktop app needs three grants, all in **System Settings → Privacy & Security**:
-
-1. **Input Monitoring** — lets it detect the hold-to-talk key (a `CGEventTap`). Without this the tray's manual Start/Stop item still works.
-2. **Accessibility** — lets it simulate Cmd+V to paste. Without it, the transcript is left on the clipboard for you to paste manually.
-3. **Microphone** — prompted automatically the first time it opens an audio input stream.
-
-## Hotkey defaults
-
-- **Hold Right Option** to record — release to transcribe and paste.
-- **Tap Right Option** (press+release faster than the hold threshold) to start a **hands-free** recording — it auto-stops on silence, or tap again to stop manually.
-- **Esc** cancels an in-progress recording (discarded, nothing pasted).
-- Rebind from the Settings window; per-app behavior (mode/tone) lives in `profiles.toml`.
-
-## CLI reference
-
-```
-flow listen [--mode raw|clean|polish|code] [--max-secs N]   # record + transcribe + paste to stdout
-flow transcribe <file> [--mode ...]                          # transcribe an existing audio file
-flow models download <parakeet-v3|cleanup> [--force]
-flow models status
-flow doctor                                                   # environment/model/permission diagnostics
-flow status                                                   # query the running daemon
-flow toggle                                                   # start/stop a hands-free recording on the daemon
-flow cancel                                                   # cancel the daemon's in-progress recording
-flow history [-n 20]                                          # recent dictations
-```
-
-`flow listen`/`flow transcribe` are daemon-first (routes through the running desktop app, driving its overlay) with a fully standalone fallback when no daemon is running.
-
-## MCP setup (Claude Code voice input)
-
-```bash
-cd mcp
-npm install
-npm run build
-claude mcp add vzt-flow --scope user -- node "$(pwd)/dist/index.js"
-```
-
-This registers three tools: `listen` (record + return cleaned transcript), `transcribe_file`, and `dictation_history`. They go through the daemon socket if the desktop app is running, and fall back to the standalone `flow` CLI otherwise (set `FLOW_BIN` if it isn't on PATH).
-
-## Config files
-
-All under `~/.config/vzt-flow/` (macOS) — see [Windows status](#windows-status) for where this lives there.
-
-| File | Purpose |
-|---|---|
-| `config.toml` | Hotkey binding, hold threshold, recording caps, idle-unload timers, cleanup deadline. |
-| `dictionary.json` | Custom terms (names, jargon, spellings) applied via fuzzy correction before cleanup. |
-| `profiles.toml` | Per-app (bundle-id, glob-matchable) `{mode, tone}` rules — e.g. Terminal/iTerm/Warp → `code`, Mail → `clean`+formal. |
-| `snippets.json` | Text-expansion shortcuts applied after cleanup. |
-| `models/` | Downloaded Parakeet + cleanup model files. |
-| `history.jsonl` | Recent dictation log (`flow history` / `dictation_history` MCP tool). |
-| `daemon.sock` | Unix control socket the desktop app listens on (macOS/Linux only — see below). |
-
-## Windows status
-
-The workspace **compiles and is built by CI** on `windows-latest` (msi/nsis installer artifacts), but this is **experimental** — untested on real Windows hardware, since development happens on macOS. Known gaps, all deliberate v1 scope cuts (not oversights):
-
-- **No daemon control socket yet.** The IPC transport is Unix-domain-socket-only; on Windows every daemon-dependent path (`flow status`/`toggle`/`cancel`/`listen`-via-daemon, and the MCP server's daemon path) reports "not supported" and falls back to the standalone CLI pipeline instead. A named-pipe transport can slot into `flow_core::ipc`'s existing framing/transport split later.
-- **Hotkey binding differs.** macOS defaults to holding Right Option (a bare modifier, via a `CGEventTap`); Windows uses `tauri-plugin-global-shortcut`, which doesn't support modifier-only bindings there, so the Windows default is **Ctrl+Shift+Space**.
-- **No Escape-to-cancel on Windows yet.** A globally *registered* Escape shortcut would swallow Escape system-wide, unlike macOS's `ListenOnly` tap. Use the tray's Start/Stop item to end a recording early.
-- **No TCC-equivalent permission gate.** Windows has no Accessibility-style one-time grant, so paste is never skipped for that reason; a lower-privileged process's paste into an elevated window (UIPI) can still silently fail — the transcript is always left on the clipboard first as a fallback either way.
-- **Config path** is `%APPDATA%\vzt-flow` on Windows (via `dirs::config_dir()`), vs. the literal `~/.config/vzt-flow` on macOS.
-- Parakeet/cleanup inference is CPU-only ONNX/llama.cpp on Windows (no CoreML/Metal execution provider).
-
-## Architecture
-
 ```
 crates/
   flow-core/    engine: audio, ASR, cleanup LLM, dictionary, code mode,
@@ -152,6 +53,71 @@ crates/
 apps/
   desktop/      Tauri 2 menu-bar app (tray, overlay, settings, daemon socket)
 mcp/            Node/TS MCP server exposing listen/transcribe_file/dictation_history
+```
+
+## Quickstart
+
+Full, verified-against-the-code guides live in `docs/`:
+
+- **[docs/USAGE-macOS.md](docs/USAGE-macOS.md)** — the primary, actively
+  developed platform. Install (source or CI `.dmg`), model downloads,
+  permissions (**read this if the hotkey stops working after a rebuild** —
+  there's a known macOS code-signing gotcha), daily use, per-app modes,
+  code-mode reference, dictionary/snippets, full config/CLI/MCP reference,
+  and troubleshooting.
+- **[docs/USAGE-Windows.md](docs/USAGE-Windows.md)** — experimental. Compiles
+  and is CI-built, but has never been run on real Windows hardware. Covers
+  the Ctrl+Shift+Space binding, and every verified difference from macOS
+  (no daemon socket yet, no per-app profiles, no `clean`/`polish` cleanup
+  LLM, Ctrl+V paste with no secure-field detection, `%APPDATA%\vzt-flow`
+  config path).
+
+### macOS, in short
+
+```bash
+git clone https://github.com/vonzelle-vzt/vzt-flow.git
+cd vzt-flow
+
+cargo build --release -p flow-cli
+./target/release/flow doctor
+./target/release/flow models download parakeet-v3
+./target/release/flow models download cleanup   # optional, for clean/polish modes
+
+cd apps/desktop
+npm install
+cargo install tauri-cli --version "^2"
+cargo tauri build
+open ../../target/release/bundle/dmg/*.dmg
+```
+
+Then grant **Microphone**, **Accessibility**, and **Input Monitoring** in
+System Settings → Privacy & Security — see
+[docs/USAGE-macOS.md#permissions](docs/USAGE-macOS.md#permissions) for exact
+steps and the rebuild-revokes-permissions gotcha.
+
+### Windows, in short (experimental)
+
+```powershell
+cargo build --release -p flow-cli
+.\target\release\flow.exe models download parakeet-v3
+cd apps\desktop
+npm install
+cargo install tauri-cli --version "^2"
+cargo tauri build --target x86_64-pc-windows-msvc
+```
+
+Default hotkey is **Ctrl+Shift+Space** (Windows doesn't support the
+modifier-only binding macOS uses). See
+[docs/USAGE-Windows.md](docs/USAGE-Windows.md) for what does and doesn't work
+yet.
+
+### MCP setup (Claude Code voice input), either platform
+
+```bash
+cd mcp
+npm install
+npm run build
+claude mcp add vzt-flow --scope user -- node "$(pwd)/dist/index.js"
 ```
 
 ## License
