@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/flow-core", "crates/flow-cli"]
+members = ["crates/flow-core", "crates/flow-cli", "apps/desktop/src-tauri"]
 
 [workspace.package]
 version = "0.1.0"

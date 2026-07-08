@@ -1,0 +1,123 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>VZT Flow Settings</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
+    font-size: 13px;
+    color: #1c1c1e;
+    background: #f2f2f5;
+    padding: 20px 24px;
+  }
+  @media (prefers-color-scheme: dark) {
+    body { color: #f0f0f2; background: #1c1c1e; }
+    .card { background: #2a2a2d !important; border-color: #3a3a3d !important; }
+    input, select { background: #1c1c1e !important; color: #f0f0f2 !important; border-color: #444 !important; }
+  }
+  h1 { font-size: 15px; margin: 0 0 14px; }
+  h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; opacity: 0.6; margin: 20px 0 8px; }
+  .card {
+    background: white;
+    border: 1px solid #e0e0e3;
+    border-radius: 10px;
+    padding: 12px 14px;
+  }
+  .row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 6px 0;
+  }
+  .row + .row { border-top: 1px solid rgba(128,128,128,0.15); }
+  .status-dot {
+    width: 9px; height: 9px; border-radius: 50%;
+    display: inline-block; margin-right: 6px;
+  }
+  .ok { background: #34c759; }
+  .bad { background: #ff453a; }
+  button {
+    font-size: 12px;
+    padding: 5px 10px;
+    border-radius: 6px;
+    border: 1px solid #c8c8cc;
+    background: #fafafa;
+    cursor: pointer;
+  }
+  @media (prefers-color-scheme: dark) {
+    button { background: #333; color: #eee; border-color: #555; }
+  }
+  select, input[type=number] {
+    font-size: 12px;
+    padding: 4px 6px;
+    border-radius: 6px;
+    border: 1px solid #c8c8cc;
+  }
+  label.checkbox { display: flex; align-items: center; gap: 6px; }
+  #transcript {
+    white-space: pre-wrap;
+    max-height: 80px;
+    overflow-y: auto;
+    font-size: 12px;
+    opacity: 0.85;
+  }
+</style>
+</head>
+<body>
+  <h1>VZT Flow</h1>
+
+  <h2>Setup</h2>
+  <div class="card">
+    <div class="row">
+      <span><span id="dot-mic" class="status-dot bad"></span>Microphone</span>
+      <button id="btn-mic">Check</button>
+    </div>
+    <div class="row">
+      <span><span id="dot-ax" class="status-dot bad"></span>Accessibility (for pasting)</span>
+      <button id="btn-ax">Open Settings</button>
+    </div>
+    <div class="row">
+      <span><span id="dot-hotkey" class="status-dot bad"></span>Global hotkey (Input Monitoring)</span>
+      <span id="hotkey-note" style="opacity:0.6;font-size:11px;">restart after granting</span>
+    </div>
+  </div>
+
+  <h2>Hotkey</h2>
+  <div class="card">
+    <div class="row">
+      <span>Hold-to-talk key</span>
+      <select id="hotkey-select">
+        <option value="61">Right Option</option>
+        <option value="60">Right Shift</option>
+        <option value="62">Right Control</option>
+        <option value="54">Right Command</option>
+        <option value="63">Fn</option>
+      </select>
+    </div>
+    <div class="row">
+      <span>Hold threshold (ms)</span>
+      <input id="hold-threshold" type="number" min="100" max="1000" step="50" style="width:64px" />
+    </div>
+  </div>
+
+  <h2>General</h2>
+  <div class="card">
+    <div class="row">
+      <label class="checkbox"><input type="checkbox" id="launch-at-login" /> Launch at login</label>
+    </div>
+  </div>
+
+  <h2>Last transcript</h2>
+  <div class="card">
+    <div id="transcript">(none yet)</div>
+    <div class="row" style="justify-content:flex-end; border-top:none;">
+      <button id="btn-copy">Copy</button>
+    </div>
+  </div>
+
+  <script src="settings.js"></script>
+</body>
+</html>

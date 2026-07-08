@@ -28,6 +28,12 @@ enum Commands {
     },
     /// Print environment/model/device diagnostics.
     Doctor,
+    /// Hidden: exercise the clipboard save/set/paste/restore pipeline in
+    /// isolation without needing the desktop app running.
+    #[command(hide = true)]
+    PasteTest {
+        text: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -50,5 +56,6 @@ fn main() -> anyhow::Result<()> {
             ModelsAction::Download { model, force } => commands::models::download(&model, force),
         },
         Commands::Doctor => commands::doctor::run(),
+        Commands::PasteTest { text } => commands::paste_test::run(&text),
     }
 }

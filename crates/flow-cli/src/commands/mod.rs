@@ -1,6 +1,7 @@
 pub mod doctor;
 pub mod listen;
 pub mod models;
+pub mod paste_test;
 pub mod transcribe;
 
 /// Shared helper: convert an arbitrary audio file to a 16kHz mono f32

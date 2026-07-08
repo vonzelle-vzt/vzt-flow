@@ -1,0 +1,79 @@
+mod commands;
+mod coordinator;
+mod overlay;
+mod settings;
+mod state;
+mod tray;
+
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+
+use flow_core::config::Config;
+use state::AppState;
+use tauri::Manager;
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    tauri::Builder::default()
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
+        .invoke_handler(tauri::generate_handler![
+            commands::get_config,
+            commands::set_config,
+            commands::get_permission_status,
+            commands::open_accessibility_settings,
+            commands::get_last_transcript,
+            commands::copy_last_transcript,
+            commands::test_overlay,
+        ])
+        .setup(|app| {
+            let handle = app.handle().clone();
+
+            // Menu-bar only: no Dock icon, no app-switcher entry.
+            #[cfg(target_os = "macos")]
+            handle.set_activation_policy(tauri::ActivationPolicy::Accessory)?;
+
+            let config = Config::load().unwrap_or_else(|e| {
+                eprintln!("[vzt-flow] failed to load config, using defaults: {e}");
+                Config::default()
+            });
+
+            let is_recording = Arc::new(AtomicBool::new(false));
+            app.manage(AppState::new(config.clone(), is_recording.clone()));
+
+            tray::setup_tray(&handle)?;
+
+            let (coordinator_tx, hotkey_active) =
+                coordinator::spawn(handle.clone(), config, is_recording);
+            *app.state::<AppState>().coordinator_tx.lock().unwrap() = Some(coordinator_tx);
+            if !hotkey_active {
+                eprintln!(
+                    "[vzt-flow] global hold-to-talk key is NOT active. Use the tray's \
+                     \"Start/Stop dictation\" item, then grant Input Monitoring permission \
+                     and restart the app to enable the hardware hotkey."
+                );
+            }
+
+            // Pre-create (hidden) so the first `show_overlay` call has no
+            // window-creation latency mid-recording.
+            let _ = overlay::ensure_overlay(&handle);
+
+            Ok(())
+        })
+        .build(tauri::generate_context!())
+        .expect("error while building vzt-flow desktop app")
+        .run(|_app_handle, event| {
+            // `code: None` means the exit was requested by user interaction
+            // (e.g. all windows closing) rather than our own tray "Quit"
+            // handler calling `app.exit(0)` (which reports `Some(0)`).
+            // Since this is a menu-bar app with no real windows to close,
+            // only the tray's Quit should ever end the process.
+            if let tauri::RunEvent::ExitRequested { api, code, .. } = event {
+                if code.is_none() {
+                    api.prevent_exit();
+                }
+            }
+        });
+}

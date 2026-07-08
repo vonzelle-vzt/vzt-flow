@@ -150,6 +150,172 @@ impl AudioRecorder {
     }
 }
 
+/// Commands accepted by the audio worker thread spawned by
+/// [`spawn_audio_worker`]. The worker owns the cpal `Stream` for the
+/// lifetime of a recording (cpal streams are not `Send`, so they can never
+/// leave the thread that created them) and is driven entirely by this
+/// channel instead.
+pub enum AudioCommand {
+    /// Open the input stream and start accumulating samples.
+    Start,
+    /// Stop the current recording and reply with the resampled 16kHz mono
+    /// audio plus its real-world duration.
+    Stop,
+    /// Stop the current recording and discard whatever was captured.
+    Cancel,
+}
+
+/// Messages the audio worker sends back to the coordinator.
+pub enum AudioReply {
+    Started,
+    Stopped { samples: Vec<f32>, duration: Duration },
+    Cancelled,
+    /// Roughly-15Hz input level updates (peak amplitude in `[0, 1]`) for
+    /// driving the overlay's level bars while recording.
+    Level(f32),
+    Error(String),
+}
+
+const LEVEL_UPDATE_INTERVAL: Duration = Duration::from_millis(66); // ~15 Hz
+
+/// Spawns a dedicated OS thread that waits for [`AudioCommand`]s and drives
+/// microphone capture. Runs until `cmd_rx` disconnects.
+pub fn spawn_audio_worker(
+    cmd_rx: mpsc::Receiver<AudioCommand>,
+    reply_tx: mpsc::Sender<AudioReply>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::Builder::new()
+        .name("vzt-flow-audio-worker".into())
+        .spawn(move || {
+            while let Ok(cmd) = cmd_rx.recv() {
+                match cmd {
+                    AudioCommand::Start => {
+                        if let Err(e) = run_one_recording(&cmd_rx, &reply_tx) {
+                            let _ = reply_tx.send(AudioReply::Error(e.to_string()));
+                        }
+                    }
+                    // Stop/Cancel with no recording in progress: nothing to do.
+                    AudioCommand::Stop | AudioCommand::Cancel => {}
+                }
+            }
+        })
+        .expect("failed to spawn audio worker thread")
+}
+
+/// Opens the input stream, accumulates samples until a `Stop`/`Cancel`
+/// command (or the sender disconnects), and replies accordingly. Lives
+/// entirely on the audio worker thread so the non-`Send` cpal `Stream`
+/// never has to cross a thread boundary.
+fn run_one_recording(
+    cmd_rx: &mpsc::Receiver<AudioCommand>,
+    reply_tx: &mpsc::Sender<AudioReply>,
+) -> Result<()> {
+    let host = cpal::default_host();
+    let device = host
+        .default_input_device()
+        .context("no default input (microphone) device found")?;
+    let config = device
+        .default_input_config()
+        .context("failed to read default input config")?;
+
+    let sample_format = config.sample_format();
+    let stream_config: StreamConfig = config.into();
+    let in_rate = stream_config.sample_rate.0;
+    let in_channels = stream_config.channels as usize;
+
+    let (data_tx, data_rx) = mpsc::channel::<Vec<f32>>();
+    let err_fn = |err| eprintln!("audio input stream error: {err}");
+
+    let stream = match sample_format {
+        SampleFormat::F32 => device.build_input_stream(
+            &stream_config,
+            move |data: &[f32], _| {
+                let _ = data_tx.send(data.to_vec());
+            },
+            err_fn,
+            None,
+        ),
+        SampleFormat::I16 => device.build_input_stream(
+            &stream_config,
+            move |data: &[i16], _| {
+                let converted: Vec<f32> = data.iter().map(|&s| s as f32 / i16::MAX as f32).collect();
+                let _ = data_tx.send(converted);
+            },
+            err_fn,
+            None,
+        ),
+        SampleFormat::U16 => device.build_input_stream(
+            &stream_config,
+            move |data: &[u16], _| {
+                let converted: Vec<f32> = data
+                    .iter()
+                    .map(|&s| (s as f32 - u16::MAX as f32 / 2.0) / (u16::MAX as f32 / 2.0))
+                    .collect();
+                let _ = data_tx.send(converted);
+            },
+            err_fn,
+            None,
+        ),
+        other => anyhow::bail!("unsupported sample format: {other:?}"),
+    }
+    .context("failed to build input stream")?;
+
+    stream.play().context("failed to start input stream")?;
+    let _ = reply_tx.send(AudioReply::Started);
+
+    let mut raw_samples: Vec<f32> = Vec::new();
+    let mut last_level_sent = Instant::now();
+    let mut cancelled = false;
+
+    'capture: loop {
+        // Drain whatever audio has arrived, then check for a control
+        // command, with a short timeout so level updates stay responsive
+        // even during silence.
+        match data_rx.recv_timeout(Duration::from_millis(20)) {
+            Ok(chunk) => {
+                if last_level_sent.elapsed() >= LEVEL_UPDATE_INTERVAL {
+                    let peak = chunk.iter().fold(0.0f32, |m, s| m.max(s.abs())).min(1.0);
+                    let _ = reply_tx.send(AudioReply::Level(peak));
+                    last_level_sent = Instant::now();
+                }
+                raw_samples.extend(chunk);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break 'capture,
+        }
+
+        match cmd_rx.try_recv() {
+            Ok(AudioCommand::Stop) => break 'capture,
+            Ok(AudioCommand::Cancel) => {
+                cancelled = true;
+                break 'capture;
+            }
+            Ok(AudioCommand::Start) => {} // already recording; ignore
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => break 'capture,
+        }
+    }
+
+    drop(stream);
+    while let Ok(chunk) = data_rx.try_recv() {
+        raw_samples.extend(chunk);
+    }
+
+    if cancelled {
+        let _ = reply_tx.send(AudioReply::Cancelled);
+        return Ok(());
+    }
+
+    let mono = downmix_to_mono(&raw_samples, in_channels);
+    let resampled = resample_linear(&mono, in_rate, TARGET_SAMPLE_RATE);
+    let duration = Duration::from_secs_f64(mono.len() as f64 / in_rate as f64);
+    let _ = reply_tx.send(AudioReply::Stopped {
+        samples: resampled,
+        duration,
+    });
+    Ok(())
+}
+
 fn downmix_to_mono(samples: &[f32], channels: usize) -> Vec<f32> {
     if channels <= 1 {
         return samples.to_vec();

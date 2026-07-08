@@ -1,2 +1,4 @@
 /target
 .staging-parakeet-v3
+node_modules/
+apps/desktop/src-tauri/gen/

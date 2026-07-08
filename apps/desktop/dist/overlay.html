@@ -1,0 +1,89 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>VZT Flow</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: transparent;
+    overflow: hidden;
+    -webkit-user-select: none;
+    user-select: none;
+    cursor: default;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
+  }
+  #pill {
+    width: 220px;
+    height: 64px;
+    box-sizing: border-box;
+    background: rgba(20, 20, 26, 0.86);
+    border-radius: 20px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    padding: 0 16px;
+    box-shadow: 0 6px 24px rgba(0, 0, 0, 0.35);
+  }
+  .dot {
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    background: #ff453a;
+    flex-shrink: 0;
+    animation: pulse 1s ease-in-out infinite;
+  }
+  @keyframes pulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.55; transform: scale(0.82); }
+  }
+  #bars {
+    display: flex;
+    align-items: center;
+    gap: 3px;
+    height: 28px;
+    flex: 1;
+  }
+  #bars span {
+    display: block;
+    width: 3px;
+    min-height: 4px;
+    border-radius: 2px;
+    background: #5ee7ff;
+    transition: height 60ms linear;
+  }
+  .spinner {
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    border: 3px solid rgba(94, 231, 255, 0.25);
+    border-top-color: #5ee7ff;
+    animation: spin 0.8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .check {
+    width: 22px;
+    height: 22px;
+    color: #6bffa1;
+  }
+  #label {
+    color: rgba(255, 255, 255, 0.82);
+    font-size: 12px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  #pill.hidden { display: none; }
+</style>
+</head>
+<body>
+  <div id="pill" class="hidden">
+    <div id="leading"></div>
+    <div id="bars"></div>
+    <div id="label"></div>
+  </div>
+  <script src="overlay.js"></script>
+</body>
+</html>
