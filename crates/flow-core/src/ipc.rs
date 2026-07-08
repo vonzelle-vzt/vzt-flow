@@ -265,6 +265,36 @@ pub mod unix {
     }
 }
 
+/// Cross-platform "is a daemon reachable, and can we round-trip a request"
+/// facade used by CLI commands (`daemon_client`, `doctor`) that don't need
+/// the rest of `unix`'s bind/serve surface. On Unix this just re-exports the
+/// socket transport above. On Windows there is no transport implemented yet
+/// (see the module docs), so every call reports "not running"/"not
+/// supported" instead of failing to compile — callers already have a
+/// standalone (no-daemon) fallback path for exactly this case.
+#[cfg(unix)]
+pub mod transport {
+    pub use super::unix::{call, is_alive};
+}
+
+#[cfg(not(unix))]
+pub mod transport {
+    use super::*;
+    use std::path::Path;
+    use std::time::Duration;
+
+    pub fn is_alive(_path: &Path) -> bool {
+        false
+    }
+
+    pub fn call(_path: &Path, _req: &Request, _read_timeout: Option<Duration>) -> Result<Response> {
+        anyhow::bail!(
+            "the vzt-flow daemon control socket is not supported on this platform yet; \
+             use the standalone CLI commands instead (they don't require a running daemon)"
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

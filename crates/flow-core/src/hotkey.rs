@@ -25,36 +25,8 @@
 //! coordinator maintains — functionally the same "only cancels while
 //! recording" behavior, with one tap instead of two.
 
-use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU16, Ordering};
-use std::sync::mpsc::Sender;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use std::thread;
-use std::time::Duration;
-
-use core_foundation::base::TCFType;
-use core_foundation::mach_port::CFMachPortRef;
-use core_foundation::runloop::{kCFRunLoopCommonModes, kCFRunLoopDefaultMode, CFRunLoop};
-use core_graphics::event::{
-    CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
-    CGEventType, CallbackResult, EventField,
-};
-
-use crate::config::ESCAPE_KEYCODE;
-
-// `core-graphics` 0.25 exposes `CGEventTap::enable()` but keeps the raw
-// `CGEventTapEnable` FFI private, and there is no way to reach the owning
-// `CGEventTap` from inside its own callback. We re-declare the symbol so the
-// callback can re-arm the tap the instant macOS disables it (see F1). The
-// symbol lives in the CoreGraphics framework, already linked transitively via
-// `core-graphics`, so no extra `#[link]` is required.
-extern "C" {
-    fn CGEventTapEnable(tap: CFMachPortRef, enable: bool);
-}
-
-/// How often the watchdog wakes to unconditionally re-arm the tap, as a
-/// belt-and-braces backstop to the in-callback re-enable.
-const WATCHDOG_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HotkeyEvent {
@@ -72,7 +44,49 @@ pub fn new_recording_flag() -> Arc<AtomicBool> {
     Arc::new(AtomicBool::new(false))
 }
 
-/// Maps a modifier key's virtual keycode to the device-independent
+/// macOS hold-to-talk monitoring via a `CGEventTap`. Gated out on every
+/// other platform — see the module docs above for why this can't be
+/// `tauri-plugin-global-shortcut` for a modifier-only binding, and see
+/// `apps/desktop/src-tauri/src/coordinator.rs` for the Windows equivalent
+/// (which *does* use that plugin, since Windows has no modifier-only
+/// binding to support in the first place — its default binding is a normal
+/// key combo, and registering that only needs an `AppHandle`, which this
+/// platform-agnostic crate deliberately doesn't depend on).
+#[cfg(target_os = "macos")]
+mod macos {
+    use super::HotkeyEvent;
+    use std::ffi::c_void;
+    use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU16, Ordering};
+    use std::sync::mpsc::Sender;
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::Duration;
+
+    use core_foundation::base::TCFType;
+    use core_foundation::mach_port::CFMachPortRef;
+    use core_foundation::runloop::{kCFRunLoopCommonModes, kCFRunLoopDefaultMode, CFRunLoop};
+    use core_graphics::event::{
+        CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
+        CGEventType, CallbackResult, EventField,
+    };
+
+    use crate::config::ESCAPE_KEYCODE;
+
+    // `core-graphics` 0.25 exposes `CGEventTap::enable()` but keeps the raw
+    // `CGEventTapEnable` FFI private, and there is no way to reach the owning
+    // `CGEventTap` from inside its own callback. We re-declare the symbol so the
+    // callback can re-arm the tap the instant macOS disables it (see F1). The
+    // symbol lives in the CoreGraphics framework, already linked transitively via
+    // `core-graphics`, so no extra `#[link]` is required.
+    extern "C" {
+        fn CGEventTapEnable(tap: CFMachPortRef, enable: bool);
+    }
+
+    /// How often the watchdog wakes to unconditionally re-arm the tap, as a
+    /// belt-and-braces backstop to the in-callback re-enable.
+    const WATCHDOG_INTERVAL: Duration = Duration::from_secs(5);
+
+    /// Maps a modifier key's virtual keycode to the device-independent
 /// `CGEventFlags` bit that reflects its current up/down state. Only
 /// modifier keys are supported as hold-to-talk bindings (a non-modifier
 /// key held down would auto-repeat keyDown events instead of producing a
@@ -280,4 +294,23 @@ mod tests {
         let after_reset = false;
         assert_eq!(hold_edge(after_reset, true), Some(HotkeyEvent::HoldKeyPressed));
     }
+    }
+} // mod macos
+
+#[cfg(target_os = "macos")]
+pub use macos::spawn_monitor;
+
+/// Non-macOS stub. Always fails to install — there is no in-process global
+/// hotkey monitor in `flow-core` on this platform. The desktop app installs
+/// its own platform-appropriate monitor instead (see
+/// `apps/desktop/src-tauri/src/coordinator.rs`, which uses
+/// `tauri-plugin-global-shortcut` on Windows); this crate has no `AppHandle`
+/// to register shortcuts through, so it can't do that itself.
+#[cfg(not(target_os = "macos"))]
+pub fn spawn_monitor(
+    _initial_keycode: u16,
+    _is_recording: Arc<AtomicBool>,
+    _tx: std::sync::mpsc::Sender<HotkeyEvent>,
+) -> Result<Arc<std::sync::atomic::AtomicU16>, ()> {
+    Err(())
 }

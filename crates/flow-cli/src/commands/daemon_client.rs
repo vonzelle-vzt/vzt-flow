@@ -4,15 +4,16 @@
 use std::time::Duration;
 
 use anyhow::Result;
-use flow_core::ipc::{unix, Request, Response};
+use flow_core::ipc::{transport, Request, Response};
 
 /// Best-effort check for "is a daemon currently listening". `false` covers
-/// both "never started" and "stale socket file left behind" — callers that
-/// need to distinguish those can call `flow_core::ipc::unix::is_alive`
+/// both "never started" and "stale socket file left behind" (and, on
+/// Windows, "no daemon transport exists yet") — callers that need to
+/// distinguish the Unix cases can call `flow_core::ipc::unix::is_alive`
 /// directly.
 pub fn is_daemon_running() -> bool {
     match flow_core::ipc::socket_path() {
-        Ok(path) => unix::is_alive(&path),
+        Ok(path) => transport::is_alive(&path),
         Err(_) => false,
     }
 }
@@ -25,7 +26,7 @@ pub fn is_daemon_running() -> bool {
 /// replying.
 pub fn call(req: &Request, read_timeout: Option<Duration>) -> Option<Response> {
     let path = flow_core::ipc::socket_path().ok()?;
-    unix::call(&path, req, read_timeout).ok()
+    transport::call(&path, req, read_timeout).ok()
 }
 
 /// Same as [`call`] but surfaces the connection error instead of swallowing
@@ -33,5 +34,5 @@ pub fn call(req: &Request, read_timeout: Option<Duration>) -> Option<Response> {
 /// explicit error rather than silently doing nothing.
 pub fn call_required(req: &Request, read_timeout: Option<Duration>) -> Result<Response> {
     let path = flow_core::ipc::socket_path()?;
-    unix::call(&path, req, read_timeout)
+    transport::call(&path, req, read_timeout)
 }

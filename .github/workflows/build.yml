@@ -1,0 +1,113 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Cheap, fast typecheck job that doesn't need a Rust toolchain or a built
+  # Rust binary — catches TS errors in the MCP server without waiting on
+  # the platform build jobs below.
+  typecheck-mcp:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: mcp/package-lock.json
+      - name: Install MCP dependencies
+        working-directory: mcp
+        run: npm ci
+      - name: Typecheck (tsc --noEmit)
+        working-directory: mcp
+        run: npx tsc -p . --noEmit
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install frontend/MCP dependencies
+        run: |
+          npm ci --prefix apps/desktop
+          npm ci --prefix mcp
+          npm run build --prefix mcp
+      - name: cargo test --release (workspace)
+        run: cargo test --release --workspace
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^2" --locked
+
+      - name: tauri build (aarch64, unsigned/local build — no notarization in CI)
+        working-directory: apps/desktop
+        run: cargo tauri build --target aarch64-apple-darwin
+
+      - name: Locate dmg artifact
+        id: find_dmg
+        run: |
+          DMG=$(find apps/desktop/src-tauri/target/aarch64-apple-darwin/release/bundle/dmg -name '*.dmg' | head -n1)
+          echo "path=$DMG" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vzt-flow-macos-aarch64-dmg
+          path: ${{ steps.find_dmg.outputs.path }}
+          if-no-files-found: error
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install frontend/MCP dependencies
+        run: |
+          npm ci --prefix apps/desktop
+          npm ci --prefix mcp
+          npm run build --prefix mcp
+      - name: cargo test --release (workspace)
+        run: cargo test --release --workspace
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^2" --locked
+
+      - name: tauri build (x64, unsigned — no code signing in CI)
+        working-directory: apps/desktop
+        run: cargo tauri build --target x86_64-pc-windows-msvc
+
+      - name: Locate msi/nsis artifacts
+        id: find_installers
+        shell: bash
+        run: |
+          mkdir -p /tmp/vzt-flow-windows-artifacts
+          find apps/desktop/src-tauri/target/x86_64-pc-windows-msvc/release/bundle \
+            \( -name '*.msi' -o -name '*.exe' \) -exec cp {} /tmp/vzt-flow-windows-artifacts/ \;
+          ls -la /tmp/vzt-flow-windows-artifacts
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vzt-flow-windows-x64-installers
+          path: /tmp/vzt-flow-windows-artifacts/*
+          if-no-files-found: error

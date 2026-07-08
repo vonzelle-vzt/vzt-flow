@@ -78,6 +78,90 @@ pub struct ListenOutcome {
     pub duration_s: f64,
 }
 
+/// Installs the platform hold-to-talk hotkey monitor and forwards its
+/// press/release events onto `tx`. Returns whether installation succeeded.
+///
+/// macOS uses `flow_core::hotkey`'s `CGEventTap` (see that module's docs for
+/// why — modifier-only bindings can't go through
+/// `tauri-plugin-global-shortcut`). Windows *does* use that plugin, since
+/// its default binding is a normal key combo rather than a bare modifier,
+/// and registering one only needs the `AppHandle` this function already has
+/// — no reason to duplicate an OS-level tap for it.
+#[cfg(target_os = "macos")]
+fn spawn_hotkey_monitor(
+    app: &AppHandle,
+    keycode: u16,
+    is_recording: Arc<AtomicBool>,
+    tx: Sender<HotkeyEvent>,
+) -> bool {
+    let hotkey_result = flow_core::hotkey::spawn_monitor(keycode, is_recording, tx);
+    let active = hotkey_result.is_ok();
+    if let Ok(keycode_handle) = &hotkey_result {
+        *app.state::<AppState>().hotkey_keycode_handle.lock().unwrap() = Some(keycode_handle.clone());
+    } else {
+        eprintln!(
+            "[vzt-flow] hotkey monitor failed to install a CGEventTap — this almost always means \
+             Input Monitoring permission hasn't been granted (System Settings > Privacy & Security \
+             > Input Monitoring). The tray's manual Start/Stop item still works."
+        );
+    }
+    active
+}
+
+/// Windows hold-to-talk binding: Ctrl+Shift+Space via
+/// `tauri-plugin-global-shortcut` (registered here at runtime; the plugin
+/// itself is added to the Tauri builder in `lib.rs`, Windows-only). Not
+/// Right Option/Alt like macOS's default — the plugin does not support
+/// modifier-only shortcuts on Windows (verified against the plugin's docs
+/// before writing this, per the same standard `hotkey.rs` documents for its
+/// own macOS-vs-plugin decision), so a normal key combo is used instead.
+///
+/// Escape-to-cancel is not wired up on Windows yet: unlike the macOS tap
+/// (which is `ListenOnly` and never consumes Escape for other apps), a
+/// globally *registered* Escape shortcut would swallow Escape everywhere,
+/// which is unacceptable UX. `flow cancel` isn't available either, since the
+/// daemon control socket is Unix-only for now (see `flow_core::ipc`). The
+/// tray's "Start/Stop dictation" item remains the way to end a recording
+/// early on this platform. Documented as a known gap in the README.
+#[cfg(target_os = "windows")]
+fn spawn_hotkey_monitor(
+    app: &AppHandle,
+    _keycode: u16,
+    _is_recording: Arc<AtomicBool>,
+    tx: Sender<HotkeyEvent>,
+) -> bool {
+    use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
+
+    let shortcut = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::Space);
+    let result = app.global_shortcut().on_shortcut(shortcut, move |_app, _shortcut, event| {
+        let hk = match event.state {
+            ShortcutState::Pressed => HotkeyEvent::HoldKeyPressed,
+            ShortcutState::Released => HotkeyEvent::HoldKeyReleased,
+        };
+        let _ = tx.send(hk);
+    });
+    match result {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!(
+                "[vzt-flow] failed to register global hotkey Ctrl+Shift+Space: {e}. \
+                 The tray's manual Start/Stop item still works."
+            );
+            false
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn spawn_hotkey_monitor(
+    _app: &AppHandle,
+    _keycode: u16,
+    _is_recording: Arc<AtomicBool>,
+    _tx: Sender<HotkeyEvent>,
+) -> bool {
+    false
+}
+
 /// Spawns the audio worker, model manager, and hotkey monitor threads, then
 /// the coordinator thread itself. Returns the sender used to feed it
 /// messages (stored in `AppState` for the tray/commands to reach it) and
@@ -153,18 +237,8 @@ pub fn spawn(
 
     // --- hotkey monitor ---
     let (hotkey_tx, hotkey_rx) = mpsc::channel::<HotkeyEvent>();
-    let hotkey_result =
-        flow_core::hotkey::spawn_monitor(config.hotkey_keycode, is_recording.clone(), hotkey_tx);
-    let hotkey_active = hotkey_result.is_ok();
-    if let Ok(keycode_handle) = &hotkey_result {
-        *app.state::<AppState>().hotkey_keycode_handle.lock().unwrap() = Some(keycode_handle.clone());
-    } else {
-        eprintln!(
-            "[vzt-flow] hotkey monitor failed to install a CGEventTap — this almost always means \
-             Input Monitoring permission hasn't been granted (System Settings > Privacy & Security \
-             > Input Monitoring). The tray's manual Start/Stop item still works."
-        );
-    }
+    let hotkey_active =
+        spawn_hotkey_monitor(&app, config.hotkey_keycode, is_recording.clone(), hotkey_tx);
     {
         let tx = unified_tx.clone();
         std::thread::spawn(move || {

@@ -18,12 +18,9 @@ use sha2::{Digest, Sha256};
 const PARAKEET_V3_URL: &str = "https://blob.handy.computer/parakeet-v3-int8.tar.gz";
 
 pub fn model_root_dir() -> Result<PathBuf> {
-    // The brief specifies the literal `~/.config/vzt-flow/models` path.
-    // `dirs::config_dir()` would resolve to `~/Library/Application
-    // Support` on macOS per platform convention, so we build the Unix-style
-    // path explicitly off the home directory instead.
-    let home = dirs::home_dir().context("could not determine home directory")?;
-    Ok(home.join(".config").join("vzt-flow").join("models"))
+    // Shares `config::config_dir()`'s platform split: literal
+    // `~/.config/vzt-flow` on macOS, `%APPDATA%\vzt-flow` on Windows.
+    Ok(crate::config::config_dir()?.join("models"))
 }
 
 pub fn parakeet_model_dir() -> Result<PathBuf> {

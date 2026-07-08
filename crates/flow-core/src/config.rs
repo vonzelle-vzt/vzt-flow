@@ -63,9 +63,22 @@ impl Default for Config {
     }
 }
 
+/// `~/.config/vzt-flow` on macOS (deliberately not `dirs::config_dir()`,
+/// which would resolve to `~/Library/Application Support` — every existing
+/// install and this module's own doc comments assume the literal
+/// `~/.config` path). On Windows there is no `~/.config` convention, so we
+/// use `dirs::config_dir()` there instead, which resolves to `%APPDATA%`.
 pub fn config_dir() -> Result<PathBuf> {
-    let home = dirs::home_dir().context("could not determine home directory")?;
-    Ok(home.join(".config").join("vzt-flow"))
+    #[cfg(target_os = "macos")]
+    {
+        let home = dirs::home_dir().context("could not determine home directory")?;
+        Ok(home.join(".config").join("vzt-flow"))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let base = dirs::config_dir().context("could not determine config directory")?;
+        Ok(base.join("vzt-flow"))
+    }
 }
 
 pub fn config_path() -> Result<PathBuf> {

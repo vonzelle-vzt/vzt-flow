@@ -15,11 +15,21 @@ use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
-        .plugin(tauri_plugin_autostart::init(
-            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
-            None,
-        ))
+    #[allow(unused_mut)]
+    let mut builder = tauri::Builder::default().plugin(tauri_plugin_autostart::init(
+        tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+        None,
+    ));
+
+    // Windows hold-to-talk hotkey uses this plugin (see coordinator.rs's
+    // `spawn_hotkey_monitor`); macOS uses flow-core's CGEventTap instead and
+    // never registers it, so it's only added to the builder here.
+    #[cfg(target_os = "windows")]
+    {
+        builder = builder.plugin(tauri_plugin_global_shortcut::Builder::new().build());
+    }
+
+    builder
         .invoke_handler(tauri::generate_handler![
             commands::get_config,
             commands::set_config,

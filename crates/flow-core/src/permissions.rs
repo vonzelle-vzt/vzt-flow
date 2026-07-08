@@ -34,11 +34,16 @@ mod macos {
 
 #[cfg(not(target_os = "macos"))]
 mod macos {
+    /// No "secure input mode" concept off macOS; never block a paste for it.
     pub fn secure_input_enabled() -> bool {
         false
     }
+    /// No TCC/Accessibility-style permission gate off macOS — Windows has no
+    /// equivalent one-time grant to check, so report "trusted" rather than
+    /// permanently skipping every paste. (UIPI privilege-boundary paste
+    /// failures aren't detected here; see `insert.rs`.)
     pub fn accessibility_trusted() -> bool {
-        false
+        true
     }
 }
 

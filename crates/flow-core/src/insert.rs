@@ -75,7 +75,7 @@ pub fn paste_text(text: &str) -> Result<PasteOutcome> {
     } else if !accessibility_trusted() {
         PasteOutcome::SkippedNoAccessibility
     } else {
-        simulate_cmd_v()?;
+        simulate_paste()?;
         PasteOutcome::Pasted
     };
 
@@ -114,17 +114,39 @@ pub fn paste_text(text: &str) -> Result<PasteOutcome> {
     Ok(outcome)
 }
 
-fn simulate_cmd_v() -> Result<()> {
+/// The platform's "paste" modifier: Cmd on macOS, Ctrl everywhere else
+/// (Windows/Linux). enigo itself is cross-platform; only the key differs.
+#[cfg(target_os = "macos")]
+fn paste_modifier() -> Key {
+    Key::Meta
+}
+#[cfg(not(target_os = "macos"))]
+fn paste_modifier() -> Key {
+    Key::Control
+}
+
+/// Simulates the OS paste shortcut (Cmd+V / Ctrl+V) via enigo.
+///
+/// Windows note: unlike macOS's secure-input check above, there is no API
+/// queried here for UIPI (User Interface Privilege Isolation) — a
+/// lower-privilege process's synthetic input is silently dropped by a
+/// higher-privilege target window (e.g. an elevated app), with no error
+/// enigo can observe. We don't attempt to detect that case; the transcript
+/// is always left on the clipboard first (see `paste_text` above), so the
+/// worst case is the user pastes manually instead of it landing
+/// automatically. Revisit if this turns out to bite real users.
+fn simulate_paste() -> Result<()> {
     let mut enigo = Enigo::new(&Settings::default()).context("failed to init enigo")?;
+    let modifier = paste_modifier();
     enigo
-        .key(Key::Meta, Direction::Press)
-        .context("failed to press Cmd")?;
+        .key(modifier, Direction::Press)
+        .context("failed to press paste modifier")?;
     enigo
         .key(Key::Unicode('v'), Direction::Click)
         .context("failed to click V")?;
     enigo
-        .key(Key::Meta, Direction::Release)
-        .context("failed to release Cmd")?;
+        .key(modifier, Direction::Release)
+        .context("failed to release paste modifier")?;
     Ok(())
 }
 

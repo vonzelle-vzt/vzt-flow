@@ -10,7 +10,7 @@
 use std::sync::mpsc;
 use std::time::Duration;
 
-use flow_core::ipc::{unix, Request, Response};
+use flow_core::ipc::{Request, Response};
 use flow_core::model_manager::ModelCommand;
 use tauri::{AppHandle, Manager};
 
@@ -20,7 +20,14 @@ use crate::state::{AppState, ModelLifecycle};
 /// Spawns the socket-accept loop on a dedicated thread. Binding happens
 /// synchronously (so a bind failure surfaces immediately, before `setup()`
 /// returns) and the loop itself runs for the lifetime of the process.
+///
+/// Unix only: there is no daemon transport implemented for Windows yet (see
+/// `flow_core::ipc`'s module docs) — `lib.rs`'s `setup()` already treats a
+/// bind failure as non-fatal (logged, app keeps running without the
+/// scriptable socket), so the Windows stub below just reports that.
+#[cfg(unix)]
 pub fn spawn(app: AppHandle) -> anyhow::Result<()> {
+    use flow_core::ipc::unix;
     let path = flow_core::ipc::socket_path()?;
     let listener = unix::bind(&path)?;
     eprintln!("[vzt-flow] daemon socket listening at {}", path.display());
@@ -34,16 +41,29 @@ pub fn spawn(app: AppHandle) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(not(unix))]
+pub fn spawn(_app: AppHandle) -> anyhow::Result<()> {
+    anyhow::bail!(
+        "the daemon control socket is not supported on this platform yet; \
+         the app still works without it, just not scriptably via `flow`/MCP"
+    )
+}
+
 /// Best-effort cleanup on shutdown — removes the socket file so a stale
 /// entry doesn't cause the next launch's `bind` to think a daemon is still
 /// alive (the `bind`/connect-test dance handles that anyway, but removing
 /// it here keeps `flow doctor` from reporting a bogus stale-file warning
 /// between a clean quit and the next launch).
+#[cfg(unix)]
 pub fn cleanup() {
+    use flow_core::ipc::unix;
     if let Ok(path) = flow_core::ipc::socket_path() {
         unix::cleanup(&path);
     }
 }
+
+#[cfg(not(unix))]
+pub fn cleanup() {}
 
 fn handle_request(app: &AppHandle, req: Request) -> Response {
     match req {

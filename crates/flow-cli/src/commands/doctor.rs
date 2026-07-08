@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use flow_core::audio::default_input_device_info;
-use flow_core::ipc::{unix, Request};
+use flow_core::ipc::{transport, Request};
 use flow_core::models::{check_cleanup_model, check_parakeet_model, model_root_dir};
 
 pub fn run() -> Result<()> {
@@ -65,9 +65,9 @@ pub fn run() -> Result<()> {
         Ok(path) => {
             if !path.exists() {
                 println!("Daemon socket: not present ({})", path.display());
-            } else if unix::is_alive(&path) {
+            } else if transport::is_alive(&path) {
                 println!("Daemon socket: PRESENT and alive ({})", path.display());
-                match unix::call(&path, &Request::Status, Some(Duration::from_secs(5))) {
+                match transport::call(&path, &Request::Status, Some(Duration::from_secs(5))) {
                     Ok(resp) if resp.ok => {
                         println!("Daemon version: {}", resp.version.as_deref().unwrap_or("unknown"));
                         println!("Daemon state: {}", resp.state.as_deref().unwrap_or("unknown"));
