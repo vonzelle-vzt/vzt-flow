@@ -27,6 +27,13 @@ pub struct Config {
     pub hold_threshold_ms: u64,
     /// Seconds of transcriber inactivity before the model is unloaded.
     pub idle_unload_secs: u64,
+    /// Hard cap (seconds) on a single hold-to-talk recording. When reached
+    /// the recording auto-stops and what was captured is transcribed (not
+    /// discarded), so a stuck key can never record forever.
+    pub max_hold_secs: u64,
+    /// Hard cap (seconds) on a single hands-free (tap-to-toggle) recording.
+    /// Higher than the hold cap since hands-free is meant for longer dictation.
+    pub max_handsfree_secs: u64,
     /// Launch the app at login (mirrors tauri-plugin-autostart state; kept
     /// here too so Settings can render it without an async round-trip).
     pub launch_at_login: bool,
@@ -39,6 +46,8 @@ impl Default for Config {
             hotkey_label: "Right Option".to_string(),
             hold_threshold_ms: 300,
             idle_unload_secs: 300,
+            max_hold_secs: 120,
+            max_handsfree_secs: 300,
             launch_at_login: false,
         }
     }

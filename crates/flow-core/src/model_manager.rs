@@ -63,20 +63,41 @@ pub fn spawn(
                         }
                         let transcriber = model.as_mut().expect("model just loaded or already present");
                         let started = Instant::now();
-                        let result = transcriber.transcribe(&samples);
+                        // A panic inside the ONNX inference path (bad tensor
+                        // shape, allocator abort, etc.) must not take down this
+                        // thread — that would wedge every future dictation in
+                        // Transcribing forever. Catch it, reply Err, and drop
+                        // the transcriber so the next command reloads cleanly.
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            transcriber.transcribe(&samples)
+                        }));
                         let infer_time = started.elapsed();
-                        let rtf = if audio_duration.as_secs_f64() > 0.0 {
-                            infer_time.as_secs_f64() / audio_duration.as_secs_f64()
-                        } else {
-                            0.0
-                        };
-                        eprintln!(
-                            "[vzt-flow] transcribed {:.2}s audio in {:.2}s (RTF {:.3})",
-                            audio_duration.as_secs_f64(),
-                            infer_time.as_secs_f64(),
-                            rtf
-                        );
-                        let _ = reply.send(result.map_err(|e| e.to_string()));
+                        match result {
+                            Ok(transcript) => {
+                                let rtf = if audio_duration.as_secs_f64() > 0.0 {
+                                    infer_time.as_secs_f64() / audio_duration.as_secs_f64()
+                                } else {
+                                    0.0
+                                };
+                                eprintln!(
+                                    "[vzt-flow] transcribed {:.2}s audio in {:.2}s (RTF {:.3})",
+                                    audio_duration.as_secs_f64(),
+                                    infer_time.as_secs_f64(),
+                                    rtf
+                                );
+                                let _ = reply.send(transcript.map_err(|e| e.to_string()));
+                            }
+                            Err(_panic) => {
+                                eprintln!(
+                                    "[vzt-flow] transcriber panicked; dropping model to force a \
+                                     clean reload on the next request"
+                                );
+                                model = None;
+                                let _ = reply.send(Err(
+                                    "transcription failed (internal error)".to_string()
+                                ));
+                            }
+                        }
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => {
                         if model.is_some() && last_used.elapsed() >= idle_timeout {

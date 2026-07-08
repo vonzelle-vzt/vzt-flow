@@ -130,9 +130,17 @@ pub fn spawn(
 /// which "press generation" it belongs to — lets a delayed hold-check
 /// ignore itself if the key was released (or pressed again) in the
 /// meantime.
+///
+/// `consumed` guards the tap-vs-hold decision at release time (F4): a press
+/// whose recording was cancelled, capped, or otherwise already resolved is
+/// marked consumed, so its eventual key-release is a no-op instead of being
+/// misread as a fresh short tap that arms hands-free. Only a genuine short
+/// tap (press→release under the hold threshold, still unconsumed) toggles
+/// hands-free.
 struct HoldTracker {
     key_down: Arc<AtomicBool>,
     generation: Arc<AtomicU64>,
+    consumed: Arc<AtomicBool>,
 }
 
 fn run_coordinator(
@@ -144,6 +152,7 @@ fn run_coordinator(
     let hold = HoldTracker {
         key_down: Arc::new(AtomicBool::new(false)),
         generation: Arc::new(AtomicU64::new(0)),
+        consumed: Arc::new(AtomicBool::new(false)),
     };
     while let Ok(msg) = rx.recv() {
         let state = app.state::<AppState>();
@@ -151,6 +160,8 @@ fn run_coordinator(
             CoordinatorMsg::Hotkey(HotkeyEvent::HoldKeyPressed) => {
                 hold.key_down.store(true, Ordering::Relaxed);
                 let gen = hold.generation.fetch_add(1, Ordering::Relaxed) + 1;
+                // Fresh press: nothing resolved yet.
+                hold.consumed.store(false, Ordering::Relaxed);
 
                 let hands_free = state.hands_free_active.load(Ordering::Relaxed);
                 if hands_free {
@@ -166,42 +177,63 @@ fn run_coordinator(
                 let app2 = app.clone();
                 let key_down = hold.key_down.clone();
                 let generation = hold.generation.clone();
-                let threshold = Duration::from_millis(
-                    app2.state::<AppState>().config.lock().unwrap().hold_threshold_ms,
-                );
+                let consumed = hold.consumed.clone();
+                let (threshold, max_hold_secs) = {
+                    let st = app2.state::<AppState>();
+                    let cfg = st.config.lock().unwrap();
+                    (
+                        Duration::from_millis(cfg.hold_threshold_ms),
+                        cfg.max_hold_secs,
+                    )
+                };
                 std::thread::spawn(move || {
                     std::thread::sleep(threshold);
                     let still_same_press = generation.load(Ordering::Relaxed) == gen;
                     let still_down = key_down.load(Ordering::Relaxed);
-                    if still_same_press && still_down {
+                    let not_consumed = !consumed.load(Ordering::Relaxed);
+                    if still_same_press && still_down && not_consumed {
                         let state = app2.state::<AppState>();
                         if *state.dictation_state.lock().unwrap() == DictationState::Idle {
-                            start_recording(&app2);
+                            start_recording(&app2, max_hold_secs);
                         }
                     }
                 });
             }
             CoordinatorMsg::Hotkey(HotkeyEvent::HoldKeyReleased) => {
                 hold.key_down.store(false, Ordering::Relaxed);
+                // This release resolves the current press no matter what;
+                // mark it consumed so any later re-entry can't reuse it.
+                let was_consumed = hold.consumed.swap(true, Ordering::Relaxed);
                 let hands_free = state.hands_free_active.load(Ordering::Relaxed);
                 let current = *state.dictation_state.lock().unwrap();
 
                 if hands_free {
+                    // Tap while hands-free was live: toggle it off.
                     state.hands_free_active.store(false, Ordering::Relaxed);
                     stop_and_transcribe(&audio_cmd_tx);
                 } else if current == DictationState::Recording {
                     // Hold threshold had already fired and recording is
                     // under way: this release ends it.
                     stop_and_transcribe(&audio_cmd_tx);
-                } else if current == DictationState::Idle {
-                    // Released before the hold threshold fired: a tap.
-                    // Toggle hands-free recording on.
+                } else if current == DictationState::Idle && !was_consumed {
+                    // Genuine short tap (Idle, released before the hold
+                    // threshold, and not already resolved by an Escape-cancel
+                    // or an early cap): toggle hands-free recording on.
+                    //
+                    // The `!was_consumed` guard is the fix for F4 — without it
+                    // an Idle reached via Escape-cancel or a cap-that-outlived
+                    // its transcription would be misread as a tap and silently
+                    // start a surprise hands-free recording.
                     state.hands_free_active.store(true, Ordering::Relaxed);
-                    start_recording(&app);
+                    start_recording(&app, max_handsfree_secs(&app));
                 }
+                // else: consumed, or mid-transcription/paste — no-op.
             }
             CoordinatorMsg::Hotkey(HotkeyEvent::CancelRequested) => {
                 if *state.dictation_state.lock().unwrap() == DictationState::Recording {
+                    // The recording is being thrown away; mark the in-flight
+                    // press consumed so its release doesn't arm hands-free (F4).
+                    hold.consumed.store(true, Ordering::Relaxed);
                     state.hands_free_active.store(false, Ordering::Relaxed);
                     let _ = audio_cmd_tx.send(AudioCommand::Cancel);
                 }
@@ -209,8 +241,11 @@ fn run_coordinator(
             CoordinatorMsg::TrayToggleDictation => {
                 let current = *state.dictation_state.lock().unwrap();
                 if current == DictationState::Idle {
+                    // Manual start behaves like a hands-free session; consume
+                    // any dangling press so a stray release can't double-toggle.
+                    hold.consumed.store(true, Ordering::Relaxed);
                     state.hands_free_active.store(true, Ordering::Relaxed);
-                    start_recording(&app);
+                    start_recording(&app, max_handsfree_secs(&app));
                 } else if current == DictationState::Recording {
                     state.hands_free_active.store(false, Ordering::Relaxed);
                     stop_and_transcribe(&audio_cmd_tx);
@@ -220,7 +255,16 @@ fn run_coordinator(
             CoordinatorMsg::Audio(AudioReply::Level(level)) => {
                 overlay::emit_overlay(&app, OverlayEvent::Recording { level });
             }
-            CoordinatorMsg::Audio(AudioReply::Stopped { samples, duration }) => {
+            CoordinatorMsg::Audio(AudioReply::Stopped { samples, duration, capped }) => {
+                if capped {
+                    // The worker auto-stopped at the max-duration cap while the
+                    // key may still be physically held. Reset the mode flag and
+                    // consume the in-flight press so its eventual release is a
+                    // no-op rather than a surprise hands-free toggle (F3/F4).
+                    state.hands_free_active.store(false, Ordering::Relaxed);
+                    hold.consumed.store(true, Ordering::Relaxed);
+                    eprintln!("[vzt-flow] recording hit max-duration cap; transcribing what was captured");
+                }
                 state.set_dictation_state(DictationState::Transcribing);
                 tray::refresh_menu(&app);
                 overlay::emit_overlay(&app, OverlayEvent::Transcribing);
@@ -238,15 +282,52 @@ fn run_coordinator(
                 }
                 let forward_tx = state.coordinator_tx.lock().unwrap().clone();
                 std::thread::spawn(move || {
-                    if let Ok(result) = reply_rx.recv() {
-                        if let Some(tx) = forward_tx {
-                            let _ = tx.send(CoordinatorMsg::TranscribeResult {
-                                result,
-                                audio_duration: duration,
-                            });
-                        }
+                    // Never wait forever on the transcriber. A dropped reply
+                    // channel (panicked worker) surfaces as RecvError; a wedged
+                    // inference trips the 60s timeout. Either way synthesize an
+                    // error result so the state machine leaves Transcribing and
+                    // the overlay is dismissed instead of hanging (F2).
+                    let result = match reply_rx.recv_timeout(Duration::from_secs(60)) {
+                        Ok(result) => result,
+                        Err(_) => Err("transcription failed".to_string()),
+                    };
+                    if let Some(tx) = forward_tx {
+                        let _ = tx.send(CoordinatorMsg::TranscribeResult {
+                            result,
+                            audio_duration: duration,
+                        });
                     }
                 });
+            }
+            CoordinatorMsg::Audio(AudioReply::Disconnected { samples, duration }) => {
+                // Input device faulted mid-recording (F8). Reset mode flags and
+                // consume the in-flight press, then either salvage the take
+                // (worker already discarded anything under ~1s, handing back an
+                // empty buffer) or show a brief "mic disconnected" note.
+                state.hands_free_active.store(false, Ordering::Relaxed);
+                hold.consumed.store(true, Ordering::Relaxed);
+                if samples.is_empty() {
+                    eprintln!("[vzt-flow] microphone disconnected mid-recording; nothing to salvage");
+                    state.set_dictation_state(DictationState::Idle);
+                    overlay::emit_overlay(
+                        &app,
+                        OverlayEvent::Message { text: "Microphone disconnected".to_string() },
+                    );
+                    let app2 = app.clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_millis(1500));
+                        overlay::hide_overlay(&app2);
+                    });
+                } else {
+                    eprintln!("[vzt-flow] microphone disconnected mid-recording; transcribing the {:.1}s captured", duration.as_secs_f64());
+                    if let Some(tx) = state.coordinator_tx.lock().unwrap().clone() {
+                        let _ = tx.send(CoordinatorMsg::Audio(AudioReply::Stopped {
+                            samples,
+                            duration,
+                            capped: false,
+                        }));
+                    }
+                }
             }
             CoordinatorMsg::Audio(AudioReply::Cancelled) => {
                 state.set_dictation_state(DictationState::Idle);
@@ -270,7 +351,17 @@ fn run_coordinator(
                     Err(e) => {
                         eprintln!("[vzt-flow] transcription error: {e}");
                         state.set_dictation_state(DictationState::Idle);
-                        overlay::hide_overlay(&app);
+                        // Surface the failure briefly instead of silently
+                        // vanishing, then dismiss (F2).
+                        overlay::emit_overlay(
+                            &app,
+                            OverlayEvent::Message { text: "Transcription failed".to_string() },
+                        );
+                        let app2 = app.clone();
+                        std::thread::spawn(move || {
+                            std::thread::sleep(Duration::from_millis(1500));
+                            overlay::hide_overlay(&app2);
+                        });
                     }
                 }
                 tray::refresh_menu(&app);
@@ -300,7 +391,16 @@ fn run_coordinator(
     }
 }
 
-fn start_recording(app: &AppHandle) {
+/// Reads the current hands-free max-recording cap from config.
+fn max_handsfree_secs(app: &AppHandle) -> u64 {
+    app.state::<AppState>()
+        .config
+        .lock()
+        .unwrap()
+        .max_handsfree_secs
+}
+
+fn start_recording(app: &AppHandle, max_secs: u64) {
     let state = app.state::<AppState>();
     state.set_dictation_state(DictationState::Recording);
     tray::refresh_menu(app);
@@ -308,7 +408,7 @@ fn start_recording(app: &AppHandle) {
     overlay::emit_overlay(app, OverlayEvent::Recording { level: 0.0 });
     let tx = state.audio_cmd_tx.lock().unwrap().clone();
     if let Some(tx) = tx {
-        let _ = tx.send(AudioCommand::Start);
+        let _ = tx.send(AudioCommand::Start { max_secs });
     }
 }
 

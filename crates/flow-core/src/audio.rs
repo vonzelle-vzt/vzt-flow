@@ -156,8 +156,10 @@ impl AudioRecorder {
 /// leave the thread that created them) and is driven entirely by this
 /// channel instead.
 pub enum AudioCommand {
-    /// Open the input stream and start accumulating samples.
-    Start,
+    /// Open the input stream and start accumulating samples. `max_secs` is a
+    /// hard cap: once the recording reaches it the worker auto-stops and
+    /// delivers what it captured (see [`AudioReply::Stopped`] `capped`).
+    Start { max_secs: u64 },
     /// Stop the current recording and reply with the resampled 16kHz mono
     /// audio plus its real-world duration.
     Stop,
@@ -168,8 +170,23 @@ pub enum AudioCommand {
 /// Messages the audio worker sends back to the coordinator.
 pub enum AudioReply {
     Started,
-    Stopped { samples: Vec<f32>, duration: Duration },
+    /// A recording finished. `capped` is true when it ended because it hit
+    /// the max-duration cap rather than a user Stop — the coordinator uses
+    /// that to reset mode flags and mark the in-flight key press consumed.
+    Stopped {
+        samples: Vec<f32>,
+        duration: Duration,
+        capped: bool,
+    },
     Cancelled,
+    /// The input device faulted mid-recording (unplugged, format change,
+    /// etc.). `samples` carries what was captured when it's long enough to be
+    /// worth transcribing (>1s), otherwise it is empty and should be
+    /// discarded. Either way the coordinator returns to Idle.
+    Disconnected {
+        samples: Vec<f32>,
+        duration: Duration,
+    },
     /// Roughly-15Hz input level updates (peak amplitude in `[0, 1]`) for
     /// driving the overlay's level bars while recording.
     Level(f32),
@@ -177,6 +194,21 @@ pub enum AudioReply {
 }
 
 const LEVEL_UPDATE_INTERVAL: Duration = Duration::from_millis(66); // ~15 Hz
+
+/// Minimum captured duration worth transcribing after a mid-recording device
+/// fault; shorter than this we discard as noise.
+const MIN_SALVAGE_SECS: f64 = 1.0;
+
+/// Number of raw (interleaved, pre-downmix) input samples that `max_secs` of
+/// audio occupies, plus a generous margin. Used as a byte/length backstop so
+/// the capture buffer can never grow without bound even if the wall-clock cap
+/// check is somehow starved.
+pub fn max_raw_samples(max_secs: u64, sample_rate: u32, channels: usize) -> usize {
+    // +5s of headroom so the time-based cap is what normally fires first.
+    (max_secs.saturating_add(5) as usize)
+        .saturating_mul(sample_rate.max(1) as usize)
+        .saturating_mul(channels.max(1))
+}
 
 /// Spawns a dedicated OS thread that waits for [`AudioCommand`]s and drives
 /// microphone capture. Runs until `cmd_rx` disconnects.
@@ -189,8 +221,8 @@ pub fn spawn_audio_worker(
         .spawn(move || {
             while let Ok(cmd) = cmd_rx.recv() {
                 match cmd {
-                    AudioCommand::Start => {
-                        if let Err(e) = run_one_recording(&cmd_rx, &reply_tx) {
+                    AudioCommand::Start { max_secs } => {
+                        if let Err(e) = run_one_recording(&cmd_rx, &reply_tx, max_secs) {
                             let _ = reply_tx.send(AudioReply::Error(e.to_string()));
                         }
                     }
@@ -209,6 +241,7 @@ pub fn spawn_audio_worker(
 fn run_one_recording(
     cmd_rx: &mpsc::Receiver<AudioCommand>,
     reply_tx: &mpsc::Sender<AudioReply>,
+    max_secs: u64,
 ) -> Result<()> {
     let host = cpal::default_host();
     let device = host
@@ -224,7 +257,16 @@ fn run_one_recording(
     let in_channels = stream_config.channels as usize;
 
     let (data_tx, data_rx) = mpsc::channel::<Vec<f32>>();
-    let err_fn = |err| eprintln!("audio input stream error: {err}");
+
+    // Raised by cpal's error callback (runs on cpal's own thread) when the
+    // input device faults mid-stream — device unplugged, sample-format change,
+    // etc. The capture loop polls it and treats it as a clean fault stop.
+    let device_lost = Arc::new(AtomicBool::new(false));
+    let err_flag = device_lost.clone();
+    let err_fn = move |err| {
+        eprintln!("audio input stream error: {err}");
+        err_flag.store(true, Ordering::SeqCst);
+    };
 
     let stream = match sample_format {
         SampleFormat::F32 => device.build_input_stream(
@@ -266,8 +308,28 @@ fn run_one_recording(
     let mut raw_samples: Vec<f32> = Vec::new();
     let mut last_level_sent = Instant::now();
     let mut cancelled = false;
+    let mut capped = false;
+    let mut disconnected = false;
+
+    let started = Instant::now();
+    let max_elapsed = Duration::from_secs(max_secs);
+    let raw_sample_cap = max_raw_samples(max_secs, in_rate, in_channels);
 
     'capture: loop {
+        // A device fault reported by cpal's error callback takes priority:
+        // stop cleanly and salvage/discard below.
+        if device_lost.load(Ordering::SeqCst) {
+            disconnected = true;
+            break 'capture;
+        }
+
+        // Hard duration cap (and its buffer-length backstop): auto-stop and
+        // keep what we captured so a stuck key can't record forever.
+        if started.elapsed() >= max_elapsed || raw_samples.len() >= raw_sample_cap {
+            capped = true;
+            break 'capture;
+        }
+
         // Drain whatever audio has arrived, then check for a control
         // command, with a short timeout so level updates stay responsive
         // even during silence.
@@ -290,15 +352,18 @@ fn run_one_recording(
                 cancelled = true;
                 break 'capture;
             }
-            Ok(AudioCommand::Start) => {} // already recording; ignore
+            Ok(AudioCommand::Start { .. }) => {} // already recording; ignore
             Err(mpsc::TryRecvError::Empty) => {}
             Err(mpsc::TryRecvError::Disconnected) => break 'capture,
         }
     }
 
     drop(stream);
-    while let Ok(chunk) = data_rx.try_recv() {
-        raw_samples.extend(chunk);
+    // Don't drain further after a device fault — the queue may be stale/torn.
+    if !disconnected {
+        while let Ok(chunk) = data_rx.try_recv() {
+            raw_samples.extend(chunk);
+        }
     }
 
     if cancelled {
@@ -307,11 +372,25 @@ fn run_one_recording(
     }
 
     let mono = downmix_to_mono(&raw_samples, in_channels);
-    let resampled = resample_linear(&mono, in_rate, TARGET_SAMPLE_RATE);
     let duration = Duration::from_secs_f64(mono.len() as f64 / in_rate as f64);
+
+    if disconnected {
+        // Salvage the take only if it's long enough to be worth transcribing;
+        // otherwise hand back an empty buffer so the coordinator discards it.
+        let samples = if duration.as_secs_f64() >= MIN_SALVAGE_SECS {
+            resample_linear(&mono, in_rate, TARGET_SAMPLE_RATE)
+        } else {
+            Vec::new()
+        };
+        let _ = reply_tx.send(AudioReply::Disconnected { samples, duration });
+        return Ok(());
+    }
+
+    let resampled = resample_linear(&mono, in_rate, TARGET_SAMPLE_RATE);
     let _ = reply_tx.send(AudioReply::Stopped {
         samples: resampled,
         duration,
+        capped,
     });
     Ok(())
 }
@@ -347,4 +426,35 @@ pub fn resample_linear(input: &[f32], in_rate: u32, out_rate: u32) -> Vec<f32> {
         output.push(a + (b - a) * frac);
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn raw_sample_cap_matches_duration_plus_margin() {
+        // 120s hold cap at 48kHz stereo = 120*48000*2 plus a 5s margin.
+        let cap = max_raw_samples(120, 48_000, 2);
+        assert_eq!(cap, (120 + 5) * 48_000 * 2);
+
+        // 300s hands-free cap at 44.1kHz mono.
+        let cap = max_raw_samples(300, 44_100, 1);
+        assert_eq!(cap, (300 + 5) * 44_100 * 1);
+    }
+
+    #[test]
+    fn raw_sample_cap_is_saturating_and_nonzero() {
+        // Degenerate inputs must not panic or produce a zero budget that
+        // would instantly cap every recording.
+        assert!(max_raw_samples(0, 0, 0) > 0);
+        assert_eq!(max_raw_samples(u64::MAX, u32::MAX, usize::MAX), usize::MAX);
+    }
+
+    #[test]
+    fn min_salvage_threshold_is_one_second() {
+        // Guards the >1s salvage decision used on device disconnect.
+        assert!(0.5 < MIN_SALVAGE_SECS);
+        assert!(1.5 >= MIN_SALVAGE_SECS);
+    }
 }
