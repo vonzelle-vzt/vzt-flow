@@ -1,0 +1,15 @@
+[package]
+name = "flow-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "flow"
+path = "src/main.rs"
+
+[dependencies]
+flow-core = { path = "../flow-core" }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+hound = "3.5"

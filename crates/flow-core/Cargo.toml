@@ -1,0 +1,16 @@
+[package]
+name = "flow-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+transcribe-rs = { version = "0.3", features = ["onnx", "ort-coreml"] }
+cpal = "0.15"
+hound = "3.5"
+dirs = "5"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+indicatif = "0.17"
+sha2 = "0.10"
+anyhow = "1"
+thiserror = "2"
