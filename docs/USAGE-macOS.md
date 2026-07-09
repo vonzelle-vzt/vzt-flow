@@ -50,7 +50,7 @@ Every push/PR to `main` runs `.github/workflows/build.yml`'s `macos` job,
 which builds an unsigned `aarch64-apple-darwin` bundle and uploads it as an
 artifact named `vzt-flow-macos-aarch64-dmg` (containing a single `.dmg`,
 named by Tauri's own `{productName}_{version}_{arch}.dmg` convention — e.g.
-`VZT Flow_0.1.0_aarch64.dmg`).
+`VZT Flow_0.2.0_aarch64.dmg`).
 
 Via the `gh` CLI:
 
@@ -65,7 +65,7 @@ Via the Actions UI: open the repo → **Actions** → **build** → pick a green
 run → scroll to **Artifacts** → download `vzt-flow-macos-aarch64-dmg`.
 
 An Intel Mac build is also produced, as artifact `vzt-flow-macos-x86_64-dmg`
-(dmg named `VZT Flow_0.1.0_x64.dmg` by Tauri's own arch-naming convention —
+(dmg named `VZT Flow_0.2.0_x64.dmg` by Tauri's own arch-naming convention —
 see [Hardware requirements](#hardware-requirements) below for what's
 different about it).
 
@@ -661,7 +661,7 @@ npm run build
 claude mcp add vzt-flow --scope user -- node "$(pwd)/dist/index.js"
 ```
 
-This registers three tools (`mcp/src/index.ts`), backed by the daemon socket
+This registers four tools (`mcp/src/index.ts`), backed by the daemon socket
 when the desktop app is running, falling back to the standalone `flow` CLI
 otherwise (set `FLOW_BIN` if the binary isn't discoverable — the fallback
 resolver checks `FLOW_BIN`, then `~/vzt-flow/target/release/flow`, then bare
@@ -672,6 +672,7 @@ resolver checks `FLOW_BIN`, then `~/vzt-flow/target/release/flow`, then bare
 | `listen` | `mode` (raw/clean/polish/code, default `clean`), `max_seconds` (default `120`, up to `600`) | Records from the mic and returns the transcribed, cleaned text |
 | `transcribe_file` | `path` (absolute path) | Transcribes an existing audio file through dictionary correction |
 | `dictation_history` | `n` (default `10`) | Returns recent dictation history entries |
+| `meeting_transcript` | `meeting` (numeric index, `0` = latest, or a filename; default `0`) | Reads a local `flow meeting` transcript (long ones truncated to head + tail) — read, summarize, or pull action items from a call |
 
 **Using `listen` from Claude Code**: once registered, ask Claude Code to
 "listen for my voice input" (or similar) and it can invoke the `listen` tool

@@ -37,7 +37,7 @@ fast enough that the round trip to the cloud was never buying you much.
 | Custom dictionary (names, jargon, spellings) | Yes, local file | Varies |
 | Text snippets/expansion | Yes, local file | Limited |
 | CLI | Yes (`flow listen`, `flow transcribe`, `flow doctor`, ...) | No |
-| Scriptable / MCP voice input for agents | Yes (`listen`, `transcribe_file`, `dictation_history`) | No |
+| Scriptable / MCP voice input for agents | Yes (`listen`, `transcribe_file`, `dictation_history`, `meeting_transcript`) | No |
 | Source | Open, MIT | Closed |
 
 This isn't a claim that VZT Flow's transcription quality beats a
@@ -48,37 +48,58 @@ and a hard privacy guarantee you can verify yourself by reading the source.
 
 ## Feature tour
 
-### Push-to-talk, hands-free, and cancel
+### How to dictate
 
-**Hold Right Option** to record — release to transcribe and paste. **Tap**
-it (press+release faster than the 300ms hold threshold) to start a
-**hands-free** recording instead, which auto-stops after ~2.5s of
-continuous silence following at least one loud frame, or stops on a second
-tap. **Esc** cancels an in-progress recording outright — nothing is
-transcribed or pasted. Every recording mode is hard-capped at **600s
-(10min)** for both held and hands-free recording (configurable via
-`max_hold_secs`/`max_handsfree_secs`) so a stuck key can never record
-forever; hitting the cap transcribes what was captured rather than
-discarding it.
+Two gestures, one key. This is the authoritative reference — everything
+else in the docs links back here rather than restating it.
+
+| Gesture | Mode | Stops when |
+|---|---|---|
+| **Hold** Right Option, talk, release | Push-to-talk | You release the key |
+| **Tap** Right Option (<300 ms), talk | Hands-free | ~2.5 s of silence, or a second tap |
+
+(Windows/Linux use **Ctrl+Shift+Space** for the same two gestures instead of
+Right Option — see [Windows](#windows-experimental) /
+[Linux](#linux-experimental) below.)
+
+- **Esc** cancels either mode outright — nothing is transcribed or pasted.
+- The tap only **arms** hands-free if no other key was pressed during it.
+  Right Option is macOS's special-character modifier (Option+e = ´,
+  Option+n = ˜, …), so holding it and pressing **any other key** is treated
+  as typing, not push-to-talk — special characters via Option never
+  false-trigger a recording. If a hold had already started before the extra
+  key landed, that false start is discarded immediately (the *accidental-
+  press guard*); the typed character still reaches the app either way (the
+  hotkey tap is `ListenOnly`, so it never swallows the keystroke).
+- Both modes get **rolling transcription** with a live preview in the
+  overlay pill — see [Long-form dictation](#long-form-dictation-10-minute-holds-chunked-so-they-dont-oom)
+  below.
+- After each synthetic Cmd+V, *paste verification* reads the focused field
+  via the Accessibility API (~150ms later); if the field is readable and the
+  transcript tail is missing, the paste is retried once, then (still
+  missing) left on the clipboard with a "paste may have failed" overlay.
+  Unreadable fields — most web/Electron/secure inputs — are assumed
+  successful (prior behavior), and the whole check is bounded under 400ms.
+- Every recording mode is hard-capped at **600s (10min)**
+  (`max_hold_secs`/`max_handsfree_secs`) so a stuck key can never record
+  forever; hitting the cap transcribes what was captured rather than
+  discarding it.
+
+Config knobs, with real defaults (`crates/flow-core/src/config.rs`):
+
+| Field | Default | Meaning |
+|---|---|---|
+| `hotkey_keycode` | `61` (Right Option) | The hold/tap key |
+| `hold_threshold_ms` | `300` | Hold vs. tap threshold (ms) |
+| `handsfree_silence_secs` | `2.5` | Silence before hands-free auto-stops (s) |
+| `max_hold_secs` | `600` | Hard cap on a held recording (s) |
+| `max_handsfree_secs` | `600` | Hard cap on a hands-free recording (s) |
 
 A small floating pill overlay tracks the whole lifecycle: a live level
 meter while **Recording**, a mode badge (raw/clean/polish/code) while
 **Transcribing**, a brief **Done** flash, and short-lived **Message** states
 for non-fatal issues ("Secure field — transcript on clipboard", "No
 Accessibility permission", "Microphone disconnected").
-
-Two safety nets sit on the input path. Right Option is macOS's
-special-character modifier (Option+e = ´, Option+n = ˜, …), so holding it and
-pressing **any other key** is treated as typing, not push-to-talk: the
-*accidental-press guard* suppresses the hands-free toggle and discards any
-recording already started, while the typed character still reaches the app
-(the hotkey tap is `ListenOnly`, so it never swallows the keystroke). And
-after each synthetic Cmd+V, *paste verification* reads the focused field via
-the Accessibility API (~150ms later); if the field is readable and the
-transcript tail is missing, the paste is retried once, then (still missing)
-left on the clipboard with a "paste may have failed" overlay. Unreadable
-fields — most web/Electron/secure inputs — are assumed successful (prior
-behavior), and the whole check is bounded under 400ms.
 
 ### On-device ASR: Parakeet TDT 0.6B v3
 
@@ -220,8 +241,10 @@ Once registered, just ask Claude Code to listen for your voice input and it
 invokes `listen` directly — no alt-tabbing out to a separate dictation app.
 It talks to the running desktop app's daemon socket when available (driving
 the same overlay you see everywhere else), falling back to the standalone
-`flow` CLI otherwise. Two more tools ship alongside it: `transcribe_file`
-(an existing audio file) and `dictation_history` (recent dictations).
+`flow` CLI otherwise. Three more tools ship alongside it: `transcribe_file`
+(an existing audio file), `dictation_history` (recent dictations), and
+`meeting_transcript` (read/summarize a `flow meeting` transcript by index or
+filename).
 
 ### Full CLI + daemon socket
 
@@ -433,7 +456,7 @@ single-display setup.)*
 | `crates/flow-core` | The engine: audio capture, ASR, LLM cleanup, dictionary, code mode, snippets, profiles, history, hotkey monitoring, paste, model download/management, daemon IPC. Platform-agnostic; macOS-only pieces are `#[cfg(target_os = "macos")]`-gated. |
 | `crates/flow-cli` | The `flow` binary. Daemon-first, standalone fallback. |
 | `apps/desktop` | The [Tauri 2](https://tauri.app) menu-bar app: tray icon, overlay, Settings window, hotkey, daemon control socket. |
-| `mcp/` | Node/TypeScript MCP server (`listen`, `transcribe_file`, `dictation_history`) for Claude Code. |
+| `mcp/` | Node/TypeScript MCP server (`listen`, `transcribe_file`, `dictation_history`, `meeting_transcript`) for Claude Code. |
 
 Key dependencies: [Tauri 2](https://tauri.app) (native webview shell — an
 8-12MB installer footprint instead of bundling Chromium the way Electron
