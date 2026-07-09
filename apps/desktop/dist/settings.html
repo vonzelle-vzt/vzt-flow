@@ -129,12 +129,27 @@
     <div class="row">
       <span>Hold-to-talk key</span>
       <select id="hotkey-select">
-        <option value="61">Right Option</option>
-        <option value="60">Right Shift</option>
-        <option value="62">Right Control</option>
-        <option value="54">Right Command</option>
-        <option value="63">Fn</option>
+        <optgroup label="Right side (recommended)">
+          <option value="61">Right Option</option>
+          <option value="60">Right Shift</option>
+          <option value="62">Right Control</option>
+          <option value="54">Right Command</option>
+        </optgroup>
+        <optgroup label="Other">
+          <option value="63">Fn</option>
+        </optgroup>
+        <optgroup label="Left side — conflicts with typing">
+          <option value="58">Left Option</option>
+          <option value="56">Left Shift</option>
+          <option value="59">Left Control</option>
+          <option value="55">Left Command</option>
+        </optgroup>
       </select>
+    </div>
+    <div class="row" style="border-top:none;">
+      <span style="opacity:0.6;font-size:11px;">Left-side modifiers are the ones ordinary shortcuts use (Cmd+C,
+        Shift+click) — holding one to talk collides with typing. The accidental-press guard discards the false
+        start, but the binding will feel twitchy. Right Option is the default because it's the least-used modifier.</span>
     </div>
     <div class="row">
       <span>Hold threshold (ms)</span>

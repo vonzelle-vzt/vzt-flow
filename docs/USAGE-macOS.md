@@ -561,7 +561,7 @@ Persisted at `~/.config/vzt-flow/config.toml`. Every field, with its default
 
 | Field | Default | Meaning |
 |---|---|---|
-| `hotkey_keycode` | `61` (Right Option) | macOS virtual keycode of the hold-to-talk key |
+| `hotkey_keycode` | `61` (Right Option) | macOS virtual keycode of the hold-to-talk key. Changeable in Settings → Hotkey (nine choices, right-side keys first); only modifier keycodes are valid because a non-modifier key held down auto-repeats keyDown events instead of producing the single clean FlagsChanged transition hold/tap detection relies on (see `hotkey.rs`'s module docs). Caps Lock is intentionally excluded from the picker — its `CGEventFlagAlphaShift` bit reflects the caps-lock *latched* state, not physical hold state, so binding it would toggle recording (and the caps-lock LED) rather than hold it. `flow doctor` reports whether the configured keycode is supported. |
 | `hotkey_label` | `"Right Option"` | Human-readable label shown in Settings |
 | `hold_threshold_ms` | `300` | Minimum hold duration (ms) before a press counts as "hold" rather than a tap that toggles hands-free |
 | `idle_unload_secs` | `300` | Seconds of transcriber/cleanup-model inactivity before it's unloaded from memory |

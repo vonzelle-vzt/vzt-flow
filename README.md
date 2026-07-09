@@ -491,7 +491,7 @@ require a restart: [docs/USAGE-macOS.md#config-reference-configtoml](docs/USAGE-
 
 | Field | Default | Meaning |
 |---|---|---|
-| `hotkey_keycode` | `61` (Right Option) | Hold-to-talk key |
+| `hotkey_keycode` | `61` (Right Option) | Hold-to-talk key — changeable in Settings → Hotkey; only the modifier keycodes are valid (a non-modifier key auto-repeats keyDown instead of the clean hold/tap transition detection relies on, see [docs/USAGE-macOS.md#config-reference-configtoml](docs/USAGE-macOS.md#config-reference-configtoml)) |
 | `hold_threshold_ms` | `300` | Hold vs. tap threshold (ms) |
 | `idle_unload_secs` | `300` | Model idle-unload timer (s) |
 | `max_hold_secs` | `600` | Hard cap on a held recording (s) |

@@ -2,6 +2,10 @@ use std::time::Duration;
 
 use anyhow::Result;
 use flow_core::audio::default_input_device_info;
+use flow_core::config::Config;
+use flow_core::hotkey::{
+    hotkey_keycode_is_hold_capable, hotkey_keycode_is_supported, supported_hotkey_keycodes,
+};
 use flow_core::ipc::{transport, Request};
 use flow_core::models::{check_cleanup_model, check_parakeet_model, model_root_dir};
 
@@ -59,6 +63,39 @@ pub fn run() -> Result<()> {
         Ok(true) => println!("Cleanup model: PRESENT"),
         Ok(false) => println!("Cleanup model: MISSING (run: flow models download cleanup)"),
         Err(e) => println!("Cleanup model: error checking status ({e})"),
+    }
+
+    match Config::load() {
+        Ok(cfg) => {
+            let kc = cfg.hotkey_keycode;
+            if hotkey_keycode_is_hold_capable(kc) {
+                println!("Hotkey: {} (keycode {kc}) — supported", cfg.hotkey_label);
+            } else if kc == 57 {
+                // Caps Lock: modifier_bit_for_keycode(57) reads
+                // CGEventFlagAlphaShift, the *latched* state (LED on/off),
+                // not physical hold state — so it toggles instead of
+                // holding. See hotkey.rs::HOLD_CAPABLE_HOTKEY_KEYCODES.
+                println!(
+                    "Hotkey: {} (keycode {kc}) — toggle semantics, not hold-to-talk (not recommended)",
+                    cfg.hotkey_label
+                );
+            } else if hotkey_keycode_is_supported(kc) {
+                println!(
+                    "Hotkey: {} (keycode {kc}) — supported but not hold-capable",
+                    cfg.hotkey_label
+                );
+            } else {
+                let valid = supported_hotkey_keycodes()
+                    .iter()
+                    .map(u16::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",");
+                println!(
+                    "Hotkey: keycode {kc} — UNSUPPORTED (hotkey will never fire; valid: {valid})"
+                );
+            }
+        }
+        Err(e) => println!("Hotkey: error loading config ({e})"),
     }
 
     match flow_core::ipc::socket_path() {

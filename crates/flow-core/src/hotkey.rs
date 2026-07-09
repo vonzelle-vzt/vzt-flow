@@ -55,6 +55,56 @@ pub fn new_recording_flag() -> Arc<AtomicBool> {
     Arc::new(AtomicBool::new(false))
 }
 
+/// All keycodes the macOS tap can read a live up/down state for via
+/// `FlagsChanged` (i.e. every arm `modifier_bit_for_keycode` maps to
+/// `Some`). This is the single source of truth for "is this keycode a
+/// modifier key at all" — kept platform-agnostic (unlike
+/// `modifier_bit_for_keycode`, which lives inside the `#[cfg(target_os =
+/// "macos")]` module) so `flow-cli`'s `doctor` can validate a configured
+/// keycode on any build target, not just macOS.
+///
+/// Caps Lock (57) is included here but is deliberately **excluded** from
+/// [`hold_capable_hotkey_keycodes`] — see that function's docs. Don't use
+/// this list to populate a hold-to-talk picker; use the hold-capable one.
+pub const SUPPORTED_HOTKEY_KEYCODES: &[u16] =
+    &[54, 55, 56, 57, 58, 59, 60, 61, 62, 63];
+
+/// The subset of [`SUPPORTED_HOTKEY_KEYCODES`] that actually behaves as a
+/// *hold*-to-talk key. Caps Lock (57) is excluded: `CGEventFlagAlphaShift`
+/// reflects the caps-lock **latched state** (the LED on/off), not whether
+/// the physical key is currently held down. Bound as a hold key, pressing
+/// Caps Lock would start recording and leave Caps Lock ON; pressing it
+/// again would stop recording — a toggle that also hijacks the user's caps
+/// lock state, not push-to-talk. `modifier_bit_for_keycode(57)` still
+/// returns `Some(_)` (the tap *can* read a flag for it), so it stays in
+/// `SUPPORTED_HOTKEY_KEYCODES`; it just isn't a valid *hold* binding.
+pub const HOLD_CAPABLE_HOTKEY_KEYCODES: &[u16] =
+    &[54, 55, 56, 58, 59, 60, 61, 62, 63];
+
+/// Returns [`SUPPORTED_HOTKEY_KEYCODES`].
+pub fn supported_hotkey_keycodes() -> &'static [u16] {
+    SUPPORTED_HOTKEY_KEYCODES
+}
+
+/// Returns [`HOLD_CAPABLE_HOTKEY_KEYCODES`] — the keycodes safe to offer as
+/// a hold-to-talk binding (excludes Caps Lock; see its docs).
+pub fn hold_capable_hotkey_keycodes() -> &'static [u16] {
+    HOLD_CAPABLE_HOTKEY_KEYCODES
+}
+
+/// Whether `keycode` is one the tap can read a live flag for at all
+/// (includes Caps Lock, which is supported-but-not-hold-capable — see
+/// [`hotkey_keycode_is_hold_capable`] for the stricter check).
+pub fn hotkey_keycode_is_supported(keycode: u16) -> bool {
+    SUPPORTED_HOTKEY_KEYCODES.contains(&keycode)
+}
+
+/// Whether `keycode` is valid to bind as a *hold*-to-talk key (excludes
+/// Caps Lock's toggle semantics; see [`HOLD_CAPABLE_HOTKEY_KEYCODES`]).
+pub fn hotkey_keycode_is_hold_capable(keycode: u16) -> bool {
+    HOLD_CAPABLE_HOTKEY_KEYCODES.contains(&keycode)
+}
+
 /// macOS hold-to-talk monitoring via a `CGEventTap`. Gated out on every
 /// other platform — see the module docs above for why this can't be
 /// `tauri-plugin-global-shortcut` for a modifier-only binding, and see
@@ -124,6 +174,16 @@ fn modifier_bit_for_keycode(keycode: u16) -> Option<CGEventFlags> {
 /// latch), so a stale latch only ever affects *edge* detection — and the
 /// callback resets that latch on tap re-arm and on binding changes so it can
 /// never invert (F7).
+///
+/// Known pre-existing quirk (not fixed here): `CGEventFlags` bits are
+/// **device-independent** — `CGEventFlagShift` is set by *either* Shift key,
+/// same for Control/Option/Command. So with e.g. a Right Shift binding, if
+/// the user is also holding Left Shift when they release Right Shift, the
+/// flag stays set and `down` reads `true` — no `HoldKeyReleased` edge fires
+/// until *both* shift keys are up. Same failure mode for any
+/// Control/Option/Command binding paired with its other-side twin. Exposing
+/// the left-side keycodes as bindable options raises the odds of hitting
+/// this; flagging it here so the next reader doesn't have to rediscover it.
 fn hold_edge(was_down: bool, down: bool) -> Option<HotkeyEvent> {
     if down && !was_down {
         Some(HotkeyEvent::HoldKeyPressed)
@@ -323,6 +383,49 @@ mod tests {
         // tap re-arm / binding change. After the reset the same press is seen.
         let after_reset = false;
         assert_eq!(hold_edge(after_reset, true), Some(HotkeyEvent::HoldKeyPressed));
+    }
+
+    #[test]
+    fn supported_keycodes_all_map_to_a_modifier_bit() {
+        for &kc in crate::hotkey::supported_hotkey_keycodes() {
+            assert!(
+                modifier_bit_for_keycode(kc).is_some(),
+                "keycode {kc} is in supported_hotkey_keycodes() but modifier_bit_for_keycode returned None"
+            );
+        }
+    }
+
+    #[test]
+    fn non_modifier_keycodes_map_to_none_and_are_unlisted() {
+        // 0 'a', 12 'q', 49 space, 36 return — ordinary (non-modifier) keys.
+        for kc in [0u16, 12, 49, 36] {
+            assert_eq!(modifier_bit_for_keycode(kc), None, "keycode {kc} unexpectedly has a modifier bit");
+            assert!(!crate::hotkey::hotkey_keycode_is_supported(kc), "keycode {kc} unexpectedly in supported list");
+            assert!(!crate::hotkey::hotkey_keycode_is_hold_capable(kc), "keycode {kc} unexpectedly hold-capable");
+        }
+    }
+
+    #[test]
+    fn caps_lock_is_supported_but_not_hold_capable() {
+        assert!(crate::hotkey::hotkey_keycode_is_supported(57));
+        assert!(
+            !crate::hotkey::hotkey_keycode_is_hold_capable(57),
+            "Caps Lock reflects latched state (AlphaShift), not hold state — must not be hold-capable"
+        );
+    }
+
+    #[test]
+    fn hold_capable_set_is_exactly_supported_minus_caps_lock() {
+        let mut expected: Vec<u16> = crate::hotkey::supported_hotkey_keycodes()
+            .iter()
+            .copied()
+            .filter(|&kc| kc != 57)
+            .collect();
+        expected.sort_unstable();
+        let mut actual: Vec<u16> = crate::hotkey::hold_capable_hotkey_keycodes().to_vec();
+        actual.sort_unstable();
+        assert_eq!(actual, expected);
+        assert_eq!(actual, vec![54, 55, 56, 58, 59, 60, 61, 62, 63]);
     }
     }
 } // mod macos
