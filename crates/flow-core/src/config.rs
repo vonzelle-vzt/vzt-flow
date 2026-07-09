@@ -124,6 +124,21 @@ pub struct Config {
     /// this field existed loads fine and gets `"ask"`.
     #[serde(default = "default_meeting_auto")]
     pub meeting_auto: String,
+    /// Rolling transcription (Feature B): transcribe silence-completed chunks
+    /// *during* a long recording so only the final <35s tail is transcribed at
+    /// release, cutting end-latency for multi-minute dictations from ~30s to a
+    /// few seconds. Defaults to `true`; set `false` to fall back to the batch
+    /// (transcribe-everything-at-release) path. `#[serde(default)]` on the
+    /// struct means a `config.toml` predating this field loads fine and gets
+    /// `true`.
+    #[serde(default = "default_true")]
+    pub rolling_transcription: bool,
+}
+
+/// Default for [`Config::rolling_transcription`] — a free fn so serde's
+/// `#[serde(default)]` populates it for configs written before the field.
+fn default_true() -> bool {
+    true
 }
 
 impl Default for Config {
@@ -142,6 +157,7 @@ impl Default for Config {
             handsfree_silence_secs: 2.5,
             cleanup_enabled: true,
             meeting_auto: default_meeting_auto(),
+            rolling_transcription: true,
         }
     }
 }

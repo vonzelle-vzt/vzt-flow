@@ -112,6 +112,11 @@ pub enum OverlayEvent {
     Transcribing { mode: String },
     Done,
     Message { text: String },
+    /// Rolling preview (Feature B): the raw (dictionary-corrected, no-LLM) tail
+    /// of the transcript produced so far, shown as a subdued one-line strip
+    /// under the timer while a long recording is still in progress. Explicitly
+    /// "raw" — it's pre-cleanup and may change once the LLM pass runs.
+    Preview { text: String },
 }
 
 /// How long before a recording's duration cap the overlay switches to its

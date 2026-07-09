@@ -2,6 +2,16 @@ const pill = document.getElementById("pill");
 const leading = document.getElementById("leading");
 const bars = document.getElementById("bars");
 const label = document.getElementById("label");
+const preview = document.getElementById("preview");
+
+// Longest rolling-preview tail to show (chars); older text scrolls off the
+// left. Kept short so the subdued strip stays one line inside the pill.
+const PREVIEW_TAIL_CHARS = 60;
+
+function clearPreview() {
+  preview.textContent = "";
+  preview.classList.remove("show");
+}
 
 // Reduced from 24: the waveform previously claimed the pill's full flexible
 // width via #bars's `flex: 1`, leaving no room for the new elapsed-time
@@ -69,11 +79,24 @@ event.listen("overlay://state", (e) => {
       pill.classList.toggle("warning", !!payload.warning);
       renderLevel(payload.level ?? 0);
       break;
+    case "preview": {
+      // Rolling live preview: show the trailing PREVIEW_TAIL_CHARS of the raw
+      // transcript-so-far (the coordinator sends the full running tail). Leaves
+      // the recording row (dot/bars/timer) untouched.
+      const text = (payload.text ?? "").trim();
+      if (text) {
+        const tail = text.slice(-PREVIEW_TAIL_CHARS);
+        preview.textContent = tail;
+        preview.classList.add("show");
+      }
+      break;
+    }
     case "transcribing":
       show();
       setLeading("transcribing");
       bars.style.display = "none";
       pill.classList.remove("warning");
+      clearPreview();
       label.textContent = payload.mode ? `Transcribing… (${payload.mode})` : "Transcribing…";
       break;
     case "done":
@@ -81,6 +104,7 @@ event.listen("overlay://state", (e) => {
       setLeading("done");
       bars.style.display = "none";
       pill.classList.remove("warning");
+      clearPreview();
       label.textContent = "Pasted";
       break;
     case "message":
@@ -88,6 +112,7 @@ event.listen("overlay://state", (e) => {
       setLeading("");
       bars.style.display = "none";
       pill.classList.remove("warning");
+      clearPreview();
       label.textContent = payload.text ?? "";
       break;
   }
@@ -99,6 +124,12 @@ let lastKind = null;
 event.listen("overlay://state", (e) => {
   if (e.payload.kind === "recording" && lastKind !== "recording") {
     history = new Array(BAR_COUNT).fill(0);
+    // Fresh recording: drop any stale rolling preview from the last one.
+    clearPreview();
   }
-  lastKind = e.payload.kind;
+  // A `preview` event arrives mid-recording; don't treat it as a state change
+  // that would reset the waveform on the next real recording tick.
+  if (e.payload.kind !== "preview") {
+    lastKind = e.payload.kind;
+  }
 });

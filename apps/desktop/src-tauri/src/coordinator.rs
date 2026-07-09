@@ -15,6 +15,7 @@ use flow_core::config::Config;
 use flow_core::hotkey::HotkeyEvent;
 use flow_core::model_manager::{ModelCommand, ModelStatusEvent};
 use flow_core::profiles::ProfileRule;
+use flow_core::rolling::{self, RollingInput, RollingOutput};
 use flow_core::{codemode, dictionary, history, insert, permissions, snippets};
 use tauri::{AppHandle, Manager};
 use tauri_plugin_notification::NotificationExt;
@@ -52,6 +53,14 @@ pub enum CoordinatorMsg {
         app_bundle_id: Option<String>,
         listen_reply: Option<Sender<Result<ListenOutcome, String>>>,
     },
+    /// A message from the current recording's rolling-transcription worker
+    /// (Feature B), tagged with the recording `epoch` so any output from an
+    /// abandoned or older recording is ignored.
+    Rolling { epoch: u64, output: RollingOutput },
+    /// Watchdog: a rolling finalize for `epoch` has taken too long; force the
+    /// state machine out of Transcribing (the rolling counterpart of the batch
+    /// path's F2 never-hang timeout).
+    RollingTimeout { epoch: u64 },
     /// Manual toggle from the tray menu item — behaves like a hotkey tap.
     TrayToggleDictation,
     /// Cycles the overlay through its states for visual verification,
@@ -316,6 +325,18 @@ struct HoldTracker {
     other_key: Arc<AtomicBool>,
 }
 
+/// Captured at release for a rolling recording (Feature B): everything the
+/// post-transcription pipeline needs, held until the worker delivers the
+/// assembled transcript via [`RollingOutput::Final`]. `epoch` matches the
+/// recording that produced it so a late `Final` from an abandoned recording is
+/// ignored.
+struct PendingRollingFinal {
+    app_bundle_id: Option<String>,
+    profile: ProfileRule,
+    listen_reply: Option<Sender<Result<ListenOutcome, String>>>,
+    epoch: u64,
+}
+
 /// Action a hold-key *release* resolves to. Pure so the tap-vs-hold decision
 /// is unit-testable without a live `AppHandle`; the `HoldKeyReleased` handler
 /// drives the side effects for each variant.
@@ -378,6 +399,13 @@ fn run_coordinator(
         consumed: Arc::new(AtomicBool::new(false)),
         other_key: Arc::new(AtomicBool::new(false)),
     };
+    // Rolling-transcription (Feature B) state for the current recording. All
+    // live on this one thread, so no locking is needed. `rolling_epoch` is
+    // bumped every recording so stale worker output is discarded.
+    let mut rolling_in: Option<Sender<RollingInput>> = None;
+    let mut rolling_epoch: u64 = 0;
+    let mut rolling_preview = String::new();
+    let mut pending_rolling: Option<PendingRollingFinal> = None;
     while let Ok(msg) = rx.recv() {
         let state = app.state::<AppState>();
         match msg {
@@ -495,7 +523,45 @@ fn run_coordinator(
                     stop_and_transcribe(&audio_cmd_tx);
                 }
             }
-            CoordinatorMsg::Audio(AudioReply::Started) => {}
+            CoordinatorMsg::Audio(AudioReply::Started) => {
+                // Spin up this recording's rolling-transcription worker
+                // (Feature B) if enabled. Created here on the coordinator
+                // thread — not in `start_recording`, which may run on a timer
+                // thread. A new epoch abandons any previous worker's output.
+                rolling_in = None;
+                rolling_epoch = rolling_epoch.wrapping_add(1);
+                rolling_preview.clear();
+                pending_rolling = None;
+                let rolling_enabled = state.config.lock().unwrap().rolling_transcription;
+                if rolling_enabled {
+                    let epoch = rolling_epoch;
+                    let (out_tx, out_rx) = mpsc::channel::<RollingOutput>();
+                    if let Some(coord_tx) = state.coordinator_tx.lock().unwrap().clone() {
+                        // Forward the worker's output onto the coordinator
+                        // channel, epoch-tagged. Exits when the worker drops
+                        // `out_tx` (recording finalized or abandoned).
+                        std::thread::spawn(move || {
+                            while let Ok(output) = out_rx.recv() {
+                                if coord_tx
+                                    .send(CoordinatorMsg::Rolling { epoch, output })
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                        });
+                        rolling_in =
+                            Some(rolling::spawn_rolling_worker(model_cmd_tx.clone(), out_tx));
+                    }
+                }
+            }
+            CoordinatorMsg::Audio(AudioReply::RollingSamples { samples }) => {
+                // Feed settled audio to the rolling worker (if one is running
+                // for this recording); it cuts and dispatches chunks.
+                if let Some(rin) = &rolling_in {
+                    let _ = rin.send(RollingInput::Samples(samples));
+                }
+            }
             CoordinatorMsg::Audio(AudioReply::Level(level)) => {
                 let elapsed = state
                     .recording_started
@@ -540,6 +606,31 @@ fn run_coordinator(
                 }
                 let listen_reply = listen_pending.map(|(tx, _)| tx);
                 overlay::emit_overlay(&app, OverlayEvent::Transcribing { mode: profile.mode.clone() });
+
+                // Rolling path (Feature B): the worker already holds the audio
+                // and has transcribed everything but the tail. Tell it to
+                // finalize; the assembled transcript comes back as
+                // `RollingOutput::Final`. A watchdog guards against a wedged
+                // engine stranding us in Transcribing (F2), mirroring the batch
+                // timeout below. `samples` is empty in rolling mode.
+                if let Some(rin) = rolling_in.take() {
+                    let _ = rin.send(RollingInput::Finish);
+                    pending_rolling = Some(PendingRollingFinal {
+                        app_bundle_id,
+                        profile,
+                        listen_reply,
+                        epoch: rolling_epoch,
+                    });
+                    if let Some(tx) = state.coordinator_tx.lock().unwrap().clone() {
+                        let epoch = rolling_epoch;
+                        let timeout = duration + Duration::from_secs(60);
+                        std::thread::spawn(move || {
+                            std::thread::sleep(timeout);
+                            let _ = tx.send(CoordinatorMsg::RollingTimeout { epoch });
+                        });
+                    }
+                    continue;
+                }
 
                 let (reply_tx, reply_rx) = mpsc::channel();
                 let sent = model_cmd_tx.send(ModelCommand::Transcribe {
@@ -591,6 +682,47 @@ fn run_coordinator(
                 // empty buffer) or show a brief "mic disconnected" note.
                 state.hands_free_active.store(false, Ordering::Relaxed);
                 hold.consumed.store(true, Ordering::Relaxed);
+
+                // Rolling (Feature B): the streamed audio is already with the
+                // worker (`samples` is always empty here in rolling mode), so
+                // finalize via a synthetic Stopped — routed through the rolling
+                // path above — when there's enough to bother with, else abandon.
+                if rolling_in.is_some() {
+                    if duration.as_secs_f64() >= 1.0 {
+                        eprintln!(
+                            "[vzt-flow] microphone disconnected mid-recording; finalizing the {:.1}s captured (rolling)",
+                            duration.as_secs_f64()
+                        );
+                        if let Some(tx) = state.coordinator_tx.lock().unwrap().clone() {
+                            let _ = tx.send(CoordinatorMsg::Audio(AudioReply::Stopped {
+                                samples: Vec::new(),
+                                duration,
+                                capped: false,
+                                auto_stopped_silence: false,
+                            }));
+                        }
+                    } else {
+                        eprintln!("[vzt-flow] microphone disconnected mid-recording; nothing to salvage (rolling)");
+                        rolling_in = None;
+                        rolling_epoch = rolling_epoch.wrapping_add(1);
+                        rolling_preview.clear();
+                        if let Some((tx, _)) = state.pending_listen.lock().unwrap().take() {
+                            let _ = tx.send(Err("microphone disconnected".to_string()));
+                        }
+                        state.set_dictation_state(DictationState::Idle);
+                        overlay::emit_overlay(
+                            &app,
+                            OverlayEvent::Message { text: "Microphone disconnected".to_string() },
+                        );
+                        let app2 = app.clone();
+                        std::thread::spawn(move || {
+                            std::thread::sleep(Duration::from_millis(1500));
+                            overlay::hide_overlay(&app2);
+                        });
+                    }
+                    continue;
+                }
+
                 if samples.is_empty() {
                     eprintln!("[vzt-flow] microphone disconnected mid-recording; nothing to salvage");
                     if let Some((tx, _)) = state.pending_listen.lock().unwrap().take() {
@@ -619,6 +751,13 @@ fn run_coordinator(
                 }
             }
             CoordinatorMsg::Audio(AudioReply::Cancelled) => {
+                // Abandon any rolling worker (Feature B): dropping its sender
+                // exits it, and the epoch bump discards any output already
+                // queued from it.
+                rolling_in = None;
+                rolling_epoch = rolling_epoch.wrapping_add(1);
+                rolling_preview.clear();
+                pending_rolling = None;
                 if let Some((tx, _)) = state.pending_listen.lock().unwrap().take() {
                     let _ = tx.send(Err("recording cancelled".to_string()));
                 }
@@ -627,6 +766,10 @@ fn run_coordinator(
             }
             CoordinatorMsg::Audio(AudioReply::Error(e)) => {
                 eprintln!("[vzt-flow] audio error: {e}");
+                rolling_in = None;
+                rolling_epoch = rolling_epoch.wrapping_add(1);
+                rolling_preview.clear();
+                pending_rolling = None;
                 if let Some((tx, _)) = state.pending_listen.lock().unwrap().take() {
                     let _ = tx.send(Err(e.clone()));
                 }
@@ -637,6 +780,76 @@ fn run_coordinator(
                     std::thread::sleep(Duration::from_millis(1500));
                     overlay::hide_overlay(&app2);
                 });
+            }
+            CoordinatorMsg::Rolling { epoch, output } => {
+                // Discard output from an abandoned or older recording.
+                if epoch != rolling_epoch {
+                    continue;
+                }
+                match output {
+                    RollingOutput::Preview { chunk_text } => {
+                        // Live preview (Feature B): only while still recording,
+                        // dictionary-corrected (no LLM) for display. Appended to
+                        // the running raw tail; the overlay shows its last chars.
+                        if *state.dictation_state.lock().unwrap() == DictationState::Recording {
+                            let corrected = {
+                                let dict = state.dictionary.lock().unwrap().clone();
+                                dictionary::correct(&chunk_text, &dict)
+                            };
+                            let corrected = corrected.trim();
+                            if !corrected.is_empty() {
+                                if !rolling_preview.is_empty() {
+                                    rolling_preview.push(' ');
+                                }
+                                rolling_preview.push_str(corrected);
+                                overlay::emit_overlay(
+                                    &app,
+                                    OverlayEvent::Preview { text: rolling_preview.clone() },
+                                );
+                            }
+                        }
+                    }
+                    RollingOutput::Final { raw_text, audio_duration } => {
+                        rolling_preview.clear();
+                        if let Some(p) = pending_rolling.take() {
+                            if p.epoch == epoch {
+                                run_pipeline(
+                                    &app,
+                                    raw_text,
+                                    audio_duration,
+                                    p.app_bundle_id,
+                                    p.profile,
+                                    p.listen_reply,
+                                );
+                                tray::refresh_menu(&app);
+                            }
+                        }
+                    }
+                }
+            }
+            CoordinatorMsg::RollingTimeout { epoch } => {
+                // A rolling finalize wedged (F2). Only act if it's still the
+                // current recording and hasn't finalized in the meantime.
+                if epoch == rolling_epoch {
+                    if let Some(p) = pending_rolling.take() {
+                        eprintln!("[vzt-flow] rolling transcription timed out; leaving Transcribing (F2)");
+                        rolling_in = None;
+                        rolling_preview.clear();
+                        if let Some(tx) = p.listen_reply {
+                            let _ = tx.send(Err("transcription timed out".to_string()));
+                        }
+                        state.set_dictation_state(DictationState::Idle);
+                        overlay::emit_overlay(
+                            &app,
+                            OverlayEvent::Message { text: "Transcription failed".to_string() },
+                        );
+                        let app2 = app.clone();
+                        std::thread::spawn(move || {
+                            std::thread::sleep(Duration::from_millis(1500));
+                            overlay::hide_overlay(&app2);
+                        });
+                    }
+                }
             }
             CoordinatorMsg::TranscribeResult { result, audio_duration, app_bundle_id, profile, listen_reply } => {
                 match result {
@@ -745,14 +958,19 @@ fn start_recording(app: &AppHandle, max_secs: u64) {
     overlay::emit_overlay(app, overlay::recording_event(0.0, Duration::ZERO, max_secs));
     // Energy-based auto-stop only applies to hands-free recordings — a
     // hold-to-talk recording's only stop signal is releasing the key.
-    let handsfree_silence_secs = if state.hands_free_active.load(Ordering::Relaxed) {
-        Some(state.config.lock().unwrap().handsfree_silence_secs)
-    } else {
-        None
+    let (handsfree_silence_secs, rolling) = {
+        let cfg = state.config.lock().unwrap();
+        let hf = state
+            .hands_free_active
+            .load(Ordering::Relaxed)
+            .then_some(cfg.handsfree_silence_secs);
+        (hf, cfg.rolling_transcription)
     };
     let tx = state.audio_cmd_tx.lock().unwrap().clone();
     if let Some(tx) = tx {
-        let _ = tx.send(AudioCommand::Start { max_secs, handsfree_silence_secs });
+        // `rolling` must match what the `Started` handler reads from config to
+        // decide whether to create a rolling worker — both read the same flag.
+        let _ = tx.send(AudioCommand::Start { max_secs, handsfree_silence_secs, rolling });
     }
 
     // Kick off cleanup-model load + Metal warm-up now, in parallel with the

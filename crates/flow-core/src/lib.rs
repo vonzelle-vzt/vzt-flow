@@ -15,6 +15,7 @@ pub mod model_manager;
 pub mod models;
 pub mod permissions;
 pub mod profiles;
+pub mod rolling;
 pub mod snippets;
 
 pub use audio::{AudioCommand, AudioRecorder, AudioReply};

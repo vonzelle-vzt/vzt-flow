@@ -30,12 +30,14 @@ use crate::meeting::transcriber::{rms, FRAME_SECS, SILENCE_RMS_THRESHOLD};
 
 /// Sample rate assumed for the `samples_16k_mono` input. The dictation and
 /// standalone capture paths all resample to 16 kHz mono before transcription.
-const SAMPLE_RATE: u32 = 16_000;
+pub(crate) const SAMPLE_RATE: u32 = 16_000;
 
 /// Audio at or below this length is transcribed in a single pass (unchanged
 /// behavior). 35s sits safely under the ~16GB peak the engine reaches around
-/// 49s, so short and medium dictations pay no chunking overhead.
-const SINGLE_PASS_MAX_SECS: f32 = 35.0;
+/// 49s, so short and medium dictations pay no chunking overhead. Also the
+/// threshold the rolling path (`crate::rolling`) uses to decide when enough
+/// settled audio has accumulated to cut a chunk mid-recording.
+pub(crate) const SINGLE_PASS_MAX_SECS: f32 = 35.0;
 
 /// Earliest offset (from a chunk's start) at which a silence cut is allowed —
 /// the low edge of the search window. Keeps chunks from being pointlessly
@@ -50,7 +52,7 @@ const CUT_WINDOW_MAX_SECS: f32 = 35.0;
 /// Overlap re-fed into the next chunk after a hard (mid-speech) cut, so a word
 /// straddling the boundary is captured whole by at least one chunk. The
 /// repeated words are removed by [`dedup_seam`].
-const OVERLAP_SECS: f32 = 1.5;
+pub(crate) const OVERLAP_SECS: f32 = 1.5;
 
 /// Upper bound on how many leading words of a post-hard-cut chunk are examined
 /// for a seam overlap. 1.5s of speech is only a handful of words; capping the
@@ -61,7 +63,7 @@ const MAX_SEAM_OVERLAP_WORDS: usize = 20;
 /// Where a chunk should end and whether the cut lands in silence (clean
 /// concatenation) or mid-speech (needs an overlap + seam dedup).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CutKind {
+pub(crate) enum CutKind {
     /// Cut inside a quiet frame — the chunks concatenate cleanly.
     Silence,
     /// No quiet frame in the window — hard cut at 35s; the following chunk
@@ -100,12 +102,10 @@ pub fn transcribe_long(
     let plans = plan_chunks(samples_16k_mono, SAMPLE_RATE);
     let total = plans.len();
 
-    let mut out_text = String::new();
-    let mut out_segments: Vec<TranscriptSegment> = Vec::new();
-    let mut any_segments = false;
-    // Previous chunk's emitted (post-dedup) text, for seam de-duplication.
-    let mut prev_text = String::new();
-
+    // Transcribe each chunk sequentially on the one engine (so peak memory
+    // stays bounded to a single chunk), collecting per-chunk transcripts to
+    // stitch afterwards. Only one chunk's slice is touched at a time.
+    let mut transcripts: Vec<Transcript> = Vec::with_capacity(total);
     for (i, plan) in plans.iter().enumerate() {
         let dur_secs = plan.len as f32 / SAMPLE_RATE as f32;
         eprintln!(
@@ -119,7 +119,27 @@ pub fn transcribe_long(
         let t = transcriber
             .transcribe(chunk)
             .with_context(|| format!("transcribing chunk {}/{}", i + 1, total))?;
+        transcripts.push(t);
+    }
 
+    Ok(assemble(&plans, &transcripts, SAMPLE_RATE))
+}
+
+/// Stitches per-chunk transcripts back into one, applying the seam de-dup at
+/// hard-cut boundaries and offsetting each chunk's segment timestamps by the
+/// chunk's start. Factored out of [`transcribe_long`] so the rolling path
+/// (`crate::rolling`), which transcribes chunks *during* recording and only
+/// has them all in hand at release, reuses the identical seam/segment logic
+/// instead of re-deriving it. `plans` and `transcripts` must be the same
+/// length and in the same chunk order.
+pub fn assemble(plans: &[ChunkPlan], transcripts: &[Transcript], sample_rate: u32) -> Transcript {
+    let mut out_text = String::new();
+    let mut out_segments: Vec<TranscriptSegment> = Vec::new();
+    let mut any_segments = false;
+    // Previous chunk's emitted (post-dedup) text, for seam de-duplication.
+    let mut prev_text = String::new();
+
+    for (plan, t) in plans.iter().zip(transcripts.iter()) {
         let text = if plan.needs_dedup {
             dedup_seam(&prev_text, &t.text)
         } else {
@@ -133,14 +153,14 @@ pub fn transcribe_long(
             out_text.push_str(&text);
         }
 
-        if let Some(segments) = t.segments {
+        if let Some(segments) = &t.segments {
             any_segments = true;
-            let offset = plan.start as f32 / SAMPLE_RATE as f32;
+            let offset = plan.start as f32 / sample_rate as f32;
             for s in segments {
                 out_segments.push(TranscriptSegment {
                     start: s.start + offset,
                     end: s.end + offset,
-                    text: s.text,
+                    text: s.text.clone(),
                 });
             }
         }
@@ -148,10 +168,10 @@ pub fn transcribe_long(
         prev_text = text;
     }
 
-    Ok(Transcript {
+    Transcript {
         text: out_text,
         segments: if any_segments { Some(out_segments) } else { None },
-    })
+    }
 }
 
 /// Splits `samples` into chunk spans, choosing each boundary via
@@ -203,7 +223,7 @@ pub fn plan_chunks(samples: &[f32], sample_rate: u32) -> Vec<ChunkPlan> {
 /// quietest one; if that frame is below the silence bar it's a clean
 /// [`CutKind::Silence`] cut (returned at the frame's midpoint), otherwise the
 /// window is continuous speech and we [`CutKind::Hard`]-cut at 35s.
-fn plan_cut(remaining: &[f32], sample_rate: u32) -> (usize, CutKind) {
+pub(crate) fn plan_cut(remaining: &[f32], sample_rate: u32) -> (usize, CutKind) {
     let frame = ((FRAME_SECS * sample_rate as f32) as usize).max(1);
     let win_start = (CUT_WINDOW_MIN_SECS * sample_rate as f32) as usize;
     let win_end = ((CUT_WINDOW_MAX_SECS * sample_rate as f32) as usize).min(remaining.len());
@@ -419,5 +439,54 @@ mod tests {
         // genuinely overlaps, so the next text is returned verbatim.
         let out = dedup_seam("we are done -", "- so we continue");
         assert_eq!(out, "- so we continue");
+    }
+
+    // ---- assemble (shared by transcribe_long and the rolling path) ----
+
+    fn t(text: &str) -> Transcript {
+        Transcript { text: text.to_string(), segments: None }
+    }
+
+    #[test]
+    fn assemble_joins_clean_silence_cut_chunks_with_a_space() {
+        // Two silence-cut chunks (no dedup): plain space join, trimmed.
+        let plans = vec![
+            ChunkPlan { start: 0, len: 100, needs_dedup: false },
+            ChunkPlan { start: 100, len: 100, needs_dedup: false },
+        ];
+        let out = assemble(&plans, &[t("  hello there "), t("general kenobi")], SAMPLE_RATE);
+        assert_eq!(out.text, "hello there general kenobi");
+        assert!(out.segments.is_none());
+    }
+
+    #[test]
+    fn assemble_dedups_hard_cut_overlap_like_transcribe_long() {
+        // Second chunk is a hard-cut overlap: its leading duplicated words are
+        // dropped against the previous chunk's emitted text.
+        let plans = vec![
+            ChunkPlan { start: 0, len: 100, needs_dedup: false },
+            ChunkPlan { start: 90, len: 100, needs_dedup: true },
+        ];
+        let out = assemble(&plans, &[t("meet me at the cafe"), t("at the cafe tomorrow")], SAMPLE_RATE);
+        assert_eq!(out.text, "meet me at the cafe tomorrow");
+    }
+
+    #[test]
+    fn assemble_offsets_segment_timestamps_by_chunk_start() {
+        let plans = vec![
+            ChunkPlan { start: 0, len: SAMPLE_RATE as usize, needs_dedup: false },
+            ChunkPlan { start: SAMPLE_RATE as usize, len: SAMPLE_RATE as usize, needs_dedup: false },
+        ];
+        let transcripts = vec![
+            Transcript { text: "one".into(), segments: Some(vec![TranscriptSegment { start: 0.0, end: 0.5, text: "one".into() }]) },
+            Transcript { text: "two".into(), segments: Some(vec![TranscriptSegment { start: 0.0, end: 0.5, text: "two".into() }]) },
+        ];
+        let out = assemble(&plans, &transcripts, SAMPLE_RATE);
+        let segs = out.segments.expect("segments present");
+        assert_eq!(segs.len(), 2);
+        // Second chunk starts at 1.0s (SAMPLE_RATE samples), so its segment is
+        // shifted by +1.0s.
+        assert!((segs[1].start - 1.0).abs() < 1e-4);
+        assert!((segs[1].end - 1.5).abs() < 1e-4);
     }
 }

@@ -11,7 +11,14 @@ use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, StreamConfig};
 
+use crate::rolling::IncrementalResampler;
+
 pub const TARGET_SAMPLE_RATE: u32 = 16_000;
+
+/// Rolling mode: emit a `RollingSamples` batch once this many settled 16 kHz
+/// samples (~0.25s) have accumulated, so the coordinator gets a steady trickle
+/// without a message per mic callback.
+const ROLLING_EMIT_MIN_SAMPLES: usize = TARGET_SAMPLE_RATE as usize / 4;
 
 /// Info about the default input device, used by `flow doctor`.
 pub struct InputDeviceInfo {
@@ -165,7 +172,16 @@ pub enum AudioCommand {
     /// (see [`AudioReply::Stopped`] `auto_stopped_silence`). `None` for
     /// hold-to-talk recordings, where releasing the key is the only stop
     /// signal.
-    Start { max_secs: u64, handsfree_silence_secs: Option<f64> },
+    ///
+    /// `rolling` enables during-recording transcription (Feature B): when set,
+    /// the worker resamples incrementally and streams settled 16 kHz mono via
+    /// [`AudioReply::RollingSamples`] as audio arrives (dropping consumed raw
+    /// input so the capture buffer stays small), and the final
+    /// [`AudioReply::Stopped`] carries an *empty* `samples` — the coordinator
+    /// reconstructs the full audio from the streamed increments. When `false`
+    /// the worker buffers everything and `Stopped` carries the whole recording,
+    /// exactly as before.
+    Start { max_secs: u64, handsfree_silence_secs: Option<f64>, rolling: bool },
     /// Stop the current recording and reply with the resampled 16kHz mono
     /// audio plus its real-world duration.
     Stop,
@@ -200,6 +216,12 @@ pub enum AudioReply {
     /// Roughly-15Hz input level updates (peak amplitude in `[0, 1]`) for
     /// driving the overlay's level bars while recording.
     Level(f32),
+    /// Rolling mode only (Feature B): a batch of newly-settled 16 kHz mono
+    /// samples, streamed during recording so the coordinator can cut and
+    /// transcribe chunks before release. Concatenating every `RollingSamples`
+    /// batch (in order) yields the complete recording; the terminal `Stopped`
+    /// then carries an empty `samples`.
+    RollingSamples { samples: Vec<f32> },
     Error(String),
 }
 
@@ -231,10 +253,14 @@ pub fn spawn_audio_worker(
         .spawn(move || {
             while let Ok(cmd) = cmd_rx.recv() {
                 match cmd {
-                    AudioCommand::Start { max_secs, handsfree_silence_secs } => {
-                        if let Err(e) =
-                            run_one_recording(&cmd_rx, &reply_tx, max_secs, handsfree_silence_secs)
-                        {
+                    AudioCommand::Start { max_secs, handsfree_silence_secs, rolling } => {
+                        if let Err(e) = run_one_recording(
+                            &cmd_rx,
+                            &reply_tx,
+                            max_secs,
+                            handsfree_silence_secs,
+                            rolling,
+                        ) {
                             let _ = reply_tx.send(AudioReply::Error(e.to_string()));
                         }
                     }
@@ -255,6 +281,7 @@ fn run_one_recording(
     reply_tx: &mpsc::Sender<AudioReply>,
     max_secs: u64,
     handsfree_silence_secs: Option<f64>,
+    rolling: bool,
 ) -> Result<()> {
     let host = cpal::default_host();
     let device = host
@@ -333,6 +360,14 @@ fn run_one_recording(
     let frame_len_samples = (in_rate as usize / 10).max(1) * in_channels; // ~100ms of interleaved samples
     let mut frame_accum: Vec<f32> = Vec::new();
 
+    // Rolling (Feature B): stream settled 16 kHz mono during recording and drop
+    // consumed raw input rather than retaining the whole recording. `total_mono`
+    // counts mono input samples (raw_samples stays empty in this mode) so the
+    // duration readout is still accurate.
+    let mut resampler = rolling.then(|| IncrementalResampler::new(in_rate, TARGET_SAMPLE_RATE));
+    let mut pending_16k: Vec<f32> = Vec::new();
+    let mut total_mono: usize = 0;
+
     'capture: loop {
         // A device fault reported by cpal's error callback takes priority:
         // stop cleanly and salvage/discard below.
@@ -367,7 +402,20 @@ fn run_one_recording(
                         }
                     }
                 }
-                raw_samples.extend(chunk);
+                if let Some(r) = resampler.as_mut() {
+                    // Rolling: resample incrementally, stream settled 16 kHz
+                    // mono, and let the raw chunk drop (never retained).
+                    let mono = downmix_to_mono(&chunk, in_channels);
+                    total_mono += mono.len();
+                    r.push(&mono);
+                    pending_16k.extend(r.drain_ready());
+                    if pending_16k.len() >= ROLLING_EMIT_MIN_SAMPLES {
+                        let batch = std::mem::take(&mut pending_16k);
+                        let _ = reply_tx.send(AudioReply::RollingSamples { samples: batch });
+                    }
+                } else {
+                    raw_samples.extend(chunk);
+                }
                 if auto_stopped_silence {
                     break 'capture;
                 }
@@ -392,7 +440,14 @@ fn run_one_recording(
     // Don't drain further after a device fault — the queue may be stale/torn.
     if !disconnected {
         while let Ok(chunk) = data_rx.try_recv() {
-            raw_samples.extend(chunk);
+            if let Some(r) = resampler.as_mut() {
+                let mono = downmix_to_mono(&chunk, in_channels);
+                total_mono += mono.len();
+                r.push(&mono);
+                pending_16k.extend(r.drain_ready());
+            } else {
+                raw_samples.extend(chunk);
+            }
         }
     }
 
@@ -401,6 +456,37 @@ fn run_one_recording(
         return Ok(());
     }
 
+    // Rolling: the coordinator already holds the streamed audio, so terminal
+    // replies carry no samples — just flush the final increment and report
+    // duration/stop-reason. The full recording is the concatenation of every
+    // RollingSamples batch.
+    if let Some(mut r) = resampler.take() {
+        pending_16k.extend(r.finish());
+        if !pending_16k.is_empty() {
+            let batch = std::mem::take(&mut pending_16k);
+            let _ = reply_tx.send(AudioReply::RollingSamples { samples: batch });
+        }
+        let duration = Duration::from_secs_f64(total_mono as f64 / in_rate as f64);
+        if disconnected {
+            let _ = reply_tx.send(AudioReply::Disconnected { samples: Vec::new(), duration });
+            return Ok(());
+        }
+        if auto_stopped_silence {
+            eprintln!(
+                "[vzt-flow] hands-free recording auto-stopped after {:.1}s of trailing silence",
+                duration.as_secs_f64()
+            );
+        }
+        let _ = reply_tx.send(AudioReply::Stopped {
+            samples: Vec::new(),
+            duration,
+            capped,
+            auto_stopped_silence,
+        });
+        return Ok(());
+    }
+
+    // Non-rolling (unchanged): the whole recording is transcribed at release.
     let mono = downmix_to_mono(&raw_samples, in_channels);
     let duration = Duration::from_secs_f64(mono.len() as f64 / in_rate as f64);
 

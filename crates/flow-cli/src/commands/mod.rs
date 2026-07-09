@@ -8,6 +8,7 @@ pub mod listen;
 pub mod meeting;
 pub mod models;
 pub mod paste_test;
+pub mod rolling_test;
 pub mod status;
 pub mod toggle;
 pub mod transcribe;

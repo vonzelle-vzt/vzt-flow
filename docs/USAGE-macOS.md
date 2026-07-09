@@ -244,6 +244,14 @@ VZT Flow needs three grants, all in **System Settings → Privacy & Security**:
   transcribed or pasted). The tap is `ListenOnly`, so Escape still reaches
   whatever app is frontmost; only its "cancel recording" *effect* is gated
   on whether a recording is active.
+- **Typing a special character never starts dictation.** Right Option is
+  macOS's special-character modifier (Option+e = ´, Option+u = ¨, Option+n =
+  ˜, …). If you hold Right Option and press **any other key**, VZT Flow treats
+  it as typing, not push-to-talk: it never arms hands-free, and if a recording
+  had already started (you held past the 300ms threshold before typing), that
+  false start is **discarded immediately** — the overlay hides and nothing is
+  pasted. Because the tap is `ListenOnly`, the special character itself still
+  reaches the app unmodified. This is the *accidental-press guard*.
 - Recording is hard-capped so a stuck key or wedged hands-free session can
   never run forever: **600s (10min)** for both a held recording
   (`max_hold_secs`) and hands-free (`max_handsfree_secs`) — sized for
@@ -267,20 +275,40 @@ VZT Flow needs three grants, all in **System Settings → Privacy & Security**:
   > `crates/flow-core/src/chunking.rs`. The underlying transcribe-rs quadratic
   > memory growth is unchanged upstream; the chunker is what makes the raised
   > cap safe, so there is no longer a reason to keep long holds under ~90s.
+  > **Rolling transcription (on by default, `rolling_transcription`)** goes one
+  > step further for long holds: instead of buffering the whole recording and
+  > transcribing it *after* you release, silence-completed chunks are
+  > transcribed **in the background while you keep talking**, so at release only
+  > the final <35s tail still needs transcribing. Measured on the M5 for a
+  > ~7min45s clip: end-latency after release drops from **25.15s** (batch,
+  > everything transcribed at release) to **0.53s** (rolling, tail only) —
+  > identical transcript, 15 chunks transcribed during recording. It reuses the
+  > same silence-aware cut and seam-dedup as the chunker, and drops each chunk's
+  > audio once transcribed so the capture buffer stays small. Recordings under
+  > ~35s are unaffected (no chunks to roll — transcription still happens once at
+  > release, exactly as before). See `crates/flow-core/src/rolling.rs`; you can
+  > exercise it on any wav with the hidden `flow rolling-test <file>`.
 - Rebind the key from the Settings window (tray → **Settings…**).
 
 ### Overlay pill
 
 A small floating pill window appears near the bottom-center of your primary
 display while dictating, and shows:
-- **Recording** — a live level indicator while you talk.
+- **Recording** — a live level indicator + running mm:ss timer while you talk.
+- **Live preview** (long recordings only) — once rolling transcription starts
+  cutting chunks (past ~35s), a subdued one-line strip appears **under the
+  timer** showing the tail of the transcript so far. It's deliberately dim and
+  italic because it's **raw** text — dictionary-corrected but pre-cleanup, so
+  the final pasted result (after the `clean`/`polish` LLM pass) may differ.
+  Short recordings show only the timer, no preview.
 - **Transcribing** — with a small badge for the resolved mode
   (raw/clean/polish/code) for whatever app was frontmost when you stopped
   talking.
 - **Done** — a brief confirmation flash before the pill hides.
 - **Message** — a short-lived note for non-fatal issues (e.g. "Secure field
   — transcript on clipboard", "No Accessibility permission — transcript on
-  clipboard", "Microphone disconnected", "Transcription failed").
+  clipboard", "Microphone disconnected", "Transcription failed", "Paste may
+  have failed — transcript on clipboard").
 
 ### Tray menu
 
@@ -333,6 +361,16 @@ your previous clipboard contents are restored **~1 second later** — but only
 if the transcript is still what's on the clipboard at that point (if you
 copied something new in the meantime, VZT Flow leaves it alone rather than
 clobbering it).
+
+**Paste verification.** ~150ms after the simulated Cmd+V, VZT Flow reads the
+focused field via the Accessibility API and checks that the transcript's tail
+actually landed. If the field is readable and the text is **missing**, it
+retries the paste once; if it's still missing, the paste is left on the
+clipboard (not restored) and the overlay shows "Paste may have failed —
+transcript on clipboard" plus a notification. If the focused field's value
+isn't readable — most web pages, Electron apps, and secure fields don't expose
+it — verification is skipped and the paste is assumed to have worked (the
+prior behavior). The whole check is bounded to well under half a second.
 
 ## Modes & per-app behavior
 
@@ -536,6 +574,7 @@ Persisted at `~/.config/vzt-flow/config.toml`. Every field, with its default
 | `handsfree_silence_secs` | `2.5` | Seconds of continuous sub-threshold audio (after at least one loud frame) before hands-free auto-stops |
 | `cleanup_enabled` | `true` | Set `false` to force every profile to behave as `raw` mode without editing `profiles.toml` — skips ever loading the cleanup model, for low-RAM machines. Wired into `flow-cli`'s standalone pipeline; the desktop daemon path doesn't check it yet. |
 | `meeting_auto` | `"ask"` | Meeting auto-detect behavior: `"ask"` (notify on a detected call), `"auto"` (start transcribing immediately), or `"off"` (disable). Also settable from the tray's **Meeting auto-detect** submenu. See [`docs/MEETINGS.md`](./MEETINGS.md). |
+| `rolling_transcription` | `true` | Transcribe silence-completed chunks *during* a long recording so only the final <35s tail is transcribed at release (end-latency ~25s → <1s on a 7min clip). Set `false` to fall back to transcribing everything at release. Recordings under ~35s are unaffected either way. |
 
 The file is created with these defaults on first run if it doesn't exist.
 Most fields (notably `hotkey_keycode` and `hold_threshold_ms`) take effect

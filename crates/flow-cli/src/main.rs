@@ -92,6 +92,20 @@ enum Commands {
     CodeTest {
         text: String,
     },
+    /// Hidden: feed a wav through the rolling (transcribe-during-recording)
+    /// pipeline in simulated real time and report the end-latency win over the
+    /// batch (transcribe-at-release) path. See `commands::rolling_test`.
+    #[command(hide = true)]
+    RollingTest {
+        file: std::path::PathBuf,
+        /// Feed faster than real time (e.g. 4 = 4x). Default 1x (honest
+        /// wall-clock pacing, so chunks dispatch at true recording offsets).
+        #[arg(long, default_value_t = 1.0)]
+        speed: f64,
+        /// Skip the batch baseline pass (rolling run only).
+        #[arg(long)]
+        skip_batch: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -134,5 +148,8 @@ fn main() -> anyhow::Result<()> {
         Commands::PasteTest { text } => commands::paste_test::run(&text),
         Commands::CleanTest { text, mode, timeout_ms } => commands::clean_test::run(&text, &mode, timeout_ms),
         Commands::CodeTest { text } => commands::code_test::run(&text),
+        Commands::RollingTest { file, speed, skip_batch } => {
+            commands::rolling_test::run(&file, speed, skip_batch)
+        }
     }
 }
