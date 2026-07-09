@@ -28,11 +28,21 @@ fn load_provider() -> Result<Box<dyn CleanupProvider>> {
     anyhow::bail!("embedded llama.cpp cleanup provider is only implemented for macOS")
 }
 
-pub fn run(text: &str, mode: &str, timeout_ms: u64) -> Result<()> {
+pub fn run(text: &str, mode: &str, timeout_ms_override: Option<u64>) -> Result<()> {
     let mode = Mode::parse(mode);
     println!("mode        : {}", mode.label());
     println!("input       : {text:?}");
-    println!("timeout_ms  : {timeout_ms}");
+
+    // Default to the same length-scaled deadline formula the desktop app
+    // uses, so this diagnostic tool exercises the real per-request budget a
+    // long dictation would get instead of a flat constant. `--timeout-ms`
+    // still overrides it for probing a specific deadline (e.g. forcing the
+    // fallback path).
+    let cfg = flow_core::config::Config::load().unwrap_or_default();
+    let timeout_ms = timeout_ms_override
+        .unwrap_or_else(|| flow_core::cleanup_manager::cleanup_deadline_ms(text.chars().count(), &cfg));
+    let computed_note = if timeout_ms_override.is_none() { " (computed from input length)" } else { "" };
+    println!("timeout_ms  : {timeout_ms}{computed_note}");
 
     if mode == Mode::Raw {
         println!("output      : {text:?} (raw mode never touches the LLM)");

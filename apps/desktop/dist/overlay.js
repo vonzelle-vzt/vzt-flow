@@ -3,7 +3,12 @@ const leading = document.getElementById("leading");
 const bars = document.getElementById("bars");
 const label = document.getElementById("label");
 
-const BAR_COUNT = 24;
+// Reduced from 24: the waveform previously claimed the pill's full flexible
+// width via #bars's `flex: 1`, leaving no room for the new elapsed-time
+// label and truncating it to a couple characters (observed live: "0:12"
+// rendered as "0…"). Fewer, still-flexible bars leaves guaranteed space for
+// the mm:ss text (see overlay.html's #label/#bars width fix too).
+const BAR_COUNT = 14;
 for (let i = 0; i < BAR_COUNT; i++) {
   const bar = document.createElement("span");
   bar.style.height = "4px";
@@ -21,6 +26,16 @@ function renderLevel(level) {
     const h = 4 + history[i] * 24;
     el.style.height = `${h}px`;
   });
+}
+
+// mm:ss readout for the elapsed-time display during long-form holds (up to
+// 10min) so the user has feedback during a multi-minute recording instead
+// of a silent pill.
+function formatElapsed(secs) {
+  const whole = Math.max(0, Math.floor(secs));
+  const m = Math.floor(whole / 60);
+  const s = whole % 60;
+  return `${m}:${String(s).padStart(2, "0")}`;
 }
 
 function setLeading(kind) {
@@ -50,25 +65,29 @@ event.listen("overlay://state", (e) => {
       show();
       setLeading("recording");
       bars.style.display = "flex";
-      label.textContent = "";
+      label.textContent = formatElapsed(payload.elapsed_secs ?? 0);
+      pill.classList.toggle("warning", !!payload.warning);
       renderLevel(payload.level ?? 0);
       break;
     case "transcribing":
       show();
       setLeading("transcribing");
       bars.style.display = "none";
+      pill.classList.remove("warning");
       label.textContent = payload.mode ? `Transcribing… (${payload.mode})` : "Transcribing…";
       break;
     case "done":
       show();
       setLeading("done");
       bars.style.display = "none";
+      pill.classList.remove("warning");
       label.textContent = "Pasted";
       break;
     case "message":
       show();
       setLeading("");
       bars.style.display = "none";
+      pill.classList.remove("warning");
       label.textContent = payload.text ?? "";
       break;
   }

@@ -394,7 +394,14 @@ fn run_coordinator(
             }
             CoordinatorMsg::Audio(AudioReply::Started) => {}
             CoordinatorMsg::Audio(AudioReply::Level(level)) => {
-                overlay::emit_overlay(&app, OverlayEvent::Recording { level });
+                let elapsed = state
+                    .recording_started
+                    .lock()
+                    .unwrap()
+                    .map(|s| s.elapsed())
+                    .unwrap_or_default();
+                let max_secs = state.recording_max_secs.lock().unwrap().unwrap_or(0);
+                overlay::emit_overlay(&app, overlay::recording_event(level, elapsed, max_secs));
             }
             CoordinatorMsg::Audio(AudioReply::Stopped { samples, duration, capped, auto_stopped_silence }) => {
                 if capped {
@@ -449,10 +456,17 @@ fn run_coordinator(
                 std::thread::spawn(move || {
                     // Never wait forever on the transcriber. A dropped reply
                     // channel (panicked worker) surfaces as RecvError; a wedged
-                    // inference trips the 60s timeout. Either way synthesize an
+                    // inference trips the timeout. Either way synthesize an
                     // error result so the state machine leaves Transcribing and
                     // the overlay is dismissed instead of hanging (F2).
-                    let result = match reply_rx.recv_timeout(Duration::from_secs(60)) {
+                    //
+                    // Scaled with audio duration (+60s margin) rather than a
+                    // flat 60s: Parakeet's measured real-time factor is well
+                    // under 1x, but a flat cap sized for short dictations
+                    // would falsely time out a legitimate 10min long-form
+                    // recording if RTF is ever not tiny.
+                    let transcribe_timeout = duration + Duration::from_secs(60);
+                    let result = match reply_rx.recv_timeout(transcribe_timeout) {
                         Ok(result) => result,
                         Err(_) => Err("transcription failed".to_string()),
                     };
@@ -621,9 +635,11 @@ fn max_handsfree_secs(app: &AppHandle) -> u64 {
 fn start_recording(app: &AppHandle, max_secs: u64) {
     let state = app.state::<AppState>();
     state.set_dictation_state(DictationState::Recording);
+    *state.recording_started.lock().unwrap() = Some(std::time::Instant::now());
+    *state.recording_max_secs.lock().unwrap() = Some(max_secs);
     tray::refresh_menu(app);
     overlay::show_overlay(app);
-    overlay::emit_overlay(app, OverlayEvent::Recording { level: 0.0 });
+    overlay::emit_overlay(app, overlay::recording_event(0.0, Duration::ZERO, max_secs));
     // Energy-based auto-stop only applies to hands-free recordings — a
     // hold-to-talk recording's only stop signal is releasing the key.
     let handsfree_silence_secs = if state.hands_free_active.load(Ordering::Relaxed) {
@@ -682,7 +698,10 @@ fn run_pipeline(
         return;
     }
 
-    let timeout_ms = state.config.lock().unwrap().cleanup_timeout_ms;
+    let timeout_ms = {
+        let cfg = state.config.lock().unwrap();
+        flow_core::cleanup_manager::cleanup_deadline_ms(corrected.chars().count(), &cfg)
+    };
     let dictionary_terms: Vec<String> = dict.iter().map(|d| d.term.clone()).collect();
     let ctx = CleanupContext { app_name: app_bundle_id.clone(), tone: profile.tone.clone(), dictionary_terms };
     let cleanup_tx = state.cleanup_cmd_tx.lock().unwrap().clone();
@@ -803,8 +822,17 @@ fn run_overlay_self_test(app: &AppHandle) {
     overlay::show_overlay(app);
     let app2 = app.clone();
     std::thread::spawn(move || {
-        for level in [0.1, 0.4, 0.8, 0.5, 0.2] {
-            overlay::emit_overlay(&app2, OverlayEvent::Recording { level });
+        // Fake a 40s cap so the last two steps land inside the 30s warning
+        // window, exercising the elapsed-time readout and warning styling
+        // (F-series "10min hold with no feedback" gap) without needing a
+        // real multi-minute recording.
+        let fake_max_secs = 40u64;
+        let steps: [(f32, f64); 5] = [(0.1, 0.0), (0.4, 5.0), (0.8, 9.5), (0.5, 10.5), (0.2, 12.0)];
+        for (level, elapsed_secs) in steps {
+            overlay::emit_overlay(
+                &app2,
+                overlay::recording_event(level, Duration::from_secs_f64(elapsed_secs), fake_max_secs),
+            );
             std::thread::sleep(Duration::from_millis(250));
         }
         overlay::emit_overlay(&app2, OverlayEvent::Transcribing { mode: "clean".to_string() });

@@ -44,7 +44,11 @@
     align-items: center;
     gap: 3px;
     height: 28px;
-    flex: 1;
+    /* Was `flex: 1`, which greedily claimed all free space in the pill and
+       left #label (the elapsed-time mm:ss readout) squeezed down to a
+       couple characters via text-overflow ellipsis. Shrinkable but not
+       growing, so #label gets first claim on any slack instead. */
+    flex: 0 1 auto;
   }
   #bars span {
     display: block;
@@ -74,8 +78,26 @@
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+    /* Guarantees room for "9:59"-width elapsed-time text (and most mode
+       badges) without being squeezed to nothing by #bars — see #bars'
+       comment for the bug this fixes. */
+    flex: 1 1 auto;
+    min-width: 34px;
   }
   #pill.hidden { display: none; }
+  /* Last-30s-before-the-cap heads-up for long-form holds: a subtle amber
+     tint rather than a jarring color flip, since this fires during normal
+     use (a full 10min hold), not an error state. */
+  #pill.warning {
+    background: rgba(46, 30, 10, 0.9);
+    box-shadow: 0 6px 24px rgba(0, 0, 0, 0.35), 0 0 0 1px rgba(255, 159, 10, 0.35);
+  }
+  #pill.warning .dot {
+    background: #ff9f0a;
+  }
+  #pill.warning #label {
+    color: #ffc36b;
+  }
 </style>
 </head>
 <body>

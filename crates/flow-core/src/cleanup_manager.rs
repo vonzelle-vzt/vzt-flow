@@ -2,7 +2,10 @@
 //! thread, mirroring `model_manager`'s lifecycle for the transcriber.
 //!
 //! The hard cleanup deadline lives here: each `Clean` command races the
-//! actual generation (run on its own worker thread) against a timer. If the
+//! actual generation (run on its own worker thread) against a per-request
+//! deadline computed by [`cleanup_deadline_ms`] (base cost + a
+//! per-character allowance, capped — not a flat constant; see that
+//! function's doc comment for the formula). If the
 //! generation wins, its text is used; if the timer wins, `cancel` is set so
 //! the worker's token loop stops within one token (see `cleanup::generate`),
 //! we give it a short grace period, then **join** the thread before
@@ -23,6 +26,29 @@ use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 use crate::cleanup::{CleanupContext, CleanupProvider, Mode};
+use crate::config::Config;
+
+/// Computes the wall-clock cleanup deadline (ms) for an input of
+/// `input_char_len` characters: `cleanup_timeout_ms` (base cost — model
+/// dispatch + short-input generation) plus `cleanup_timeout_per_char_ms` for
+/// every character of input, capped at `cleanup_timeout_max_ms` so a single
+/// dictation can never make the user wait longer than that for the LLM
+/// before falling back to the raw transcript.
+///
+/// Derivation of the default `cleanup_timeout_per_char_ms` (6ms/char):
+/// Qwen3-1.7B-Q4_K_M decodes at roughly 40-60 tok/s on M5 (measured); take
+/// the 50 tok/s midpoint -> 20ms/token. Cleanup output is about as long as
+/// input (grammar/filler fixes, not summarization) at ~4 characters/token,
+/// with the same 1.3x headroom `cleanup::generate` reserves in its own
+/// output-token budget for punctuation/expansion -> 20ms/token * 1.3 / 4
+/// chars-per-token ~= 6.5ms/char, rounded down slightly to 6ms/char so the
+/// common (short-dictation) case isn't over-budgeted.
+pub fn cleanup_deadline_ms(input_char_len: usize, cfg: &Config) -> u64 {
+    let scaled = cfg
+        .cleanup_timeout_ms
+        .saturating_add((input_char_len as u64).saturating_mul(cfg.cleanup_timeout_per_char_ms));
+    scaled.min(cfg.cleanup_timeout_max_ms)
+}
 
 /// How long to wait, after setting `cancel`, for the generation thread to
 /// notice and send its (now-irrelevant) result before we join it. Generous
@@ -222,4 +248,45 @@ pub fn spawn(
             }
         })
         .expect("failed to spawn cleanup manager thread")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deadline_for_empty_input_is_the_base_timeout() {
+        let cfg = Config::default();
+        assert_eq!(cleanup_deadline_ms(0, &cfg), cfg.cleanup_timeout_ms);
+    }
+
+    #[test]
+    fn deadline_scales_linearly_with_input_length() {
+        let cfg = Config::default();
+        // A ~40-word dictation (~200 chars): base + 200 * per-char.
+        let expected = cfg.cleanup_timeout_ms + 200 * cfg.cleanup_timeout_per_char_ms;
+        assert_eq!(cleanup_deadline_ms(200, &cfg), expected);
+        assert!(expected < cfg.cleanup_timeout_max_ms, "sanity: short input shouldn't hit the cap");
+    }
+
+    #[test]
+    fn deadline_is_capped_for_very_long_input() {
+        let cfg = Config::default();
+        // A ~1500-word ramble (~8000 chars) would blow way past the base
+        // formula; the cap must win instead of an unbounded wait.
+        assert_eq!(cleanup_deadline_ms(8_000, &cfg), cfg.cleanup_timeout_max_ms);
+    }
+
+    #[test]
+    fn deadline_never_panics_on_pathological_input() {
+        let cfg = Config::default();
+        assert_eq!(cleanup_deadline_ms(usize::MAX, &cfg), cfg.cleanup_timeout_max_ms);
+    }
+
+    #[test]
+    fn default_max_ms_is_a_sane_ceiling() {
+        // Never blocks a dictation more than 20s waiting on the LLM.
+        let cfg = Config::default();
+        assert_eq!(cfg.cleanup_timeout_max_ms, 20_000);
+    }
 }

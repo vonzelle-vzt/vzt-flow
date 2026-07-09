@@ -89,6 +89,14 @@ pub struct AppState {
     /// True once the CGEventTap installed successfully (false usually means
     /// Input Monitoring permission hasn't been granted).
     pub hotkey_monitor_active: AtomicBool,
+    /// When the current recording started, set by `start_recording` and
+    /// read on each `AudioReply::Level` tick to drive the overlay's
+    /// elapsed-time display. `None` while idle.
+    pub recording_started: Mutex<Option<std::time::Instant>>,
+    /// The duration cap (`max_hold_secs`/`max_handsfree_secs`, whichever
+    /// applies) for the current recording, set alongside `recording_started`
+    /// — used to compute the overlay's last-30s warning state.
+    pub recording_max_secs: Mutex<Option<u64>>,
 }
 
 impl AppState {
@@ -123,6 +131,8 @@ impl AppState {
             model_cmd_tx: Mutex::new(None),
             coordinator_tx: Mutex::new(None),
             hotkey_monitor_active: AtomicBool::new(false),
+            recording_started: Mutex::new(None),
+            recording_max_secs: Mutex::new(None),
         }
     }
 

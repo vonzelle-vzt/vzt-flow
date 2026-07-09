@@ -172,7 +172,13 @@ fn handle_transcribe(app: &AppHandle, path: &str) -> Response {
     if sent.is_err() {
         return Response::err("transcriber channel closed");
     }
-    let transcript = match reply_rx.recv_timeout(Duration::from_secs(60)) {
+    // Scaled with the file's own audio duration (+60s margin) rather than a
+    // flat 60s -- see coordinator.rs's identical fix for why a flat cap
+    // sized for short clips would falsely time out a long file (this path
+    // also serves `flow transcribe`/the MCP `transcribe_file` tool against
+    // arbitrary-length files, not just live dictation).
+    let transcribe_timeout = duration + Duration::from_secs(60);
+    let transcript = match reply_rx.recv_timeout(transcribe_timeout) {
         Ok(Ok(t)) => t,
         Ok(Err(e)) => return Response::err(e),
         Err(_) => return Response::err("transcription timed out"),

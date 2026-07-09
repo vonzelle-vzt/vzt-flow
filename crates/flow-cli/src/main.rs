@@ -80,8 +80,12 @@ enum Commands {
         /// "clean" or "polish".
         #[arg(long, default_value = "clean")]
         mode: String,
-        #[arg(long, default_value_t = 2500)]
-        timeout_ms: u64,
+        /// Deadline override, in ms. Defaults to the same length-scaled
+        /// formula the desktop app uses (`cleanup_manager::cleanup_deadline_ms`
+        /// against the local config) rather than a flat value, so this tool
+        /// exercises the real deadline a long dictation would get.
+        #[arg(long)]
+        timeout_ms: Option<u64>,
     },
     /// Hidden: run the deterministic code-mode transform on arbitrary text.
     #[command(hide = true)]

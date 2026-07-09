@@ -630,6 +630,20 @@ mod tests {
     }
 
     #[test]
+    fn raw_sample_cap_at_new_max_hold_is_reasonable_memory() {
+        // 600s (the new max_hold_secs/max_handsfree_secs default) at 48kHz
+        // stereo f32 -- the worst-case native mic format, and this is a
+        // backstop only (the wall-clock check normally fires first). Should
+        // land well under a few hundred MB, not gigabytes.
+        let cap = max_raw_samples(600, 48_000, 2);
+        let bytes = cap * std::mem::size_of::<f32>();
+        assert!(bytes < 300 * 1024 * 1024, "raw capture backstop grew unexpectedly large: {bytes} bytes");
+        // Sanity: still comfortably larger than the old 120s cap's backstop.
+        let old_cap_bytes = max_raw_samples(120, 48_000, 2) * std::mem::size_of::<f32>();
+        assert!(bytes > old_cap_bytes);
+    }
+
+    #[test]
     fn raw_sample_cap_is_saturating_and_nonzero() {
         // Degenerate inputs must not panic or produce a zero budget that
         // would instantly cap every recording.
