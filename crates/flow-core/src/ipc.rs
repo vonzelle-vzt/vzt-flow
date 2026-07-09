@@ -690,6 +690,41 @@ mod windows_tests {
         Box::leak(format!("vzt-flow-ipc-test-{name}-{}-{}", std::process::id(), name.len()).into_boxed_str())
     }
 
+    /// Polls `connect_test` until it succeeds or `timeout` elapses.
+    ///
+    /// Unlike a Unix listen backlog (where a `connect()` against a bound-
+    /// but-not-yet-`accept()`-ed listener still succeeds immediately — the
+    /// kernel just queues it), a Windows named pipe instance is not
+    /// connectable by a client until the server has an active accept
+    /// pending on it (the `ConnectNamedPipe` half of the handshake). A
+    /// `bind_named` listener that nothing has ever called `.incoming()`/
+    /// `serve()` on is therefore not actually reachable — connecting to it
+    /// isn't a fast failure, it can block waiting for an instance that will
+    /// never arrive. This was the root cause of `windows_tests` hanging in
+    /// CI: `bind_rejects_a_second_listener_on_a_live_pipe` used to probe an
+    /// idle listener directly. Every test below that needs "is this pipe
+    /// alive" now does so only *after* spawning `windows::serve`, and polls
+    /// (rather than guessing a fixed sleep) so it isn't racy against
+    /// however long the OS takes to schedule that thread.
+    ///
+    /// Note this isn't a defect in the production `bind`/`is_alive`
+    /// pairing itself — `daemon::spawn` always calls `bind()` immediately
+    /// followed by `serve()`, so a real daemon's pipe is never in this
+    /// idle-but-bound state for any caller to observe. It's a test-harness
+    /// gap that only an artificial "bind and don't serve" setup hits.
+    fn wait_until_alive(name: &'static str, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if test_connect_test(name) {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     #[test]
     fn pipe_name_constant_matches_documented_path() {
         // Sanity check the constant this module (and USAGE-Windows.md)
@@ -707,9 +742,16 @@ mod windows_tests {
     fn bind_rejects_a_second_listener_on_a_live_pipe() {
         let name = tmp_pipe_name("double-bind");
         let listener = test_bind_named(name).unwrap();
-        assert!(test_connect_test(name));
+        // Serve first — see `wait_until_alive`'s doc comment for why an
+        // idle (non-serving) listener isn't a realistic thing to probe.
+        let handle = std::thread::spawn(move || {
+            windows::serve(&listener, |_req| Response::ok());
+        });
+        assert!(wait_until_alive(name, Duration::from_secs(10)), "listener never became connectable");
         assert!(test_bind_named(name).is_err());
-        drop(listener);
+        // `windows::serve` loops forever; nothing to join, cleaned up at
+        // process exit (same pattern as `serve_answers_a_single_status_request`).
+        drop(handle);
     }
 
     #[test]
@@ -732,8 +774,9 @@ mod windows_tests {
             });
         });
 
-        // Give the acceptor a moment to be ready; connect + call.
-        std::thread::sleep(Duration::from_millis(20));
+        // Wait for the accept loop to actually be up rather than guessing
+        // a fixed sleep — see `wait_until_alive`'s doc comment.
+        assert!(wait_until_alive(name, Duration::from_secs(10)), "listener never became connectable");
         let resp = test_call_named(name, &Request::Status, Some(Duration::from_secs(2))).unwrap();
         assert!(resp.ok);
         assert_eq!(resp.state.as_deref(), Some("idle"));
