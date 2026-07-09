@@ -64,3 +64,10 @@ llama-cpp-2 = "0.1"
 # CPU-only ONNX inference (Parakeet) and llama.cpp (cleanup model) on
 # Windows/Linux — no Metal, no CoreML.
 llama-cpp-2 = "0.1"
+
+[target.'cfg(windows)'.dependencies]
+# Windows daemon control-pipe transport (`ipc.rs`'s `windows` module) — a
+# `std::io::{Read, Write}`-wrapped native named pipe, mirroring the Unix
+# socket transport. Sync-only usage (default features; `async`/`tokio`
+# features are opt-in and unused here).
+interprocess = "2"

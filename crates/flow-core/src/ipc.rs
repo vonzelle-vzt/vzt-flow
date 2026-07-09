@@ -1,10 +1,11 @@
 //! Daemon control-socket protocol: newline-delimited JSON request/response
-//! frames, decoupled from the transport that carries them. Today the only
-//! transport is a Unix domain socket at [`socket_path`]; a Windows
-//! named-pipe transport can slot in later by implementing a `connect`/
-//! `bind`-shaped pair against the same [`Request`]/[`Response`] types and
-//! the same `send_*`/`read_*` framing functions below (those only need
-//! `std::io::{Read, Write}`, not anything Unix-specific).
+//! frames, decoupled from the transport that carries them. On Unix the
+//! transport is a Unix domain socket at [`socket_path`]; on Windows it's a
+//! named pipe at `\\.\pipe\vzt-flow-daemon` (see the [`windows`] module) —
+//! both implement a `connect`/`bind`-shaped pair against the same
+//! [`Request`]/[`Response`] types and the same `send_*`/`read_*` framing
+//! functions below (those only need `std::io::{Read, Write}`, not anything
+//! transport-specific).
 //!
 //! Framing: one JSON object per line (`\n`-terminated). Kept intentionally
 //! dumb — no length prefixes, no multiplexing — because the daemon serves
@@ -265,19 +266,187 @@ pub mod unix {
     }
 }
 
+// --- Windows named-pipe transport ---------------------------------------
+//
+// Mirrors `unix` above but over a native Windows named pipe rather than a
+// Unix domain socket, via the `interprocess` crate's `local_socket`
+// abstraction (sync API, no extra feature flags needed — `async`/`tokio`
+// are opt-in and we don't enable them). `interprocess` was chosen over
+// hand-rolling `CreateNamedPipeW`/`ConnectNamedPipe` via the `windows`
+// crate because it already wraps the native named-pipe handle in
+// `std::io::{Read, Write}`, which is exactly the shape `write_request`/
+// `read_request`/`write_response`/`read_response` above need — hand-rolling
+// would just be re-deriving that same wrapper. It's listed on crates.io as
+// "maintenance: passive" (feature-complete, not under active development)
+// rather than abandoned; the sync `local_socket` API this module uses is
+// small and stable enough that this is an acceptable trade for not owning
+// ~150 lines of raw Win32 FFI.
+//
+// Pipe name/path: `\\.\pipe\vzt-flow-daemon`, current-user scoped by
+// default Windows named-pipe ACLs (a pipe created by a normal process is
+// only connectable by the same user session unless explicitly given a
+// custom security descriptor, which this code does not do) — equivalent in
+// spirit to the Unix socket's `0600` chmod in `unix::bind`.
+#[cfg(windows)]
+pub mod windows {
+    use super::*;
+    use interprocess::local_socket::{
+        traits::{ListenerExt, Stream as _},
+        GenericNamespaced, ListenerOptions, Name, Stream, ToNsName,
+    };
+    use std::io::BufReader;
+    use std::path::Path;
+    use std::time::Duration;
+
+    pub use interprocess::local_socket::Listener;
+
+    /// The pipe's base name; `interprocess` maps this onto the full
+    /// `\\.\pipe\vzt-flow-daemon` path via [`GenericNamespaced`]. Matches
+    /// the Unix socket's filename for consistency across docs/tooling.
+    pub const PIPE_NAME: &str = "vzt-flow-daemon";
+
+    /// Everything below is parameterized over the pipe's base name (rather
+    /// than hardcoding [`PIPE_NAME`] throughout) purely so `windows_tests`
+    /// can exercise this module with per-test pipe names instead of racing
+    /// each other — and the real daemon and its stale-listener guard —
+    /// on the one shared production name. The public `bind`/`call`/
+    /// `is_alive` wrappers below always pass `PIPE_NAME`.
+    fn pipe_name_for(name: &'static str) -> Result<Name<'static>> {
+        name.to_ns_name::<GenericNamespaced>().context("failed to build the vzt-flow daemon pipe name")
+    }
+
+    pub(crate) fn connect_test(name: &'static str) -> bool {
+        match pipe_name_for(name) {
+            Ok(n) => Stream::connect(n).is_ok(),
+            Err(_) => false,
+        }
+    }
+
+    /// Connect-tests the daemon pipe: `true` if a live listener accepted
+    /// the connection (immediately dropped), `false` otherwise. `_path` is
+    /// accepted-but-unused so this has the same signature as
+    /// `unix::is_alive` and can be re-exported from [`transport`] unchanged
+    /// by callers that pass `socket_path()` generically.
+    pub fn is_alive(_path: &Path) -> bool {
+        connect_test(PIPE_NAME)
+    }
+
+    /// No-op, unlike `unix::remove_if_stale`: a named pipe is a pure kernel
+    /// object with no filesystem entry to leak. When the owning process
+    /// exits — cleanly or via a hard kill — Windows reclaims the pipe
+    /// automatically, so there is no "stale pipe file" to clean up.
+    pub fn remove_if_stale(_path: &Path) -> Result<bool> {
+        Ok(false)
+    }
+
+    pub(crate) fn call_named(name: &'static str, req: &Request, read_timeout: Option<Duration>) -> Result<Response> {
+        let pipe = pipe_name_for(name)?;
+        let mut stream = Stream::connect(pipe)
+            .with_context(|| format!("failed to connect to daemon named pipe \\\\.\\pipe\\{name}"))?;
+        stream.set_recv_timeout(read_timeout).context("failed to set read timeout")?;
+        write_request(&mut stream, req)?;
+        let mut reader = BufReader::new(stream);
+        read_response(&mut reader)
+    }
+
+    /// Connects to the daemon pipe for a single request/response round
+    /// trip and returns the parsed response. `_path` is accepted-but-unused
+    /// (see [`is_alive`]).
+    pub fn call(_path: &Path, req: &Request, read_timeout: Option<Duration>) -> Result<Response> {
+        call_named(PIPE_NAME, req, read_timeout)
+    }
+
+    pub(crate) fn bind_named(name: &'static str) -> Result<Listener> {
+        // Unlike `UnixListener::bind`, Windows named pipes normally allow
+        // multiple listener instances to register under the same name at
+        // once (that's the OS's standard multi-instance pipe-server model,
+        // meant for concurrent-accept pools) — `ListenerOptions::create_sync`
+        // would silently succeed even with another vzt-flow daemon already
+        // serving. So the "already running" guard `unix::bind` gets for
+        // free from `UnixListener::bind` is reimplemented explicitly here
+        // via a connect-test first. Same check-then-act race window as the
+        // Unix version (not atomic), which is an accepted trade there too.
+        if connect_test(name) {
+            anyhow::bail!(
+                "a daemon is already listening on \\\\.\\pipe\\{name} — is another instance of vzt-flow running?"
+            );
+        }
+        let pipe = pipe_name_for(name)?;
+        ListenerOptions::new()
+            .name(pipe)
+            .create_sync()
+            .with_context(|| format!("failed to bind daemon named pipe \\\\.\\pipe\\{name}"))
+    }
+
+    /// Binds the daemon's named-pipe listener at [`PIPE_NAME`].
+    pub fn bind() -> Result<Listener> {
+        bind_named(PIPE_NAME)
+    }
+
+    /// Runs `handler` against every connection accepted on `listener`,
+    /// sequentially — same one-request-per-connection, one-thing-at-a-time
+    /// contract as `unix::serve`.
+    pub fn serve<F>(listener: &Listener, mut handler: F)
+    where
+        F: FnMut(Request) -> Response,
+    {
+        for conn in listener.incoming() {
+            let stream = match conn {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("[vzt-flow] daemon pipe accept error: {e}");
+                    continue;
+                }
+            };
+            if let Err(e) = handle_one(stream, &mut handler) {
+                eprintln!("[vzt-flow] daemon pipe connection error: {e}");
+            }
+        }
+    }
+
+    fn handle_one<F>(stream: Stream, handler: &mut F) -> Result<()>
+    where
+        F: FnMut(Request) -> Response,
+    {
+        // Unlike `unix::handle_one` (which clones the stream fd to hold an
+        // independent reader/writer pair), `local_socket::Stream` is used
+        // here the same way the crate's own examples do: own it inside a
+        // `BufReader` for buffered reads, and write back out through
+        // `BufReader::get_mut` (which doesn't itself implement `Write`).
+        let mut reader = BufReader::new(stream);
+        match read_request(&mut reader) {
+            Ok(Some(req)) => {
+                let resp = handler(req);
+                write_response(reader.get_mut(), &resp)?;
+            }
+            Ok(None) => {} // peer connected and disconnected without sending anything
+            Err(e) => {
+                let resp = Response::err(format!("bad request: {e}"));
+                let _ = write_response(reader.get_mut(), &resp);
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Cross-platform "is a daemon reachable, and can we round-trip a request"
 /// facade used by CLI commands (`daemon_client`, `doctor`) that don't need
-/// the rest of `unix`'s bind/serve surface. On Unix this just re-exports the
-/// socket transport above. On Windows there is no transport implemented yet
-/// (see the module docs), so every call reports "not running"/"not
-/// supported" instead of failing to compile — callers already have a
-/// standalone (no-daemon) fallback path for exactly this case.
+/// the rest of `unix`'s/`windows`'s bind/serve surface. Re-exports the
+/// platform-appropriate transport; on a target that is neither Unix nor
+/// Windows, every call reports "not running"/"not supported" instead of
+/// failing to compile — callers already have a standalone (no-daemon)
+/// fallback path for exactly this case.
 #[cfg(unix)]
 pub mod transport {
     pub use super::unix::{call, is_alive};
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub mod transport {
+    pub use super::windows::{call, is_alive};
+}
+
+#[cfg(not(any(unix, windows)))]
 pub mod transport {
     use super::*;
     use std::path::Path;
@@ -499,5 +668,80 @@ mod unix_tests {
 
         handle.join().unwrap();
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::windows::{
+        bind_named as test_bind_named, call_named as test_call_named, connect_test as test_connect_test, PIPE_NAME,
+    };
+    use super::*;
+    use std::time::Duration;
+
+    /// Leaks a unique per-test pipe base name so parallel `cargo test`
+    /// threads (and the tests below, which each bind/connect a listener)
+    /// don't collide on the same pipe the way they would if every test
+    /// used the production [`PIPE_NAME`] — see `windows::pipe_name_for`'s
+    /// doc comment for why this module is parameterized over the name at
+    /// all. `Box::leak` is fine here: it's test-only and reclaimed at
+    /// process exit.
+    fn tmp_pipe_name(name: &str) -> &'static str {
+        Box::leak(format!("vzt-flow-ipc-test-{name}-{}-{}", std::process::id(), name.len()).into_boxed_str())
+    }
+
+    #[test]
+    fn pipe_name_constant_matches_documented_path() {
+        // Sanity check the constant this module (and USAGE-Windows.md)
+        // build `\\.\pipe\vzt-flow-daemon` from hasn't drifted.
+        assert_eq!(PIPE_NAME, "vzt-flow-daemon");
+    }
+
+    #[test]
+    fn is_alive_false_for_nonexistent_pipe() {
+        let name = tmp_pipe_name("nonexistent");
+        assert!(!test_connect_test(name));
+    }
+
+    #[test]
+    fn bind_rejects_a_second_listener_on_a_live_pipe() {
+        let name = tmp_pipe_name("double-bind");
+        let listener = test_bind_named(name).unwrap();
+        assert!(test_connect_test(name));
+        assert!(test_bind_named(name).is_err());
+        drop(listener);
+    }
+
+    #[test]
+    fn remove_if_stale_is_a_no_op() {
+        // Named pipes have no filesystem entry to leak (see the doc
+        // comment on `windows::remove_if_stale`); this just locks in that
+        // the function never claims to have removed anything.
+        assert!(!windows::remove_if_stale(std::path::Path::new("unused")).unwrap());
+    }
+
+    #[test]
+    fn serve_answers_a_single_status_request() {
+        let name = tmp_pipe_name("serve");
+        let listener = test_bind_named(name).unwrap();
+        let handle = std::thread::spawn(move || {
+            // Handle exactly one connection then return.
+            windows::serve(&listener, |req| {
+                matches!(req, Request::Status);
+                Response { ok: true, state: Some("idle".to_string()), ..Default::default() }
+            });
+        });
+
+        // Give the acceptor a moment to be ready; connect + call.
+        std::thread::sleep(Duration::from_millis(20));
+        let resp = test_call_named(name, &Request::Status, Some(Duration::from_secs(2))).unwrap();
+        assert!(resp.ok);
+        assert_eq!(resp.state.as_deref(), Some("idle"));
+
+        // `windows::serve` loops forever (mirrors `unix::serve`'s
+        // contract), so the spawned thread never returns on its own once
+        // it's answered our one connection — nothing left to join here,
+        // it's cleaned up when the test process exits.
+        drop(handle);
     }
 }

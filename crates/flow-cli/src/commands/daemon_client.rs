@@ -7,10 +7,10 @@ use anyhow::Result;
 use flow_core::ipc::{transport, Request, Response};
 
 /// Best-effort check for "is a daemon currently listening". `false` covers
-/// both "never started" and "stale socket file left behind" (and, on
-/// Windows, "no daemon transport exists yet") — callers that need to
-/// distinguish the Unix cases can call `flow_core::ipc::unix::is_alive`
-/// directly.
+/// both "never started" and "stale socket file left behind" (Unix) or "no
+/// listener on the pipe" (Windows) — callers that need to distinguish the
+/// platform-specific cases can call `flow_core::ipc::unix::is_alive` /
+/// `flow_core::ipc::windows::is_alive` directly.
 pub fn is_daemon_running() -> bool {
     match flow_core::ipc::socket_path() {
         Ok(path) => transport::is_alive(&path),

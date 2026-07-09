@@ -130,24 +130,34 @@ tray toggle is unaffected.
 All verified directly against the code (not carried over from the macOS
 guide unchanged):
 
-- **No daemon control socket yet.** `flow_core::ipc`'s only transport is a
-  Unix domain socket (`#[cfg(unix)]`); on Windows, `transport::is_alive`
-  always returns `false` and `transport::call` always returns an error
-  saying the daemon socket "is not supported on this platform yet." Every
-  daemon-dependent CLI path —`flow status`, `flow toggle`, `flow cancel`,
-  and `flow listen`'s daemon-first branch — falls back to (or requires) the
-  standalone pipeline instead. The desktop app's own `daemon::spawn` is
-  also `#[cfg(not(unix))]`-gated to a `bail!` on Windows, logged but
-  non-fatal at startup (`daemon control socket failed to start`). The MCP
-  server's daemon path (`mcp/src/daemon.ts`) will likewise never connect on
-  Windows and always falls through to its standalone `flow` CLI fallback.
-- **`flow` CLI verbs run standalone.** Concretely: `flow listen` always
-  takes the `run_standalone` path (records via `AudioRecorder::record_until_enter`,
-  waiting for Enter rather than being driven by the app's overlay);
-  `flow status`/`toggle`/`cancel` report/require a daemon and will simply
-  fail with "daemon not running (or unreachable)" since there's no
-  transport to reach one; `flow history` still works standalone by reading
-  `history.jsonl` directly.
+- **Daemon control socket: supported, over a named pipe.** `flow_core::ipc`
+  now has a Windows transport (`ipc::windows`, `#[cfg(windows)]`) alongside
+  the Unix domain socket one — it uses the `interprocess` crate's
+  `local_socket` abstraction to open a native named pipe at
+  `\\.\pipe\vzt-flow-daemon`, ACL'd to the current user session by default
+  (equivalent in spirit to the Unix socket's `0600` chmod). The desktop
+  app's `daemon::spawn` binds this pipe and runs the same accept-loop
+  contract as the Unix `serve` (one connection at a time), so `flow
+  status`/`toggle`/`cancel`/`listen` and the MCP server's daemon path
+  (`mcp/src/daemon.ts`, which connects to the same `\\.\pipe\...` path via
+  Node's `net.createConnection({ path })`) are all daemon-first on Windows
+  the same way they are on macOS.
+  **What's proven vs. not:** CI (`.github/workflows/build.yml`'s `windows`
+  job) compiles this and runs `cargo test --release --workspace` on
+  `windows-latest`, including windows-gated unit tests
+  (`crates/flow-core/src/ipc.rs`'s `windows_tests` module) that bind/serve/
+  connect/round-trip a request over a real named pipe on that runner. What
+  CI does **not** exercise: the full desktop-app-as-daemon path end to end
+  (spawn the `.exe`, run `flow status` against it, actually record+paste
+  through the daemon) — that's still unverified on real Windows hardware,
+  same caveat as the rest of this doc.
+- **`flow` CLI verbs are daemon-first, same as macOS.** `flow listen`
+  connects to the daemon pipe first and only falls back to the
+  `run_standalone` path (`AudioRecorder::record_until_enter`, waiting for
+  Enter) if nothing answers; `flow status`/`toggle`/`cancel` talk to the
+  daemon pipe and report "daemon not running (or unreachable)" only if
+  there's genuinely no listener; `flow history` still works standalone by
+  reading `history.jsonl` directly either way.
 - **No frontmost-app profiles — the default profile always applies.**
   `flow_core::permissions::frontmost_bundle_id()` is `#[cfg(not(target_os =
   "macos"))]`-gated to always return `None` on Windows (the macOS
@@ -226,8 +236,12 @@ guide unchanged):
 
 ## Known limitations
 
-- No daemon socket → no `flow status`/`toggle`/`cancel`, no daemon-driven
-  overlay-integrated `flow listen`, no MCP daemon path.
+- Daemon control socket (named pipe) is CI-compiled and CI-unit-tested but
+  **not yet exercised end to end on real Windows hardware** — the
+  desktop-app-as-daemon + `flow status`/`toggle`/`listen` + MCP round trip
+  through an actually-running app has not been observed outside CI's
+  in-process pipe tests. See [Differences vs.
+  macOS](#differences-vs-macos) above for exactly what is/isn't proven.
 - No per-app profiles → one mode/tone for everything (edit `profiles.toml`'s
   `[default]`).
 - No `clean`/`polish` LLM rewrite — only `raw` and `code` modes do anything
@@ -250,6 +264,10 @@ If you're running this on real Windows hardware, we'd like to know:
   outright, or just warn?
 - Does paste into a normal (non-elevated) app work reliably via enigo's
   Ctrl+V simulation?
+- Does the daemon named pipe actually work end to end: launch the desktop
+  app, then run `flow status` / `flow toggle` / `flow listen` from a
+  separate terminal — do they reach the running app, or fail to connect?
+  Same question for the MCP server's daemon path.
 - Anything that crashes, hangs, or silently does nothing.
 
 Open an issue (or, if you have write access, a note in the repo) with what

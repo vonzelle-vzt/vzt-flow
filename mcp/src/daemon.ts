@@ -1,14 +1,24 @@
-// Client for VZT Flow's daemon control socket — a Unix domain socket at
-// ~/.config/vzt-flow/daemon.sock speaking newline-delimited JSON request/
-// response frames (see crates/flow-core/src/ipc.rs for the Rust side of
-// this protocol; this is a from-scratch Node implementation of the same
-// wire format, not a shared library).
+// Client for VZT Flow's daemon control socket: a Unix domain socket at
+// ~/.config/vzt-flow/daemon.sock on macOS/Linux, or a named pipe at
+// \\.\pipe\vzt-flow-daemon on Windows — both speaking the same
+// newline-delimited JSON request/response frames (see
+// crates/flow-core/src/ipc.rs for the Rust side of this protocol; this is
+// a from-scratch Node implementation of the same wire format, not a shared
+// library). Node's `net.createConnection({ path })` handles both transports
+// transparently: on Windows a `\\.\pipe\...` path connects to a named pipe
+// instead of a Unix socket, with no other API differences.
 
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 
+// Must match `flow_core::ipc::windows::PIPE_NAME` in ipc.rs.
+const WINDOWS_PIPE_NAME = "vzt-flow-daemon";
+
 export function socketPath(): string {
+  if (process.platform === "win32") {
+    return `\\\\.\\pipe\\${WINDOWS_PIPE_NAME}`;
+  }
   return path.join(os.homedir(), ".config", "vzt-flow", "daemon.sock");
 }
 

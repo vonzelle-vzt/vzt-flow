@@ -1,5 +1,6 @@
 //! The daemon control socket: a Unix domain socket at
-//! `~/.config/vzt-flow/daemon.sock` that lets the CLI (and, via it, the MCP
+//! `~/.config/vzt-flow/daemon.sock` (Windows: a named pipe at
+//! `\\.\pipe\vzt-flow-daemon`) that lets the CLI (and, via it, the MCP
 //! server) drive this running app instance — status, toggle, cancel, a
 //! record-and-return-text `listen`, file transcription, and history.
 //!
@@ -20,11 +21,6 @@ use crate::state::{AppState, ModelLifecycle};
 /// Spawns the socket-accept loop on a dedicated thread. Binding happens
 /// synchronously (so a bind failure surfaces immediately, before `setup()`
 /// returns) and the loop itself runs for the lifetime of the process.
-///
-/// Unix only: there is no daemon transport implemented for Windows yet (see
-/// `flow_core::ipc`'s module docs) — `lib.rs`'s `setup()` already treats a
-/// bind failure as non-fatal (logged, app keeps running without the
-/// scriptable socket), so the Windows stub below just reports that.
 #[cfg(unix)]
 pub fn spawn(app: AppHandle) -> anyhow::Result<()> {
     use flow_core::ipc::unix;
@@ -41,7 +37,29 @@ pub fn spawn(app: AppHandle) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+/// Windows equivalent of the Unix `spawn` above, over a named pipe instead
+/// of a Unix domain socket (see `flow_core::ipc::windows`'s module docs).
+/// Same synchronous-bind-then-background-thread shape.
+#[cfg(windows)]
+pub fn spawn(app: AppHandle) -> anyhow::Result<()> {
+    use flow_core::ipc::windows;
+    let listener = windows::bind()?;
+    eprintln!("[vzt-flow] daemon pipe listening at \\\\.\\pipe\\{}", windows::PIPE_NAME);
+
+    std::thread::Builder::new()
+        .name("vzt-flow-daemon-pipe".into())
+        .spawn(move || {
+            windows::serve(&listener, |req| handle_request(&app, req));
+        })
+        .expect("failed to spawn daemon pipe thread");
+    Ok(())
+}
+
+/// Neither Unix nor Windows: there is no daemon transport implemented for
+/// this platform (see `flow_core::ipc`'s module docs) — `lib.rs`'s
+/// `setup()` already treats a bind failure as non-fatal (logged, app keeps
+/// running without the scriptable socket), so this stub just reports that.
+#[cfg(not(any(unix, windows)))]
 pub fn spawn(_app: AppHandle) -> anyhow::Result<()> {
     anyhow::bail!(
         "the daemon control socket is not supported on this platform yet; \
@@ -62,7 +80,12 @@ pub fn cleanup() {
     }
 }
 
-#[cfg(not(unix))]
+/// No-op on Windows: named pipes have no filesystem entry to clean up (see
+/// `flow_core::ipc::windows::remove_if_stale`'s doc comment).
+#[cfg(windows)]
+pub fn cleanup() {}
+
+#[cfg(not(any(unix, windows)))]
 pub fn cleanup() {}
 
 fn handle_request(app: &AppHandle, req: Request) -> Response {
