@@ -1,0 +1,46 @@
+name: Feature request
+description: Suggest a capability or a change in behavior
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before filing, check the [Roadmap](https://github.com/vonzelle-vzt/vzt-flow#roadmap) —
+        several obvious asks (Windows cleanup LLM, code signing, command mode)
+        are already planned.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+      description: Describe the situation, not the solution you have in mind.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would you like it to do?
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What have you tried instead?
+      description: |
+        Existing escape hatches worth ruling out first: per-app profiles
+        (`profiles.toml`), the personal dictionary, snippets, code mode, and
+        the CLI (`flow listen`, `flow transcribe`).
+
+  - type: checkboxes
+    id: constraints
+    attributes:
+      label: Does this fit the project's constraints?
+      description: |
+        VZT Flow is on-device by design. The only network traffic it makes is
+        the one-time model download. A feature that requires a cloud call, a
+        subscription, or telemetry is out of scope regardless of how useful it is.
+      options:
+        - label: This can be done entirely on-device, with no network access at runtime.
+          required: true

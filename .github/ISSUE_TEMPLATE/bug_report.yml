@@ -1,0 +1,92 @@
+name: Bug report
+description: Something doesn't work the way the docs say it should
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing. Three things answer most first-round questions:
+        your version, your platform, and `flow doctor` output.
+
+        **Security problems do not belong here.** Report those privately via
+        [Security → Report a vulnerability](https://github.com/vonzelle-vzt/vzt-flow/security/advisories/new).
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `flow --version` (or the release tag / commit you built).
+      placeholder: flow 0.2.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - macOS — Apple Silicon
+        - macOS — Intel
+        - Windows x64 (experimental)
+        - Linux x64 — X11 (experimental)
+        - Linux x64 — Wayland (experimental, degraded)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install
+    attributes:
+      label: How did you install it?
+      options:
+        - Homebrew cask
+        - Install one-liner
+        - Downloaded .dmg from Releases
+        - Built from source
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened, and what did you expect instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Hold Right Option and say "..."
+        2. Release
+        3. Nothing is pasted / wrong text appears
+    validations:
+      required: true
+
+  - type: textarea
+    id: doctor
+    attributes:
+      label: "`flow doctor` output"
+      description: Paste the full output. It is rendered as a code block automatically.
+      render: shell
+
+  - type: textarea
+    id: audio
+    attributes:
+      label: Does it reproduce with a synthesized clip?
+      description: |
+        Optional but very helpful — it separates mic/permission problems from
+        transcription problems:
+        `say -o /tmp/clip.aiff "test sentence" && ffmpeg -y -i /tmp/clip.aiff /tmp/clip.wav && flow transcribe /tmp/clip.wav`
+      render: shell
+
+  - type: checkboxes
+    id: rebuild-gotcha
+    attributes:
+      label: Permission grants
+      description: |
+        If you built from source: unsigned rebuilds silently revoke macOS
+        Input Monitoring / Accessibility grants, and the hotkey stops working
+        with no error dialog. This is the single most common false bug report.
+      options:
+        - label: I have re-granted Microphone, Accessibility, and Input Monitoring after my most recent build (or I installed a released binary).

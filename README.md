@@ -505,6 +505,16 @@ start with `crates/flow-core/src/lib.rs` and the module list above. Please
 verify claims against the code the way the docs in this repo try to (see
 the doc comments throughout `flow-core` for the standard).
 
+[CONTRIBUTING.md](CONTRIBUTING.md) has the build/test commands, the
+verification norms (test with real speech; report measured numbers, not
+adjectives), and the two gotchas most likely to waste your afternoon —
+unsigned rebuilds dropping macOS permission grants, and Parakeet's quadratic
+memory growth on long audio. Participation is governed by the
+[Code of Conduct](CODE_OF_CONDUCT.md).
+
+Found a security problem? Don't open a public issue — see
+[SECURITY.md](SECURITY.md).
+
 ## License
 
 MIT — see [LICENSE](LICENSE). Copyright (c) 2026 VZT Tech Consulting.

@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/vonzelle-vzt/vzt-flow/security/advisories/new
+    about: Never report security problems in a public issue. This opens a private advisory.
+  - name: Setup, permissions, and troubleshooting (macOS)
+    url: https://github.com/vonzelle-vzt/vzt-flow/blob/main/docs/USAGE-macOS.md
+    about: Permission grants, the rebuild-drops-permissions gotcha, and config reference.
+  - name: Windows / Linux usage (experimental)
+    url: https://github.com/vonzelle-vzt/vzt-flow/tree/main/docs
+    about: Both platforms are CI-built and only lightly hand-tested. Read the caveats first.
