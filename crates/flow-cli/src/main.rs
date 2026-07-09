@@ -3,7 +3,7 @@ mod commands;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "flow", about = "VZT Flow — local voice dictation CLI (Phase 1)")]
+#[command(name = "flow", version, about = "VZT Flow — local voice dictation CLI (Phase 1)")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
