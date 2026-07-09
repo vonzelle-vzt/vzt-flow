@@ -107,9 +107,13 @@ transcript with an echo filter (Jaccard similarity > 0.7 on time-overlapping
 lines) that drops your own mic re-picking-up speaker audio from participants
 without headphones. Stopping the meeting appends a local Qwen3-generated
 summary and action items. A `meeting_transcript` MCP tool exposes transcripts
-to Claude Code ("summarize my last meeting", "pull the action items"). macOS
-only (ScreenCaptureKit is a macOS 13+ framework). Full guide, permissions,
-and transcript-format details: [docs/MEETINGS.md](docs/MEETINGS.md).
+to Claude Code ("summarize my last meeting", "pull the action items"). A
+background auto-detector (tray → **Meeting auto-detect ▸ Ask/Auto/Off**)
+combines frontmost-app matching (Zoom/Meet/Teams) with a mic-live signal to
+offer or auto-start `flow meeting` when a call begins — 100% local,
+titles-only, no screenshots. macOS only (ScreenCaptureKit is a macOS 13+
+framework). Full guide, permissions, and transcript-format details:
+[docs/MEETINGS.md](docs/MEETINGS.md).
 
 ### AI cleanup: on-device Qwen3-1.7B, three modes, a hard deadline
 
@@ -386,9 +390,6 @@ require a restart: [docs/USAGE-macOS.md#config-reference-configtoml](docs/USAGE-
 
 ## Roadmap
 
-- Meeting auto-detect — automatically offering/starting `flow meeting` when a
-  call app becomes frontmost, rather than requiring a manual `flow meeting
-  --title ...` invocation (in progress)
 - Windows daemon socket + per-app profiles + `clean`/`polish` cleanup LLM
   (all currently macOS-only)
 - Real-hardware validation on Windows (everything today is CI-built, never
