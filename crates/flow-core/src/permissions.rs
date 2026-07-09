@@ -38,10 +38,16 @@ mod macos {
     pub fn secure_input_enabled() -> bool {
         false
     }
-    /// No TCC/Accessibility-style permission gate off macOS — Windows has no
-    /// equivalent one-time grant to check, so report "trusted" rather than
-    /// permanently skipping every paste. (UIPI privilege-boundary paste
-    /// failures aren't detected here; see `insert.rs`.)
+    /// No TCC/Accessibility-style permission gate off macOS — neither Windows
+    /// nor Linux (X11) has an equivalent one-time grant to check, so report
+    /// "trusted" rather than permanently skipping every paste. Platform paste
+    /// failures that *can't* be detected via a permission bit are handled in
+    /// `insert.rs` instead: Windows UIPI privilege-boundary drops, and Linux
+    /// Wayland (where synthetic Ctrl+V can't reach native Wayland clients, so
+    /// the transcript is left on the clipboard). If a future Linux build uses
+    /// an `evdev`/`uinput` input backend instead of X11 XTEST, this is where a
+    /// real "user is in the `input` group / has /dev/uinput access" check
+    /// would live.
     pub fn accessibility_trusted() -> bool {
         true
     }

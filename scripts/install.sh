@@ -29,29 +29,48 @@ die() { printf 'error: %s\n' "$1" >&2; exit 1; }
 
 # --- platform check -----------------------------------------------------
 
-if [ "$(uname -s)" != "Darwin" ]; then
-  die "this installer is for macOS only (Windows: scripts/install.ps1)"
-fi
-
+OS_KIND="$(uname -s)"
 ARCH="$(uname -m)"
-case "$ARCH" in
-  arm64)
-    DMG_PATTERN="*aarch64*.dmg"
-    CLI_PATTERN="vzt-flow-cli-macos-aarch64.tar.gz"
+
+case "$OS_KIND" in
+  Darwin)
+    case "$ARCH" in
+      arm64)
+        DMG_PATTERN="*aarch64*.dmg"
+        CLI_PATTERN="vzt-flow-cli-macos-aarch64.tar.gz"
+        ;;
+      x86_64)
+        # Intel Mac: CPU-only inference (no Metal/CoreML) — see the README
+        # hardware compat matrix. Built and packaged in CI, cross-compiled from
+        # an arm64 runner; not verified on real Intel hardware.
+        warn "Intel Mac detected — CPU-only inference (no Metal/CoreML), slower than Apple Silicon. See README for details."
+        # Tauri names the x86_64 dmg with "x64", not "x86_64" (see
+        # tauri-bundler's dmg/mod.rs: Arch::X86_64 => "x64") — e.g.
+        # "VZT Flow_0.1.0_x64.dmg". The CLI tarball name is ours, not Tauri's.
+        DMG_PATTERN="*_x64.dmg"
+        CLI_PATTERN="vzt-flow-cli-macos-x86_64.tar.gz"
+        ;;
+      *)
+        die "unsupported macOS architecture: $ARCH (VZT Flow ships arm64 and x86_64 builds only)"
+        ;;
+    esac
     ;;
-  x86_64)
-    # Intel Mac: CPU-only inference (no Metal/CoreML) — see the README
-    # hardware compat matrix. Built and packaged in CI, cross-compiled from
-    # an arm64 runner; not verified on real Intel hardware.
-    warn "Intel Mac detected — CPU-only inference (no Metal/CoreML), slower than Apple Silicon. See README for details."
-    # Tauri names the x86_64 dmg with "x64", not "x86_64" (see
-    # tauri-bundler's dmg/mod.rs: Arch::X86_64 => "x64") — e.g.
-    # "VZT Flow_0.1.0_x64.dmg". The CLI tarball name is ours, not Tauri's.
-    DMG_PATTERN="*_x64.dmg"
-    CLI_PATTERN="vzt-flow-cli-macos-x86_64.tar.gz"
+  Linux)
+    # Linux x86_64 only. Built and tested in CI but never run on real Linux
+    # hardware — see the README hardware compat matrix and docs/USAGE-Linux.md
+    # (X11 full, Wayland degraded). Install path handled by install_linux()
+    # below, which exits before the macOS dmg/hdiutil code.
+    case "$ARCH" in
+      x86_64)
+        CLI_PATTERN="vzt-flow-cli-linux-x86_64.tar.gz"
+        ;;
+      *)
+        die "unsupported Linux architecture: $ARCH (VZT Flow ships an x86_64 Linux build only)"
+        ;;
+    esac
     ;;
   *)
-    die "unsupported macOS architecture: $ARCH (VZT Flow ships arm64 and x86_64 builds only)"
+    die "unsupported OS: $OS_KIND (macOS and Linux x86_64 only; Windows: scripts/install.ps1)"
     ;;
 esac
 
@@ -124,6 +143,119 @@ fetch_asset() {
     download_with_token "$pattern"
   fi
 }
+
+# --- Linux install path (deb / AppImage) ----------------------------------
+# Debian/Ubuntu (dpkg + apt present) get the .deb; everything else falls back
+# to the portable .AppImage dropped in ~/.local/bin. Then the shared flow CLI
+# + MCP steps. Kept in a function invoked from the dispatch just below so the
+# macOS dmg/hdiutil path further down stays byte-for-byte unchanged.
+install_linux() {
+  local kind bundle_pattern
+  if command -v apt-get >/dev/null 2>&1 && command -v dpkg >/dev/null 2>&1; then
+    kind="deb"; bundle_pattern="*.deb"
+  else
+    kind="appimage"; bundle_pattern="*.AppImage"
+  fi
+
+  log "fetching latest release assets for ${REPO} (Linux x86_64, ${kind})"
+  fetch_asset "$bundle_pattern"
+  fetch_asset "$CLI_PATTERN"
+
+  local bundle tarball
+  bundle="$(find "$WORKDIR" -maxdepth 1 \( -name '*.deb' -o -name '*.AppImage' \) | head -n1)"
+  [ -n "$bundle" ] || die "download succeeded but no .deb/.AppImage found in $WORKDIR"
+  tarball="$WORKDIR/$CLI_PATTERN"
+  [ -f "$tarball" ] || die "download succeeded but CLI tarball not found in $WORKDIR"
+
+  # --- install the desktop app ---
+  if [ "$kind" = "deb" ]; then
+    log "installing $(basename "$bundle") (apt, needs sudo)"
+    if command -v sudo >/dev/null 2>&1; then
+      # apt-get resolves the runtime deps (webkit2gtk, libayatana-appindicator,
+      # alsa) from the package's control file; dpkg -i + apt-get -f is the
+      # fallback if the direct-file install form isn't supported.
+      sudo apt-get install -y "$bundle" \
+        || { sudo dpkg -i "$bundle" || true; sudo apt-get -f install -y; }
+    else
+      warn "sudo not found — install the .deb manually: apt-get install -y '$bundle'"
+    fi
+  else
+    local appdir="$HOME/.local/bin"
+    mkdir -p "$appdir"
+    install -m 0755 "$bundle" "$appdir/vzt-flow.AppImage"
+    log "installed AppImage to $appdir/vzt-flow.AppImage"
+    warn "AppImage needs FUSE at runtime (apt: libfuse2) and the tray needs libayatana-appindicator3 — see docs/USAGE-Linux.md."
+  fi
+
+  # --- install the flow CLI ---
+  log "extracting CLI tarball"
+  tar -xzf "$tarball" -C "$WORKDIR"
+  local cli_src
+  cli_src="$(find "$WORKDIR" -maxdepth 1 -type d -name 'vzt-flow-cli-*' | head -n1)"
+  [ -n "$cli_src" ] || die "CLI tarball did not contain the expected vzt-flow-cli-* directory"
+
+  local cli_dest="/usr/local/bin"
+  if [ ! -w "$cli_dest" ] 2>/dev/null; then
+    cli_dest="$HOME/.local/bin"
+    mkdir -p "$cli_dest"
+  fi
+  log "installing flow CLI to $cli_dest"
+  install -m 0755 "$cli_src/bin/flow" "$cli_dest/flow"
+  if [[ ":$PATH:" != *":$cli_dest:"* ]]; then
+    warn "$cli_dest is not on your PATH — add this to your shell profile:"
+    warn "  export PATH=\"$cli_dest:\$PATH\""
+  fi
+
+  # --- install the MCP server (same layout as the macOS path) ---
+  local mcp_dest="$HOME/.vzt-flow/mcp"
+  log "installing MCP server to $mcp_dest"
+  mkdir -p "$HOME/.vzt-flow"
+  rm -rf "$mcp_dest"
+  cp -R "$cli_src/mcp/dist" "$mcp_dest"
+  [ -d "$cli_src/mcp/node_modules" ] && cp -R "$cli_src/mcp/node_modules" "$mcp_dest/node_modules"
+  [ -f "$cli_src/mcp/package.json" ] && cp "$cli_src/mcp/package.json" "$mcp_dest/package.json"
+  cp "$cli_src/mcp/README-snippet.md" "$HOME/.vzt-flow/mcp-README.md" 2>/dev/null || true
+
+  local mcp_entry="$mcp_dest/index.js"
+  if [ -f "$mcp_entry" ] && command -v claude >/dev/null 2>&1; then
+    log "registering vzt-flow with claude mcp"
+    claude mcp remove vzt-flow --scope user >/dev/null 2>&1 || true
+    claude mcp add vzt-flow --scope user -- node "$mcp_entry" \
+      || warn "failed to register MCP server via 'claude mcp add' — retry:\n  claude mcp add vzt-flow --scope user -- node \"$mcp_entry\""
+  else
+    [ -f "$mcp_entry" ] || warn "MCP entry file not found at $mcp_entry — skipping claude mcp registration"
+    command -v claude >/dev/null 2>&1 || log "claude CLI not found — skipping MCP registration (install later with: claude mcp add vzt-flow --scope user -- node \"$mcp_entry\")"
+  fi
+
+  cat <<'EOF'
+
+VZT Flow is installed (Linux — built/tested in CI, not yet validated on real
+Linux hardware; see docs/USAGE-Linux.md).
+
+Runtime notes (full X11-vs-Wayland support matrix in docs/USAGE-Linux.md):
+  - Hold-to-talk hotkey (Ctrl+Shift+Space) works on X11. On Wayland it only
+    fires while an XWayland-backed window is focused — the tray's Start/Stop
+    item works on both.
+  - The tray icon needs libayatana-appindicator3 installed
+    (apt: libayatana-appindicator3-1).
+  - Paste: on Wayland the transcript is left on the clipboard and you press
+    Ctrl+V (synthetic paste can't reach native Wayland apps). On X11 it pastes
+    automatically.
+  - Grant microphone access; there is no accessibility grant to make on Linux.
+  - Meeting mode is not yet available on Linux (needs a PipeWire capture
+    backend — on the roadmap).
+
+CLI:  flow --help    (run 'flow doctor' first)
+MCP:  claude mcp list   (should show "vzt-flow")
+EOF
+}
+
+# Dispatch the Linux path here; the macOS dmg/hdiutil code below is never
+# reached on Linux.
+if [ "$OS_KIND" = "Linux" ]; then
+  install_linux
+  exit 0
+fi
 
 # --- download release assets ----------------------------------------------
 

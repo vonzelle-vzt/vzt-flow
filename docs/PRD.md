@@ -58,7 +58,7 @@ extended (a concurrent workstream may be mid-merge)
 | Meeting transcription + summary | ✅ | `flow meeting` — dual-stream capture (ScreenCaptureKit for system/participant audio + mic), both transcribed by the same local Parakeet engine, speaker-labelled Markdown transcript with an echo filter (Jaccard similarity > 0.7 on time-overlapping lines) to dedupe your own mic picking up speaker audio. On stop, local Qwen3 appends a summary + action items. `meeting_transcript` MCP tool exposes transcripts to Claude Code. macOS-only (ScreenCaptureKit is a macOS 13+ framework). |
 | Meeting auto-detect | ✅ | Shipped `308b899`. Background detector (`crates/flow-core/src/meeting/detect.rs`) combines a frontmost-app rule table (Zoom/Meet/Teams, localized-dash-tolerant) with mic-live signal (CoreAudio `kAudioDevicePropertyDeviceIsRunningSomewhere`) via a debounced state machine (2 polls to start, 3 absent polls to end; mute never ends a meeting) — 100% local, titles-only, no screenshots/OCR. Tray **Meeting auto-detect ▸ Ask/Auto/Off** submenu, persisted as `meeting_auto` in `config.toml`. "Ask" prompts via a system notification; "Auto" starts `flow meeting` immediately. |
 | Long-audio chunking | ✅ | Shipped `4757636`. `transcribe-rs`'s bundled Parakeet engine has **no internal audio chunking** (`supports_streaming: false`) and quadratic memory growth (see Non-functional/memory below) — recordings longer than ~35s are transparently split into ~30s silence-cut chunks (`crates/flow-core/src/chunking.rs`) and transcribed sequentially, bounding peak memory to a single chunk regardless of total length. Measured on a real ~7min (438s) clip: **~32.5s wall time, RTF 0.074, ~8.9GB peak RSS**. |
-| Cross-platform builds | ✅ macOS · 🚧 Windows | CI (`build.yml`/`release.yml`) builds macOS Apple Silicon (`aarch64-apple-darwin`, primary/tested) and Intel (`x86_64-apple-darwin`, CI-built, never run on real Intel hardware — effective OS floor is macOS 13.3, not the 12.0 `tauri.conf.json` advertises). Windows x64 (`x86_64-pc-windows-msvc`) is CI-built and experimental (never run on real hardware); Windows Arm (`aarch64-pc-windows-msvc`) is attempted as an allowed-to-fail job. |
+| Cross-platform builds | ✅ macOS · 🚧 Windows · 🚧 Linux | CI (`build.yml`/`release.yml`) builds macOS Apple Silicon (`aarch64-apple-darwin`, primary/tested) and Intel (`x86_64-apple-darwin`, CI-built, never run on real Intel hardware — effective OS floor is macOS 13.3, not the 12.0 `tauri.conf.json` advertises). Windows x64 (`x86_64-pc-windows-msvc`) is CI-built and experimental (never run on real hardware); Windows Arm (`aarch64-pc-windows-msvc`) is attempted as an allowed-to-fail job. Linux x64 (`x86_64-unknown-linux-gnu`) is CI-built + tested (`.deb` + `.AppImage`), never run on real Linux hardware: X11 is full (hotkey/paste/tray/overlay), Wayland is degraded (no global hotkey across native apps, clipboard-only paste) — see [docs/USAGE-Linux.md](USAGE-Linux.md). |
 
 ## Non-functional requirements
 
@@ -137,6 +137,16 @@ grants survive rebuilds (not yet done — see Out of scope below).
   **never been run on real Windows hardware** — hold/tap timing, permission
   prompts, and general stability are all "verified in code, untested in
   practice."
+- **Linux Wayland-native hotkey + meeting capture, and real-hardware
+  validation** — the Linux build (`x86_64-unknown-linux-gnu`) is CI-built and
+  tested but never run on real Linux hardware. On X11 it's full-featured; on
+  Wayland the global hotkey (needs the `org.freedesktop.portal.GlobalShortcuts`
+  XDG portal, which `global-hotkey` v0.8 doesn't implement) and cross-app
+  synthetic paste are degraded to XWayland-only / clipboard-only. Meeting mode
+  is unavailable on Linux entirely — it needs a **PipeWire** system-audio
+  capture backend (the macOS ScreenCaptureKit equivalent); the pure
+  transcript/dedup/chunker sub-modules already compile cross-platform, only the
+  capture source is missing. See [docs/USAGE-Linux.md](USAGE-Linux.md).
 - **Apple `SpeechAnalyzer` as an alternate ASR engine** — an on-device Apple
   framework alternative to Parakeet, not yet integrated.
 - **A "polish for Claude Code" cleanup mode** — tuned for dictating prompts

@@ -36,7 +36,10 @@ const CLIPBOARD_RESTORE_DELAY: Duration = Duration::from_millis(1000);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PasteOutcome {
-    /// Transcript was pasted into the frontmost app via simulated Cmd+V.
+    /// Transcript was pasted into the frontmost app via simulated Cmd+V —
+    /// either verified present in the focused field, or its value was
+    /// unreadable via Accessibility (most web/Electron/secure fields) so we
+    /// optimistically assume success. See [`verify_paste`].
     Pasted,
     /// A secure input field is focused (e.g. a password box); we left the
     /// transcript on the clipboard instead of risking a blocked/garbled
@@ -45,7 +48,31 @@ pub enum PasteOutcome {
     /// Accessibility permission hasn't been granted, so enigo cannot
     /// synthesize the Cmd+V keystroke; transcript is left on the clipboard.
     SkippedNoAccessibility,
+    /// Linux/Wayland: there is no reachable X server for enigo's XTEST paste
+    /// (no `DISPLAY`, only `WAYLAND_DISPLAY`), so a synthetic Ctrl+V can't
+    /// reach the focused Wayland client. The transcript is left on the
+    /// clipboard for the user to paste manually with Ctrl+V.
+    ClipboardOnly,
+    /// macOS: the Cmd+V was synthesized but post-paste Accessibility
+    /// verification could read the focused field and the transcript tail was
+    /// *not* present, even after one retry (Feature C). The transcript is
+    /// deliberately left on the clipboard (not restored) so the user can paste
+    /// it manually.
+    VerificationFailed,
 }
+
+/// How many trailing characters of the transcript to look for in the focused
+/// field when verifying a paste (Feature C). The tail — rather than the whole
+/// transcript — keeps the check robust to a field that already held text
+/// before the paste, and short enough to compare cheaply.
+const TAIL_MATCH_CHARS: usize = 20;
+
+/// How long to wait after a synthesized Cmd+V before reading the focused field
+/// to verify the paste landed. Worst case this is paid twice (initial check +
+/// one retry) = 300ms, kept well under the 400ms blocking budget the
+/// coordinator tolerates on the paste path.
+#[cfg(target_os = "macos")]
+const PASTE_VERIFY_DELAY: Duration = Duration::from_millis(150);
 
 /// Save the current clipboard, set it to `text`, optionally simulate
 /// Cmd+V, then restore the previous clipboard contents after a short delay.
@@ -74,42 +101,51 @@ pub fn paste_text(text: &str) -> Result<PasteOutcome> {
         PasteOutcome::SkippedSecureField
     } else if !accessibility_trusted() {
         PasteOutcome::SkippedNoAccessibility
+    } else if !can_synthesize_paste() {
+        PasteOutcome::ClipboardOnly
     } else {
         simulate_paste()?;
-        PasteOutcome::Pasted
+        // Feature C: confirm the paste actually landed (macOS AX read). On a
+        // possible failure this returns VerificationFailed after one retry;
+        // on every other platform this is a no-op that returns Pasted.
+        verify_paste(text)
     };
 
     // Restore the previous clipboard off the calling thread, but only if our
     // transcript is still sitting on it — otherwise the user copied something
-    // new during the paste delay and we must not clobber it (F6).
-    let transcript = text.to_string();
-    thread::spawn(move || {
-        thread::sleep(CLIPBOARD_RESTORE_DELAY);
-        let Ok(mut clipboard) = Clipboard::new() else {
-            return;
-        };
-        let current = clipboard.get_text().ok();
-        if !should_restore(current.as_deref(), &transcript) {
-            return; // user's fresh copy (or an image) — leave it be
-        }
-        match previous {
-            SavedClipboard::Text(prev) => {
-                let _ = clipboard.set_text(prev);
+    // new during the paste delay and we must not clobber it (F6). Skipped
+    // entirely for VerificationFailed: there we intentionally leave the
+    // transcript on the clipboard so the user can paste it by hand (Feature C).
+    if outcome != PasteOutcome::VerificationFailed {
+        let transcript = text.to_string();
+        thread::spawn(move || {
+            thread::sleep(CLIPBOARD_RESTORE_DELAY);
+            let Ok(mut clipboard) = Clipboard::new() else {
+                return;
+            };
+            let current = clipboard.get_text().ok();
+            if !should_restore(current.as_deref(), &transcript) {
+                return; // user's fresh copy (or an image) — leave it be
             }
-            SavedClipboard::Image(img) => {
-                let _ = clipboard.set_image(img);
+            match previous {
+                SavedClipboard::Text(prev) => {
+                    let _ = clipboard.set_text(prev);
+                }
+                SavedClipboard::Image(img) => {
+                    let _ = clipboard.set_image(img);
+                }
+                SavedClipboard::Unsupported => {
+                    // Couldn't capture the original (e.g. copied files);
+                    // leaving the transcript is the least-destructive option.
+                    // Log it so this is never silent.
+                    eprintln!(
+                        "[vzt-flow] previous clipboard contents were not text or image and \
+                         could not be restored; transcript left on clipboard"
+                    );
+                }
             }
-            SavedClipboard::Unsupported => {
-                // Couldn't capture the original (e.g. copied files); leaving
-                // the transcript is the least-destructive option. Log it so
-                // this is never silent.
-                eprintln!(
-                    "[vzt-flow] previous clipboard contents were not text or image and \
-                     could not be restored; transcript left on clipboard"
-                );
-            }
-        }
-    });
+        });
+    }
 
     Ok(outcome)
 }
@@ -123,6 +159,29 @@ fn paste_modifier() -> Key {
 #[cfg(not(target_os = "macos"))]
 fn paste_modifier() -> Key {
     Key::Control
+}
+
+/// Whether the platform can reliably synthesize the paste keystroke into the
+/// focused window. macOS and Windows always can here — their permission /
+/// secure-input caveats are handled by the checks in `paste_text` above.
+///
+/// On Linux, enigo's default backend drives X11 via the XTEST extension,
+/// which needs a reachable X server (`DISPLAY`). Under a pure-Wayland session
+/// with no XWayland (`DISPLAY` unset, only `WAYLAND_DISPLAY` present),
+/// `Enigo::new` can't connect and a synthetic Ctrl+V would reach nothing, so
+/// we report `false` and leave the transcript on the clipboard for a manual
+/// Ctrl+V instead. When `DISPLAY` *is* set (real X11, or XWayland) we attempt
+/// the paste; note that XTEST-into-Wayland injection is honored by some
+/// compositors (GNOME/Mutter, KDE) but not all (e.g. some wlroots-based ones)
+/// — the transcript is on the clipboard first either way, so the worst case
+/// is a manual paste. See docs/USAGE-Linux.md for the full support matrix.
+#[cfg(not(target_os = "linux"))]
+fn can_synthesize_paste() -> bool {
+    true
+}
+#[cfg(target_os = "linux")]
+fn can_synthesize_paste() -> bool {
+    std::env::var_os("DISPLAY").is_some()
 }
 
 /// Simulates the OS paste shortcut (Cmd+V / Ctrl+V) via enigo.
@@ -148,6 +207,134 @@ fn simulate_paste() -> Result<()> {
         .key(modifier, Direction::Release)
         .context("failed to release paste modifier")?;
     Ok(())
+}
+
+/// Whitespace-normalized tail of `text`: the last `n` characters after
+/// collapsing every run of whitespace to a single space and trimming the ends.
+/// The normalization makes the later `contains` check tolerant of a target
+/// field that soft-wraps or reflows newlines differently from the source.
+fn normalized_tail(text: &str, n: usize) -> String {
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let chars: Vec<char> = normalized.chars().collect();
+    let start = chars.len().saturating_sub(n);
+    chars[start..].iter().collect()
+}
+
+/// Whether the focused field's text `field_value` contains the transcript's
+/// (whitespace-normalized) [`TAIL_MATCH_CHARS`]-char tail — the evidence that
+/// the paste landed. Both sides are whitespace-normalized so wrapping/newline
+/// differences don't cause a false negative. An empty transcript has no tail
+/// to find and is treated as trivially present. Pure and unit-tested.
+fn tail_present(field_value: &str, transcript: &str) -> bool {
+    let tail = normalized_tail(transcript, TAIL_MATCH_CHARS);
+    if tail.is_empty() {
+        return true;
+    }
+    let field_norm = field_value.split_whitespace().collect::<Vec<_>>().join(" ");
+    field_norm.contains(&tail)
+}
+
+/// Reads the text value of the system-wide focused UI element via the
+/// Accessibility API (`kAXFocusedUIElement` → `kAXValue`). Returns `Some(text)`
+/// when the focused field exposes a readable string value, or `None` when it
+/// is unreadable — no focused element, a non-string value, an AX error, or a
+/// field that simply doesn't publish its content (most web/Electron views and
+/// secure fields). Callers treat `None` as "can't tell, assume success".
+#[cfg(target_os = "macos")]
+fn read_focused_text() -> Option<String> {
+    use core_foundation::base::{CFType, CFTypeRef, TCFType};
+    use core_foundation::string::CFString;
+    use std::os::raw::c_void;
+
+    // AXUIElementRef / CFTypeRef are opaque pointers. `AXUIElementCreateSystemWide`
+    // and the `Copy` accessor both follow the CoreFoundation Create/Copy rule
+    // (return +1), so each must be released exactly once. ApplicationServices is
+    // already linked (see `permissions.rs`).
+    #[link(name = "ApplicationServices", kind = "framework")]
+    extern "C" {
+        fn AXUIElementCreateSystemWide() -> *mut c_void;
+        fn AXUIElementCopyAttributeValue(
+            element: *mut c_void,
+            attribute: *const c_void, // CFStringRef
+            value: *mut *const c_void, // CFTypeRef*
+        ) -> i32; // AXError; 0 == kAXErrorSuccess
+        fn CFRelease(cf: *const c_void);
+    }
+
+    unsafe {
+        let system_wide = AXUIElementCreateSystemWide();
+        if system_wide.is_null() {
+            return None;
+        }
+
+        let focused_attr = CFString::new("AXFocusedUIElement");
+        let mut focused: *const c_void = std::ptr::null();
+        let err = AXUIElementCopyAttributeValue(
+            system_wide,
+            focused_attr.as_concrete_TypeRef() as *const c_void,
+            &mut focused,
+        );
+        CFRelease(system_wide as *const c_void);
+        if err != 0 || focused.is_null() {
+            return None;
+        }
+
+        let value_attr = CFString::new("AXValue");
+        let mut value: *const c_void = std::ptr::null();
+        let err = AXUIElementCopyAttributeValue(
+            focused as *mut c_void,
+            value_attr.as_concrete_TypeRef() as *const c_void,
+            &mut value,
+        );
+        CFRelease(focused);
+        if err != 0 || value.is_null() {
+            return None;
+        }
+
+        // Take ownership of the +1 value and interpret it as a string; a
+        // non-string AX value (number, bool, element) downcasts to None and is
+        // released when the wrapping CFType drops.
+        let cf = CFType::wrap_under_create_rule(value as CFTypeRef);
+        cf.downcast_into::<CFString>().map(|s| s.to_string())
+    }
+}
+
+/// Post-paste verification (Feature C). After the synthesized Cmd+V, wait
+/// briefly then read the focused field via Accessibility:
+///   - unreadable value → assume success (today's behavior for web/Electron/
+///     secure fields);
+///   - tail present → success;
+///   - tail absent → retry the paste once and re-check; still absent →
+///     [`PasteOutcome::VerificationFailed`].
+///
+/// Bounded to two [`PASTE_VERIFY_DELAY`] waits (≤300ms) so the caller never
+/// blocks past its ~400ms budget.
+#[cfg(target_os = "macos")]
+fn verify_paste(text: &str) -> PasteOutcome {
+    thread::sleep(PASTE_VERIFY_DELAY);
+    match read_focused_text() {
+        None => PasteOutcome::Pasted, // unreadable: can't tell, assume it worked
+        Some(v) if tail_present(&v, text) => PasteOutcome::Pasted,
+        Some(_) => {
+            // Readable and the tail isn't there — the paste likely didn't land
+            // (focus moved, app swallowed the keystroke). Retry once.
+            if simulate_paste().is_err() {
+                return PasteOutcome::VerificationFailed;
+            }
+            thread::sleep(PASTE_VERIFY_DELAY);
+            match read_focused_text() {
+                Some(v) if tail_present(&v, text) => PasteOutcome::Pasted,
+                _ => PasteOutcome::VerificationFailed,
+            }
+        }
+    }
+}
+
+/// Non-macOS: no Accessibility verification available; the synthesized paste
+/// is assumed to have landed exactly as before this feature existed.
+#[cfg(not(target_os = "macos"))]
+fn verify_paste(_text: &str) -> PasteOutcome {
+    PasteOutcome::Pasted
 }
 
 /// Exercises the clipboard save/set/[maybe paste]/restore path end-to-end
@@ -181,6 +368,12 @@ pub fn run_paste_test(text: &str) -> Result<()> {
         }
         PasteOutcome::SkippedNoAccessibility => {
             println!("Skipped paste: Accessibility permission not granted. Transcript is on the clipboard — paste manually, or grant Accessibility and retry.")
+        }
+        PasteOutcome::ClipboardOnly => {
+            println!("Skipped paste: no X server reachable (Wayland session without XWayland). Transcript is on the clipboard — paste manually with Ctrl+V.")
+        }
+        PasteOutcome::VerificationFailed => {
+            println!("Paste may have failed: the focused field was readable via Accessibility but the transcript tail wasn't there after a retry. Transcript is on the clipboard — paste manually.")
         }
     }
 
@@ -218,6 +411,57 @@ mod tests {
         // Empty transcript edge: still only matches an exactly-empty clipboard.
         assert!(should_restore(Some(""), ""));
         assert!(!should_restore(None, ""));
+    }
+
+    // ---- Feature C: paste-verification tail matching ----
+
+    #[test]
+    fn tail_present_finds_the_transcript_tail_in_a_longer_field() {
+        // Field already had prior text; the pasted transcript's tail appears
+        // at the end. Verification should pass.
+        let transcript = "the quick brown fox jumps over the lazy dog";
+        let field = "some earlier note the quick brown fox jumps over the lazy dog";
+        assert!(tail_present(field, transcript));
+    }
+
+    #[test]
+    fn tail_absent_when_field_lacks_the_transcript() {
+        let transcript = "the quick brown fox jumps over the lazy dog";
+        let field = "completely unrelated field contents that never got the paste";
+        assert!(!tail_present(field, transcript));
+    }
+
+    #[test]
+    fn tail_match_is_whitespace_normalized() {
+        // Field reflowed the transcript across a newline and doubled a space;
+        // normalization must still find the tail.
+        let transcript = "please schedule the meeting for tomorrow";
+        let field = "please schedule the\nmeeting  for tomorrow";
+        assert!(tail_present(field, transcript));
+    }
+
+    #[test]
+    fn tail_shorter_than_match_window_matches_whole_transcript() {
+        // Transcript shorter than TAIL_MATCH_CHARS: the tail is the whole
+        // (normalized) string.
+        let transcript = "hi there";
+        assert!(tail_present("well hi there", transcript));
+        assert!(!tail_present("goodbye", transcript));
+    }
+
+    #[test]
+    fn empty_transcript_is_trivially_present() {
+        // Nothing to verify — never report a spurious failure.
+        assert!(tail_present("anything at all", ""));
+        assert!(tail_present("", ""));
+    }
+
+    #[test]
+    fn normalized_tail_takes_last_n_chars_after_collapsing_whitespace() {
+        assert_eq!(normalized_tail("a  b\tc\nd", 3), "c d");
+        assert_eq!(normalized_tail("abcdef", 3), "def");
+        assert_eq!(normalized_tail("ab", 5), "ab");
+        assert_eq!(normalized_tail("   ", 5), "");
     }
 
     /// Exercises the clipboard save/set/restore mechanics without invoking

@@ -17,6 +17,7 @@ use flow_core::model_manager::{ModelCommand, ModelStatusEvent};
 use flow_core::profiles::ProfileRule;
 use flow_core::{codemode, dictionary, history, insert, permissions, snippets};
 use tauri::{AppHandle, Manager};
+use tauri_plugin_notification::NotificationExt;
 
 use crate::overlay::{self, OverlayEvent};
 use crate::state::{AppState, DictationState, ModelLifecycle};
@@ -108,22 +109,41 @@ fn spawn_hotkey_monitor(
     active
 }
 
-/// Windows hold-to-talk binding: Ctrl+Shift+Space via
+/// Windows and Linux (X11) hold-to-talk binding: Ctrl+Shift+Space via
 /// `tauri-plugin-global-shortcut` (registered here at runtime; the plugin
-/// itself is added to the Tauri builder in `lib.rs`, Windows-only). Not
-/// Right Option/Alt like macOS's default — the plugin does not support
-/// modifier-only shortcuts on Windows (verified against the plugin's docs
-/// before writing this, per the same standard `hotkey.rs` documents for its
-/// own macOS-vs-plugin decision), so a normal key combo is used instead.
+/// itself is added to the Tauri builder in `lib.rs` for both platforms).
 ///
-/// Escape-to-cancel is not wired up on Windows yet: unlike the macOS tap
-/// (which is `ListenOnly` and never consumes Escape for other apps), a
-/// globally *registered* Escape shortcut would swallow Escape everywhere,
-/// which is unacceptable UX. `flow cancel` isn't available either, since the
-/// daemon control socket is Unix-only for now (see `flow_core::ipc`). The
-/// tray's "Start/Stop dictation" item remains the way to end a recording
-/// early on this platform. Documented as a known gap in the README.
-#[cfg(target_os = "windows")]
+/// Not Right Option/Alt like macOS's default — the plugin does not support
+/// modifier-only shortcuts on Windows, and its X11 backend
+/// (`global-hotkey` 0.8) grabs a specific keycode + modifier mask via
+/// `XGrabKey`, so a bare modifier can't be a binding there either. A normal
+/// key combo is therefore used on both platforms. The plugin *does* deliver
+/// clean press/release transitions the hold logic needs:
+///   - Windows: `RegisterHotKey` → `WM_HOTKEY` press + a synthetic release.
+///   - X11: `global-hotkey` enables xkb `DETECTABLE_AUTO_REPEAT` and latches
+///     a `pressed` flag, so a held key yields exactly one `Pressed` on press
+///     and one `Released` on physical release (no auto-repeat chatter).
+///     Verified against `tauri-apps/global-hotkey` v0.8.0
+///     (`src/platform_impl/x11/mod.rs`) before writing this.
+///
+/// Wayland caveat: `global-hotkey`'s only Linux backend is X11. Under a
+/// Wayland session it connects to the X server exposed by XWayland (via
+/// `DISPLAY`), so the grab only fires while an X11/XWayland-backed window is
+/// focused, not globally across native Wayland apps; if no X server is
+/// reachable at all, `on_shortcut` returns `Err` and this returns `false`
+/// (tray toggle still works). `global-hotkey` does not implement the
+/// `org.freedesktop.portal.GlobalShortcuts` XDG portal as of v0.8.0, so a
+/// portal-based Wayland-native global hotkey is out of scope this pass and
+/// documented in docs/USAGE-Linux.md.
+///
+/// Escape-to-cancel is not wired up here: unlike the macOS tap (which is
+/// `ListenOnly` and never consumes Escape for other apps), a globally
+/// *registered* Escape shortcut would swallow Escape everywhere, which is
+/// unacceptable UX. On Linux the Unix daemon socket is available, so
+/// `flow cancel` ends a recording early; on Windows the socket is Unix-only
+/// (see `flow_core::ipc`), leaving the tray's "Start/Stop dictation" item as
+/// the early-stop path. Documented as a known gap in the README.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 fn spawn_hotkey_monitor(
     app: &AppHandle,
     _keycode: u16,
@@ -145,6 +165,7 @@ fn spawn_hotkey_monitor(
         Err(e) => {
             eprintln!(
                 "[vzt-flow] failed to register global hotkey Ctrl+Shift+Space: {e}. \
+                 On Wayland this is expected when no X server (XWayland) is reachable. \
                  The tray's manual Start/Stop item still works."
             );
             false
@@ -152,7 +173,7 @@ fn spawn_hotkey_monitor(
     }
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 fn spawn_hotkey_monitor(
     _app: &AppHandle,
     _keycode: u16,
@@ -282,6 +303,67 @@ struct HoldTracker {
     key_down: Arc<AtomicBool>,
     generation: Arc<AtomicU64>,
     consumed: Arc<AtomicBool>,
+    /// Accidental-press guard (Feature A): set when a keyDown of some other
+    /// key arrived while the hold key was physically down. On the default
+    /// Right Option binding that means the user is typing a special character
+    /// (Option+e = ´ …), not push-to-talking — so this hold must never start
+    /// or arm a recording, and any false start already under way is discarded.
+    /// Reset on each fresh press. Distinct from `consumed` because it also
+    /// forces the *release* to a no-op even if a recording is still mid-cancel
+    /// — `consumed` alone leaves a release-while-Recording resolving to
+    /// stop-and-transcribe, which would salvage the very audio the guard means
+    /// to throw away.
+    other_key: Arc<AtomicBool>,
+}
+
+/// Action a hold-key *release* resolves to. Pure so the tap-vs-hold decision
+/// is unit-testable without a live `AppHandle`; the `HoldKeyReleased` handler
+/// drives the side effects for each variant.
+#[derive(Debug, PartialEq, Eq)]
+enum ReleaseAction {
+    /// End the recording under way — a hold-to-talk release, or a hands-free
+    /// tap-off.
+    StopAndTranscribe,
+    /// Arm a hands-free (tap-to-toggle) recording — a genuine short tap.
+    ArmHandsFree,
+    /// Do nothing: the press was already resolved (cancel/cap/accidental
+    /// guard) or we're mid-transcription/paste.
+    Noop,
+}
+
+/// Decides what a hold-key release does, from the mode flag, the current
+/// dictation state, whether the press was already `consumed`, and whether the
+/// accidental-press guard fired (`other_key`).
+fn decide_release(
+    hands_free: bool,
+    state: DictationState,
+    was_consumed: bool,
+    other_key: bool,
+) -> ReleaseAction {
+    if other_key {
+        // Accidental-press guard fired mid-hold (Feature A): any recording is
+        // being discarded and the hold must resolve to nothing, whether or not
+        // the discard has flipped the state back to Idle yet.
+        return ReleaseAction::Noop;
+    }
+    if hands_free {
+        ReleaseAction::StopAndTranscribe
+    } else if state == DictationState::Recording {
+        ReleaseAction::StopAndTranscribe
+    } else if state == DictationState::Idle && !was_consumed {
+        ReleaseAction::ArmHandsFree
+    } else {
+        ReleaseAction::Noop
+    }
+}
+
+/// Whether the delayed hold-threshold timer should actually begin recording —
+/// a pure mirror of the guards the spawned timer applies: still the same
+/// press, key still physically down, and the press not already consumed (by an
+/// Escape-cancel, a cap, or the accidental-press guard, which all set
+/// `consumed`).
+fn should_start_after_hold(same_press: bool, still_down: bool, consumed: bool) -> bool {
+    same_press && still_down && !consumed
 }
 
 fn run_coordinator(
@@ -294,6 +376,7 @@ fn run_coordinator(
         key_down: Arc::new(AtomicBool::new(false)),
         generation: Arc::new(AtomicU64::new(0)),
         consumed: Arc::new(AtomicBool::new(false)),
+        other_key: Arc::new(AtomicBool::new(false)),
     };
     while let Ok(msg) = rx.recv() {
         let state = app.state::<AppState>();
@@ -301,8 +384,10 @@ fn run_coordinator(
             CoordinatorMsg::Hotkey(HotkeyEvent::HoldKeyPressed) => {
                 hold.key_down.store(true, Ordering::Relaxed);
                 let gen = hold.generation.fetch_add(1, Ordering::Relaxed) + 1;
-                // Fresh press: nothing resolved yet.
+                // Fresh press: nothing resolved yet, and no accidental-press
+                // (Feature A) guard has fired for it.
                 hold.consumed.store(false, Ordering::Relaxed);
+                hold.other_key.store(false, Ordering::Relaxed);
 
                 let hands_free = state.hands_free_active.load(Ordering::Relaxed);
                 if hands_free {
@@ -329,10 +414,10 @@ fn run_coordinator(
                 };
                 std::thread::spawn(move || {
                     std::thread::sleep(threshold);
-                    let still_same_press = generation.load(Ordering::Relaxed) == gen;
+                    let same_press = generation.load(Ordering::Relaxed) == gen;
                     let still_down = key_down.load(Ordering::Relaxed);
-                    let not_consumed = !consumed.load(Ordering::Relaxed);
-                    if still_same_press && still_down && not_consumed {
+                    let consumed = consumed.load(Ordering::Relaxed);
+                    if should_start_after_hold(same_press, still_down, consumed) {
                         let state = app2.state::<AppState>();
                         if *state.dictation_state.lock().unwrap() == DictationState::Idle {
                             start_recording(&app2, max_hold_secs);
@@ -345,30 +430,48 @@ fn run_coordinator(
                 // This release resolves the current press no matter what;
                 // mark it consumed so any later re-entry can't reuse it.
                 let was_consumed = hold.consumed.swap(true, Ordering::Relaxed);
+                let other_key = hold.other_key.load(Ordering::Relaxed);
                 let hands_free = state.hands_free_active.load(Ordering::Relaxed);
                 let current = *state.dictation_state.lock().unwrap();
 
-                if hands_free {
-                    // Tap while hands-free was live: toggle it off.
-                    state.hands_free_active.store(false, Ordering::Relaxed);
-                    stop_and_transcribe(&audio_cmd_tx);
-                } else if current == DictationState::Recording {
-                    // Hold threshold had already fired and recording is
-                    // under way: this release ends it.
-                    stop_and_transcribe(&audio_cmd_tx);
-                } else if current == DictationState::Idle && !was_consumed {
-                    // Genuine short tap (Idle, released before the hold
-                    // threshold, and not already resolved by an Escape-cancel
-                    // or an early cap): toggle hands-free recording on.
-                    //
-                    // The `!was_consumed` guard is the fix for F4 — without it
-                    // an Idle reached via Escape-cancel or a cap-that-outlived
-                    // its transcription would be misread as a tap and silently
-                    // start a surprise hands-free recording.
-                    state.hands_free_active.store(true, Ordering::Relaxed);
-                    start_recording(&app, max_handsfree_secs(&app));
+                // The `!was_consumed` guard (F4) stops an Idle reached via
+                // Escape-cancel / cap from being misread as a fresh tap that
+                // silently arms hands-free; the `other_key` guard (Feature A)
+                // additionally forces a no-op even while a discarded recording
+                // is still mid-cancel. See [`decide_release`].
+                match decide_release(hands_free, current, was_consumed, other_key) {
+                    ReleaseAction::StopAndTranscribe => {
+                        state.hands_free_active.store(false, Ordering::Relaxed);
+                        stop_and_transcribe(&audio_cmd_tx);
+                    }
+                    ReleaseAction::ArmHandsFree => {
+                        state.hands_free_active.store(true, Ordering::Relaxed);
+                        start_recording(&app, max_handsfree_secs(&app));
+                    }
+                    ReleaseAction::Noop => {}
                 }
-                // else: consumed, or mid-transcription/paste — no-op.
+            }
+            CoordinatorMsg::Hotkey(HotkeyEvent::OtherKeyDuringHold) => {
+                // Accidental-press guard (Feature A). A keyDown of some other
+                // key arrived while the hold key was down — with the default
+                // Right Option binding that is the macOS special-character
+                // modifier at work (Option+e = ´ …), so this is the user
+                // typing, not push-to-talking. Only act while a hold is
+                // genuinely in flight; a late/stale event after release must
+                // not disturb a subsequent press.
+                if hold.key_down.load(Ordering::Relaxed) {
+                    hold.other_key.store(true, Ordering::Relaxed);
+                    // Mark consumed so the delayed hold-check won't start a
+                    // recording and the release won't arm hands-free.
+                    hold.consumed.store(true, Ordering::Relaxed);
+                    if *state.dictation_state.lock().unwrap() == DictationState::Recording {
+                        // A false start already began (hold outlived the
+                        // threshold before the special char was typed):
+                        // discard it — the user is typing, not dictating.
+                        state.hands_free_active.store(false, Ordering::Relaxed);
+                        let _ = audio_cmd_tx.send(AudioCommand::Cancel);
+                    }
+                }
             }
             CoordinatorMsg::Hotkey(HotkeyEvent::CancelRequested) => {
                 if *state.dictation_state.lock().unwrap() == DictationState::Recording {
@@ -782,6 +885,22 @@ fn finalize_dictation(
             Ok(insert::PasteOutcome::SkippedNoAccessibility) => {
                 Some("No Accessibility permission — transcript on clipboard".to_string())
             }
+            Ok(insert::PasteOutcome::ClipboardOnly) => {
+                // Linux/Wayland: no X server for the synthetic Ctrl+V. The
+                // overlay pill is brief, so also fire a desktop notification
+                // making the "paste manually" instruction discoverable.
+                notify_clipboard_only(app);
+                Some("Transcript on clipboard — press Ctrl+V".to_string())
+            }
+            Ok(insert::PasteOutcome::VerificationFailed) => {
+                // Feature C: Cmd+V was sent but Accessibility verification found
+                // the transcript wasn't in the focused field even after a
+                // retry. The transcript is left on the clipboard (not
+                // restored); surface that plus a notification since the overlay
+                // pill is brief.
+                notify_paste_maybe_failed(app);
+                Some("Paste may have failed — transcript on clipboard".to_string())
+            }
             Err(e) => Some(format!("Paste failed: {e}")),
         }
     };
@@ -815,6 +934,38 @@ fn finalize_dictation(
     });
 }
 
+/// Best-effort desktop notification for the Linux/Wayland clipboard-only
+/// paste path (see `insert::PasteOutcome::ClipboardOnly`). Failures (e.g. the
+/// Notifications permission not granted) are swallowed — the transcript is
+/// already on the clipboard and the overlay pill also shows the hint.
+fn notify_clipboard_only(app: &AppHandle) {
+    if let Err(e) = app
+        .notification()
+        .builder()
+        .title("VZT Flow")
+        .body("Transcript copied to clipboard — press Ctrl+V to paste (Wayland can't auto-paste).")
+        .show()
+    {
+        eprintln!("[vzt-flow] clipboard-only notification failed: {e}");
+    }
+}
+
+/// Best-effort desktop notification for the Feature C paste-verification
+/// failure path (see `insert::PasteOutcome::VerificationFailed`). Failures are
+/// swallowed — the transcript is already on the clipboard and the overlay pill
+/// also shows the hint.
+fn notify_paste_maybe_failed(app: &AppHandle) {
+    if let Err(e) = app
+        .notification()
+        .builder()
+        .title("VZT Flow")
+        .body("Paste may have failed — transcript is on the clipboard, paste it manually.")
+        .show()
+    {
+        eprintln!("[vzt-flow] paste-verification notification failed: {e}");
+    }
+}
+
 /// Cycles the overlay through recording -> transcribing -> done -> hidden,
 /// with fake level values, entirely for visual QA via the "Test overlay"
 /// tray item — no microphone or transcriber involved.
@@ -841,4 +992,84 @@ fn run_overlay_self_test(app: &AppHandle) {
         std::thread::sleep(Duration::from_millis(900));
         overlay::hide_overlay(&app2);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- Feature A: accidental-press guard state transitions ----
+
+    #[test]
+    fn release_arms_hands_free_only_on_a_genuine_unconsumed_tap() {
+        // Idle, not hands-free, not consumed, no other key: a real short tap.
+        assert_eq!(
+            decide_release(false, DictationState::Idle, false, false),
+            ReleaseAction::ArmHandsFree
+        );
+    }
+
+    #[test]
+    fn release_stops_a_hold_to_talk_recording() {
+        // Hold outlived the threshold; releasing ends the recording.
+        assert_eq!(
+            decide_release(false, DictationState::Recording, false, false),
+            ReleaseAction::StopAndTranscribe
+        );
+    }
+
+    #[test]
+    fn release_toggles_hands_free_off() {
+        // A tap while hands-free was live stops it, regardless of state.
+        assert_eq!(
+            decide_release(true, DictationState::Recording, false, false),
+            ReleaseAction::StopAndTranscribe
+        );
+        assert_eq!(
+            decide_release(true, DictationState::Idle, false, false),
+            ReleaseAction::StopAndTranscribe
+        );
+    }
+
+    #[test]
+    fn consumed_release_is_a_noop_not_a_surprise_hands_free_start() {
+        // F4: an Idle reached via cancel/cap is consumed — must not arm.
+        assert_eq!(
+            decide_release(false, DictationState::Idle, true, false),
+            ReleaseAction::Noop
+        );
+    }
+
+    #[test]
+    fn accidental_press_guard_forces_noop_even_while_recording() {
+        // Feature A: the special-character case. Other-key fired mid-hold, so
+        // the release must be a no-op even if the discard hasn't flipped the
+        // state back to Idle yet — otherwise we'd stop-and-transcribe (salvage)
+        // audio the guard is deliberately throwing away.
+        assert_eq!(
+            decide_release(false, DictationState::Recording, false, true),
+            ReleaseAction::Noop
+        );
+        // And of course when it has already returned to Idle.
+        assert_eq!(
+            decide_release(false, DictationState::Idle, true, true),
+            ReleaseAction::Noop
+        );
+        // Even a hands-free flag can't override the guard.
+        assert_eq!(
+            decide_release(true, DictationState::Recording, false, true),
+            ReleaseAction::Noop
+        );
+    }
+
+    #[test]
+    fn hold_start_requires_same_press_still_down_and_unconsumed() {
+        assert!(should_start_after_hold(true, true, false));
+        // A different press generation (key was re-pressed): this timer is stale.
+        assert!(!should_start_after_hold(false, true, false));
+        // Key already released before the threshold (a tap): don't start.
+        assert!(!should_start_after_hold(true, false, false));
+        // Consumed (Escape-cancel, cap, or the accidental-press guard): don't start.
+        assert!(!should_start_after_hold(true, true, true));
+    }
 }

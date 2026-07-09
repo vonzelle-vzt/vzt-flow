@@ -197,7 +197,19 @@ impl MeetingHandle {
 
 /// Off macOS there is no ScreenCaptureKit, so live capture is unavailable.
 /// The listing/MCP paths above still work everywhere.
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+pub fn run(
+    _title: Option<String>,
+    _out_dir: Option<PathBuf>,
+    _stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<PathBuf> {
+    anyhow::bail!(
+        "meeting mode is not yet available on Linux (needs a PipeWire system-audio \
+         capture backend — on the roadmap; macOS uses ScreenCaptureKit today)"
+    )
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub fn run(
     _title: Option<String>,
     _out_dir: Option<PathBuf>,

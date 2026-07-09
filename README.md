@@ -7,6 +7,7 @@
 [![License: MIT](https://img.shields.io/github/license/vonzelle-vzt/vzt-flow)](LICENSE)
 ![macOS](https://img.shields.io/badge/macOS-Apple%20Silicon%20%2B%20Intel-black?logo=apple)
 ![Windows](https://img.shields.io/badge/Windows-x64%20experimental-blue?logo=windows)
+![Linux](https://img.shields.io/badge/Linux-x64%20experimental%20(X11%20full%2C%20Wayland%20degraded)-orange?logo=linux)
 
 Hold a key, talk, and the transcript lands wherever your cursor is — no
 subscription, no word limits, and nothing but the model *downloads* ever
@@ -233,8 +234,8 @@ server with `claude mcp add` if the `claude` CLI is present.
 
 ### Manual: download from Releases
 
-Grab the `.dmg` (macOS) or `.msi`/`-setup.exe` (Windows) from the
-[Releases page](https://github.com/vonzelle-vzt/vzt-flow/releases).
+Grab the `.dmg` (macOS), `.msi`/`-setup.exe` (Windows), or `.deb`/`.AppImage`
+(Linux) from the [Releases page](https://github.com/vonzelle-vzt/vzt-flow/releases).
 
 ### Build from source
 
@@ -307,6 +308,28 @@ is attempted in CI as an allowed-to-fail job — see
 [docs/USAGE-Windows.md#hardware-requirements](docs/USAGE-Windows.md#hardware-requirements)
 for current status.
 
+### Linux (experimental)
+
+> [!WARNING]
+> Compiles and is CI-tested (`.deb` + `.AppImage` on `ubuntu-latest`), but
+> **has never been run on real Linux hardware**. On **X11** it behaves like
+> the Windows build (hold-to-talk, auto-paste, tray, overlay). On **Wayland**
+> it's degraded: no global hotkey across native apps, clipboard-only paste
+> (with a "press Ctrl+V" notification), best-effort overlay — Wayland denies
+> clients global input grabs and cross-app synthetic input by design. Use the
+> tray's Start/Stop item + clipboard on Wayland. Default hotkey is
+> **Ctrl+Shift+Space**.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/vonzelle-vzt/vzt-flow/main/scripts/install.sh | bash
+```
+
+The installer detects Linux and grabs the `.deb` (Debian/Ubuntu, via `apt`) or
+`.AppImage`. The tray needs `libayatana-appindicator3` installed; meeting mode
+is not yet available (needs a PipeWire capture backend — on the roadmap). Full
+X11-vs-Wayland support matrix, runtime deps (Ubuntu/Fedora), and build-from-
+source steps: [docs/USAGE-Linux.md](docs/USAGE-Linux.md).
+
 ## Hardware compat matrix
 
 | Platform | Status | Notes |
@@ -315,7 +338,7 @@ for current status.
 | macOS Intel (`x86_64-apple-darwin`) | Built in CI, CPU-only inference | Never run on real Intel hardware; effective floor is macOS **13.3**, not the 12.0 in `tauri.conf.json` — see [USAGE-macOS.md](docs/USAGE-macOS.md#hardware-requirements) |
 | Windows x64 (`x86_64-pc-windows-msvc`) | Built in CI, experimental | Never run on real Windows hardware; no daemon/profiles/cleanup LLM yet |
 | Windows Arm (`aarch64-pc-windows-msvc`) | Attempted in CI, allowed to fail | Status depends on upstream (`ort`, WebView2-on-Arm) support this week — check the latest `build` workflow run |
-| Linux | Not built, not attempted | No CI job targets it; `cfg(not(target_os = "macos"))` code paths exist but are only exercised by the Windows job |
+| Linux x64 (`x86_64-unknown-linux-gnu`) | Built + CI-tested, experimental | Never run on real Linux hardware. `.deb` + `.AppImage` in CI. **X11**: hotkey/paste/tray/overlay all work as designed. **Wayland**: degraded — no global hotkey across native apps, clipboard-only paste, best-effort overlay (Wayland denies clients global input grabs). No cleanup LLM / profiles / meeting mode (as Windows). See [USAGE-Linux.md](docs/USAGE-Linux.md) |
 
 None of the non-"tested" rows are claimed to work beyond "compiles and
 packages in CI" — see each platform's usage doc for what's actually been

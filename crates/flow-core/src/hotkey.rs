@@ -36,6 +36,17 @@ pub enum HotkeyEvent {
     HoldKeyReleased,
     /// Escape was pressed while `is_recording` was true.
     CancelRequested,
+    /// Some *other* key produced a keyDown while the hold-to-talk key was
+    /// physically held down. On macOS the default binding (Right Option) is
+    /// the special-character modifier — Option+e = ´, Option+u = ¨, etc. —
+    /// so a keyDown arriving mid-hold means the user is typing a special
+    /// character, not push-to-talking. The coordinator treats this as an
+    /// accidental-press guard: it cancels any recording the hold had already
+    /// started (a false start) and suppresses the tap-to-toggle that a bare
+    /// short hold would otherwise arm. The tap is `ListenOnly`, so the typed
+    /// character itself is never swallowed — it reaches the frontmost app
+    /// unmodified.
+    OtherKeyDuringHold,
 }
 
 /// Shared flag the recording coordinator flips so the tap knows whether
@@ -204,7 +215,26 @@ pub fn spawn_monitor(
                             let physical_key = event
                                 .get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE)
                                 as u16;
-                            if physical_key == ESCAPE_KEYCODE
+                            let this_keycode = keycode_for_thread.load(Ordering::Relaxed);
+                            // Accidental-press guard (see
+                            // `HotkeyEvent::OtherKeyDuringHold`): the hold key
+                            // is physically down and a *different* key just
+                            // produced a keyDown. With the default Right Option
+                            // binding that is the macOS special-character
+                            // modifier at work, so this hold is really the user
+                            // typing a special char — report it so the
+                            // coordinator discards any false start and never
+                            // arms hands-free. The `!= this_keycode` guard keeps
+                            // a (hypothetical) non-modifier binding's own
+                            // auto-repeat keyDowns from self-triggering. This
+                            // takes precedence over the Escape path below: both
+                            // cancel a live recording, and reporting the guard
+                            // also suppresses a not-yet-recording false start.
+                            if hold_was_down.load(Ordering::Relaxed)
+                                && physical_key != this_keycode
+                            {
+                                let _ = tx.send(HotkeyEvent::OtherKeyDuringHold);
+                            } else if physical_key == ESCAPE_KEYCODE
                                 && is_recording.load(Ordering::Relaxed)
                             {
                                 let _ = tx.send(HotkeyEvent::CancelRequested);

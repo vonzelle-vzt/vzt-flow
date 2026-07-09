@@ -24,10 +24,11 @@ pub fn run() {
             None,
         ));
 
-    // Windows hold-to-talk hotkey uses this plugin (see coordinator.rs's
-    // `spawn_hotkey_monitor`); macOS uses flow-core's CGEventTap instead and
-    // never registers it, so it's only added to the builder here.
-    #[cfg(target_os = "windows")]
+    // Windows and Linux (X11) hold-to-talk hotkey uses this plugin (see
+    // coordinator.rs's `spawn_hotkey_monitor`); macOS uses flow-core's
+    // CGEventTap instead and never registers it, so it's only added to the
+    // builder for those two platforms.
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     {
         builder = builder.plugin(tauri_plugin_global_shortcut::Builder::new().build());
     }

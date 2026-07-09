@@ -33,3 +33,10 @@ core-foundation = "0.10"
 # Windows hold-to-talk hotkey (see coordinator.rs's `spawn_hotkey_monitor`);
 # macOS uses flow-core's CGEventTap instead and never needs this plugin.
 tauri-plugin-global-shortcut = "2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Linux (X11) hold-to-talk hotkey — same tauri-plugin-global-shortcut path as
+# Windows. global-hotkey 0.8's X11 backend delivers clean Pressed/Released
+# transitions (detectable auto-repeat + a pressed-latch); Wayland is degraded
+# to XWayland-only / tray-toggle. See coordinator.rs and docs/USAGE-Linux.md.
+tauri-plugin-global-shortcut = "2"

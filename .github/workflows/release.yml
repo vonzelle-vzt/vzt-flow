@@ -310,8 +310,103 @@ jobs:
           path: ci-artifacts/*
           if-no-files-found: error
 
+  # Linux x64 — see build.yml's `linux` job and docs/USAGE-Linux.md for the
+  # honest support matrix (built/tested in CI, never run on real Linux
+  # hardware; X11 full, Wayland degraded). Ships a .deb, an .AppImage, and a
+  # standalone CLI tarball (flow binary + MCP server) mirroring the macOS one.
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+          key: x86_64-unknown-linux-gnu
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install Linux system dependencies (Tauri/WebKitGTK, tray appindicator, ALSA, X11 paste)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libasound2-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libxdo-dev \
+            libssl-dev \
+            libgtk-3-dev
+      - name: Install frontend/MCP dependencies
+        run: |
+          npm ci --prefix apps/desktop
+          npm ci --prefix mcp
+          npm run build --prefix mcp
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^2" --locked
+
+      - name: tauri build (x64, .deb + .AppImage)
+        working-directory: apps/desktop
+        run: cargo tauri build --target x86_64-unknown-linux-gnu
+
+      - name: Build flow CLI (release)
+        run: cargo build --release --target x86_64-unknown-linux-gnu -p flow-cli
+
+      - name: Collect deb/AppImage artifacts
+        run: |
+          mkdir -p out
+          find target/x86_64-unknown-linux-gnu/release/bundle \
+            \( -name '*.deb' -o -name '*.AppImage' \) -exec cp {} out/ \;
+          echo "Linux bundle artifacts (name + size):"
+          ls -la out
+          if [ -z "$(ls -A out)" ]; then
+            echo "No .deb/.AppImage found — bundle tree:" >&2
+            find target -maxdepth 6 -name bundle -type d >&2 || true
+            exit 1
+          fi
+
+      - name: Prune MCP node_modules to production deps
+        working-directory: mcp
+        run: npm prune --omit=dev
+
+      - name: Package CLI tarball (flow binary + mcp/dist + mcp/node_modules)
+        run: |
+          STAGE=$(mktemp -d)/vzt-flow-cli-linux-x86_64
+          mkdir -p "$STAGE/bin" "$STAGE/mcp"
+          cp target/x86_64-unknown-linux-gnu/release/flow "$STAGE/bin/flow"
+          cp -R mcp/dist "$STAGE/mcp/dist"
+          cp -R mcp/node_modules "$STAGE/mcp/node_modules"
+          cp mcp/package.json "$STAGE/mcp/package.json"
+          cat > "$STAGE/mcp/README-snippet.md" <<'EOF'
+          # VZT Flow MCP server (Linux build)
+
+          Register with Claude Code:
+
+              claude mcp add vzt-flow --scope user -- node <path-to>/mcp/dist/index.js
+
+          The `flow` CLI must be on your PATH (or set VZT_FLOW_BIN) for the
+          MCP server's listen/transcribe tools to work. node_modules/ is
+          bundled alongside dist/ — dist/index.js needs it at runtime. See
+          docs/USAGE-Linux.md for the X11-vs-Wayland support matrix.
+          EOF
+          tar -C "$(dirname "$STAGE")" -czf out/vzt-flow-cli-linux-x86_64.tar.gz "$(basename "$STAGE")"
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vzt-flow-linux-x64-bundles
+          path: out/*
+          if-no-files-found: error
+
   release:
-    needs: [macos, macos-x64, windows, windows-arm64]
+    needs: [macos, macos-x64, windows, windows-arm64, linux]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -324,7 +419,8 @@ jobs:
       - name: Flatten artifacts
         run: |
           mkdir -p out
-          find dl -type f \( -name '*.dmg' -o -name '*.tar.gz' -o -name '*.msi' -o -name '*.exe' \) \
+          find dl -type f \( -name '*.dmg' -o -name '*.tar.gz' -o -name '*.msi' -o -name '*.exe' \
+            -o -name '*.deb' -o -name '*.AppImage' \) \
             -exec cp {} out/ \;
           ls -la out
 

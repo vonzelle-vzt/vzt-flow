@@ -190,6 +190,79 @@ jobs:
           path: ${{ steps.find_dmg.outputs.path }}
           if-no-files-found: error
 
+  # Linux x64. Built and tested in CI, but never run on real Linux hardware
+  # (the dev machine is macOS) — see the README hardware compat matrix and
+  # docs/USAGE-Linux.md for the honest X11-vs-Wayland support matrix. Produces
+  # a .deb and an .AppImage; the Tauri tray needs libayatana-appindicator at
+  # runtime, and the hold-to-talk hotkey uses tauri-plugin-global-shortcut's
+  # X11 backend (Wayland is degraded to XWayland-only / tray-toggle).
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+          key: x86_64-unknown-linux-gnu
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install Linux system dependencies (Tauri/WebKitGTK, tray appindicator, ALSA, X11 paste)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libasound2-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libxdo-dev \
+            libssl-dev \
+            libgtk-3-dev
+      - name: Install frontend/MCP dependencies
+        run: |
+          npm ci --prefix apps/desktop
+          npm ci --prefix mcp
+          npm run build --prefix mcp
+      - name: cargo test --release (workspace)
+        run: cargo test --release --workspace --target x86_64-unknown-linux-gnu
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^2" --locked
+
+      - name: tauri build (x64, .deb + .AppImage)
+        working-directory: apps/desktop
+        run: cargo tauri build --target x86_64-unknown-linux-gnu
+
+      - name: Locate deb/AppImage artifacts
+        id: find_installers
+        run: |
+          # Cargo workspace: the bundle lands under the workspace-root target/
+          # dir, not apps/desktop/src-tauri/target/, even though `tauri build`
+          # was invoked from apps/desktop.
+          mkdir -p ci-artifacts
+          find target/x86_64-unknown-linux-gnu/release/bundle \
+            \( -name '*.deb' -o -name '*.AppImage' \) -exec cp {} ci-artifacts/ \;
+          echo "Linux bundle artifacts (name + size):"
+          ls -la ci-artifacts
+          if [ -z "$(ls -A ci-artifacts)" ]; then
+            echo "No .deb/.AppImage found — bundle tree:" >&2
+            find target -maxdepth 6 -name bundle -type d >&2 || true
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vzt-flow-linux-x64-bundles
+          path: ci-artifacts/*
+          if-no-files-found: error
+
   windows:
     runs-on: windows-latest
     steps:
