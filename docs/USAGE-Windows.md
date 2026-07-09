@@ -41,8 +41,8 @@ Every push/PR to `main` uploads a Windows artifact named
 `vzt-flow-windows-x64-installers`, containing whatever `.msi`/`.exe`
 installers Tauri's `x86_64-pc-windows-msvc` bundle target produced — by
 Tauri's own `{productName}_{version}_{arch}[_{lang}]` naming convention,
-that's expected to be named `VZT Flow_0.1.0_x64_en-US.msi` (WiX/MSI
-installer) and/or `VZT Flow_0.1.0_x64-setup.exe` (NSIS installer).
+that's expected to be named `VZT Flow_0.2.0_x64_en-US.msi` (WiX/MSI
+installer) and/or `VZT Flow_0.2.0_x64-setup.exe` (NSIS installer).
 
 ```bash
 gh run list --workflow=build.yml --branch=main --status=success --limit 1
