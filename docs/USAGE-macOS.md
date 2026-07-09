@@ -253,7 +253,7 @@ VZT Flow needs three grants, all in **System Settings → Privacy & Security**:
   running mm:ss elapsed timer while recording, and switches to a subtle
   amber warning appearance in the last 30s before the cap.
   > **Long recordings are handled via automatic chunking** (since commit
-  > `PLACEHOLDER_COMMIT`). The bundled Parakeet ASR engine has no internal
+  > `4757636`). The bundled Parakeet ASR engine has no internal
   > streaming (`supports_streaming: false` in transcribe-rs) and its memory
   > use grows faster than linearly — ≈quadratically — in the length of a
   > single `transcribe` call: measured on an M5 Mac, ~15.6GB peak for 49s of
