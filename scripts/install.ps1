@@ -10,14 +10,43 @@
 # The repo is public, so no authentication is needed for the default path.
 #
 # Env / params:
-#   -InstallYes         never prompt
-#   $env:GITHUB_TOKEN    optional; only needed as a fallback if `gh` isn't
+#   -InstallYes          never prompt
+#   $env:GITHUB_TOKEN     optional; only needed as a fallback if `gh` isn't
 #                        installed and unauthenticated GitHub API requests
 #                        are rate-limited (60/hr per IP), or for a private fork
+#   -InstallModels /      opt-in, non-interactive model download so an
+#   $env:INSTALL_MODELS   agent/CI can complete a full end-to-end install in
+#                        one command. One of: none (default — matches prior
+#                        behavior), asr (parakeet-v3 only), all (parakeet-v3
+#                        then cleanup). parakeet-v3 is ~456MB download
+#                        (~640MB on disk); cleanup is ~1.1GB. Both would land
+#                        in %USERPROFILE%\.config\vzt-flow\models\. NOTE:
+#                        CLI/MCP packaging is not yet available for Windows
+#                        (see below) — there is no installed flow.exe for
+#                        this script to invoke yet, so asr/all currently
+#                        print instructions instead of downloading. Also,
+#                        the cleanup LLM is macOS-only today (no Windows
+#                        `clean`/`polish` support — see docs/USAGE-Windows.md
+#                        and README's "Windows (experimental)" section), so
+#                        even once CLI packaging lands, `all` would warn that
+#                        the cleanup model is unused on Windows rather than
+#                        silently pulling down 1.1GB for nothing.
 
 param(
-    [switch]$InstallYes
+    [switch]$InstallYes,
+    [string]$InstallModels = "none"
 )
+
+if (-not $PSBoundParameters.ContainsKey('InstallModels') -and $env:INSTALL_MODELS) {
+    $InstallModels = $env:INSTALL_MODELS
+}
+
+# Validate early (before any download/install work starts) so a typo fails
+# fast instead of partway through the install.
+if ($InstallModels -notin @("none", "asr", "all")) {
+    Write-Error "invalid -InstallModels/env:INSTALL_MODELS '$InstallModels' (valid values: none, asr, all)"
+    exit 1
+}
 
 $ErrorActionPreference = "Stop"
 $Repo = "vonzelle-vzt/vzt-flow"
@@ -75,6 +104,49 @@ function Get-LatestSetupExe {
     Invoke-WebRequest -Uri $asset.url -Headers $dlHeaders -OutFile $outFile
 }
 
+# --- opt-in model download (-InstallModels asr|all) ------------------------
+# A failed download warns and does not abort an otherwise-successful install
+# -- the user can always retry manually. Would invoke the just-installed
+# flow.exe by absolute path (not bare `flow.exe`, since it may not be on
+# PATH) -- but see the header note: CLI/MCP packaging isn't published for
+# Windows yet, so there is no flow.exe for this script to invoke today.
+function Invoke-ModelDownloads {
+    param(
+        [string]$Models,
+        [string]$FlowExe
+    )
+    if ($Models -eq "none") { return }
+
+    if (-not $FlowExe -or -not (Test-Path $FlowExe)) {
+        Write-Host ""
+        Write-Warning "-InstallModels '$Models' requested, but CLI/MCP packaging is not yet available for Windows -- there is no installed flow.exe for this script to invoke (see docs/USAGE-Windows.md to build the CLI from source). Once built, run manually:"
+        Write-Host "  flow.exe models download parakeet-v3"
+        if ($Models -eq "all") {
+            Write-Host "  flow.exe models download cleanup   # optional -- the cleanup LLM is macOS-only today (no Windows clean/polish support yet), so this model isn't used on Windows"
+        }
+        return
+    }
+
+    try {
+        Write-Host "==> downloading ASR model (parakeet-v3, ~456MB download / ~640MB on disk)"
+        & $FlowExe models download parakeet-v3
+        if ($LASTEXITCODE -ne 0) { throw "exit code $LASTEXITCODE" }
+    } catch {
+        Write-Warning "model download failed for parakeet-v3 ($_) -- retry with: $FlowExe models download parakeet-v3"
+    }
+
+    if ($Models -eq "all") {
+        Write-Warning "the cleanup LLM is macOS-only today (no Windows clean/polish support yet) -- downloading it anyway per -InstallModels all, but it won't be used on Windows."
+        try {
+            Write-Host "==> downloading cleanup model (cleanup, ~1.1GB)"
+            & $FlowExe models download cleanup
+            if ($LASTEXITCODE -ne 0) { throw "exit code $LASTEXITCODE" }
+        } catch {
+            Write-Warning "model download failed for cleanup ($_) -- retry with: $FlowExe models download cleanup"
+        }
+    }
+}
+
 Get-LatestSetupExe -DestDir $WorkDir -Pattern $SetupPattern
 
 $Setup = Get-ChildItem -Path $WorkDir -Filter "*-setup.exe" | Select-Object -First 1
@@ -92,5 +164,7 @@ Write-Host "If the hotkey doesn't register, another app may already be using it.
 Write-Host ""
 Write-Host "CLI/MCP packaging is not yet available for Windows — see the macOS"
 Write-Host "installer (scripts/install.sh) for the flow CLI + MCP server setup on Mac."
+
+Invoke-ModelDownloads -Models $InstallModels -FlowExe $null
 
 Remove-Item -Recurse -Force $WorkDir -ErrorAction SilentlyContinue

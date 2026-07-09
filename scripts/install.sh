@@ -11,21 +11,38 @@
 # The repo is public, so no authentication is needed for the default path.
 #
 # Env flags:
-#   INSTALL_YES=1   never prompt (assume yes to overwrite prompts)
-#   NO_LAUNCH=1     skip `open -a "VZT Flow"` at the end
-#   GITHUB_TOKEN    optional; only needed as a fallback if `gh` isn't
-#                   installed and unauthenticated GitHub API requests are
-#                   rate-limited (60/hr per IP), or for a private fork
+#   INSTALL_YES=1     never prompt (assume yes to overwrite prompts)
+#   NO_LAUNCH=1       skip `open -a "VZT Flow"` at the end
+#   GITHUB_TOKEN      optional; only needed as a fallback if `gh` isn't
+#                     installed and unauthenticated GitHub API requests are
+#                     rate-limited (60/hr per IP), or for a private fork
+#   INSTALL_MODELS    opt-in, non-interactive model download so an agent/CI
+#                     can complete a full end-to-end install in one command.
+#                     One of: none (default — matches prior behavior, run
+#                     `flow models download` yourself later), asr (fetches
+#                     parakeet-v3 only), all (parakeet-v3 then cleanup).
+#                     parakeet-v3 is ~456MB download (~640MB on disk);
+#                     cleanup is ~1.1GB. Both land in
+#                     ~/.config/vzt-flow/models/. A failed download warns
+#                     and does not abort an otherwise-successful install.
 set -euo pipefail
 
 REPO="vonzelle-vzt/vzt-flow"
 APP_NAME="VZT Flow.app"
 INSTALL_YES="${INSTALL_YES:-0}"
 NO_LAUNCH="${NO_LAUNCH:-0}"
+INSTALL_MODELS="${INSTALL_MODELS:-none}"
 
 log() { printf '==> %s\n' "$1"; }
 warn() { printf 'warning: %s\n' "$1" >&2; }
 die() { printf 'error: %s\n' "$1" >&2; exit 1; }
+
+# Validate early (before any download/install work starts) so a typo fails
+# fast instead of 5 minutes into the install.
+case "$INSTALL_MODELS" in
+  none|asr|all) ;;
+  *) die "invalid INSTALL_MODELS='$INSTALL_MODELS' (valid values: none, asr, all)" ;;
+esac
 
 # --- platform check -----------------------------------------------------
 
@@ -206,6 +223,8 @@ install_linux() {
     warn "  export PATH=\"$cli_dest:\$PATH\""
   fi
 
+  download_models "$cli_dest"
+
   # --- install the MCP server (same layout as the macOS path) ---
   local mcp_dest="$HOME/.vzt-flow/mcp"
   log "installing MCP server to $mcp_dest"
@@ -248,6 +267,53 @@ Runtime notes (full X11-vs-Wayland support matrix in docs/USAGE-Linux.md):
 CLI:  flow --help    (run 'flow doctor' first)
 MCP:  claude mcp list   (should show "vzt-flow")
 EOF
+  print_models_next_steps "$cli_dest"
+}
+
+# --- opt-in model download (INSTALL_MODELS=asr|all) -----------------------
+# Shared between the Linux and macOS install paths. Invokes the flow CLI we
+# just installed by absolute path (not bare `flow`) since $dest may not be on
+# this shell's PATH yet. A failed download warns and does not abort an
+# otherwise-successful install — the user can always retry manually.
+download_models() {
+  local dest="$1"
+  case "$INSTALL_MODELS" in
+    none) return 0 ;;
+    asr)
+      log "downloading ASR model (parakeet-v3, ~456MB download / ~640MB on disk)"
+      "$dest/flow" models download parakeet-v3 \
+        || warn "model download failed for parakeet-v3 — retry with: $dest/flow models download parakeet-v3"
+      ;;
+    all)
+      log "downloading ASR model (parakeet-v3, ~456MB download / ~640MB on disk)"
+      "$dest/flow" models download parakeet-v3 \
+        || warn "model download failed for parakeet-v3 — retry with: $dest/flow models download parakeet-v3"
+      log "downloading cleanup model (cleanup, ~1.1GB)"
+      "$dest/flow" models download cleanup \
+        || warn "model download failed for cleanup — retry with: $dest/flow models download cleanup"
+      ;;
+  esac
+}
+
+# Prints the accurate "next steps" line for models depending on
+# INSTALL_MODELS. Kept out of the trailing heredocs (one of which is
+# single-quoted) so it works regardless of heredoc quoting.
+print_models_next_steps() {
+  local dest="$1"
+  case "$INSTALL_MODELS" in
+    none)
+      printf '\nModels: not downloaded yet — run:\n'
+      printf '  %s/flow models download parakeet-v3   (required for ASR)\n' "$dest"
+      printf '  %s/flow models download cleanup        (optional, for clean/polish modes)\n' "$dest"
+      ;;
+    asr)
+      printf '\nModels: parakeet-v3 downloaded (INSTALL_MODELS=asr). For clean/polish modes, run:\n'
+      printf '  %s/flow models download cleanup\n' "$dest"
+      ;;
+    all)
+      printf '\nModels: parakeet-v3 + cleanup downloaded (INSTALL_MODELS=all) — ready to use.\n'
+      ;;
+  esac
 }
 
 # Dispatch the Linux path here; the macOS dmg/hdiutil code below is never
@@ -329,6 +395,8 @@ if [[ ":$PATH:" != *":$CLI_DEST_DIR:"* ]]; then
   warn "  export PATH=\"$CLI_DEST_DIR:\$PATH\""
 fi
 
+download_models "$CLI_DEST_DIR"
+
 # --- install the MCP server -------------------------------------------------
 
 MCP_DEST="$HOME/.vzt-flow/mcp"
@@ -378,3 +446,4 @@ Privacy & Security):
 CLI:  flow --help
 MCP:  claude mcp list   (should show "vzt-flow")
 EOF
+print_models_next_steps "$CLI_DEST_DIR"

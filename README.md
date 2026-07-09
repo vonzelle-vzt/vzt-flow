@@ -277,6 +277,22 @@ runtime) is doing real work here, not just a marketing line.
 
 ## Install
 
+### Let Claude do it
+
+Paste this into [Claude Code](https://claude.com/claude-code) and it installs
+everything — app, `flow` CLI, MCP server, and the ~640MB Parakeet model —
+then verifies the result with `flow doctor` and a real transcription:
+
+> Install VZT Flow on this machine by following
+> https://raw.githubusercontent.com/vonzelle-vzt/vzt-flow/main/AGENT-INSTALL.md
+
+[AGENT-INSTALL.md](AGENT-INSTALL.md) is a runbook written for an agent rather
+than a person: non-interactive flags, download-timeout guidance, a
+`flow doctor` + TTS round-trip verification step, and an explicit list of what
+an agent **can't** do (the three macOS permission grants are TCC-protected —
+no shell, `sudo`, or plist edit can grant them, so that step stays human, and
+the agent is told not to claim the hotkey works until you've tested it).
+
 ### macOS: one-liner
 
 ```bash
