@@ -343,7 +343,15 @@ pub mod windows {
         let pipe = pipe_name_for(name)?;
         let mut stream = Stream::connect(pipe)
             .with_context(|| format!("failed to connect to daemon named pipe \\\\.\\pipe\\{name}"))?;
-        stream.set_recv_timeout(read_timeout).context("failed to set read timeout")?;
+        // Named-pipe streams reject recv timeouts on some Windows versions
+        // (observed on GitHub's windows-2025 runners: "failed to set read
+        // timeout"). A blocking read is an acceptable degradation: the
+        // daemon's serve loop answers each request promptly once connected,
+        // and callers gate on `is_alive` first, so an unanswerable pipe is
+        // caught before this read rather than by the timeout.
+        if let Err(e) = stream.set_recv_timeout(read_timeout) {
+            eprintln!("[vzt-flow] named pipe recv timeout unsupported, using blocking read: {e}");
+        }
         write_request(&mut stream, req)?;
         let mut reader = BufReader::new(stream);
         read_response(&mut reader)
