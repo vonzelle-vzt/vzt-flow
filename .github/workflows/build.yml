@@ -150,6 +150,9 @@ jobs:
             | tar xz -C /tmp/ort-x64 --strip-components=1
           ls /tmp/ort-x64/lib
           echo "ORT_LIB_PATH=/tmp/ort-x64/lib" >> "$GITHUB_ENV"
+          DYLIB=$(find /tmp/ort-x64/lib -name 'libonnxruntime.*.dylib' | head -n1)
+          [ -n "$DYLIB" ] || { echo "::error::libonnxruntime dylib not found under /tmp/ort-x64/lib after extracting the release tarball"; exit 1; }
+          echo "ORT_DYLIB=$DYLIB" >> "$GITHUB_ENV"
 
       - name: OpenSSL headers for llama.cpp vendored httplib (macOS 26 runners)
         run: |
@@ -160,30 +163,29 @@ jobs:
       - name: Install Tauri CLI
         run: cargo install tauri-cli --version "^2" --locked
 
-      - name: tauri build (x86_64, unsigned/local build — no notarization in CI, cross-compiled)
+      # Same fix as release.yml's macos-x64 job (see the comment there for
+      # the full incident writeup): a prior version of this step built the
+      # .app AND cut the .dmg in one `cargo tauri build` call, then a later
+      # step mutated the already-built .app — but the .dmg had already been
+      # packaged from the pre-fixup app, so this job's uploaded dmg was
+      # silently wrong on every CI run. Do both mutations BEFORE the bundler
+      # cuts the dmg instead of after: RUSTFLAGS adds the rpath at link time
+      # (the bundler's --config frameworks option does not run
+      # install_name_tool for you), and --config bundle.macOS.frameworks
+      # tells the bundler to copy the dylib into Contents/Frameworks and
+      # sign it as part of its own ad-hoc signing pass. Scoped to this step
+      # only — the aarch64 job statically links ort and has no frameworks
+      # entry to add.
+      - name: tauri build (x86_64, ad-hoc signed with onnxruntime bundled + rpath — cross-compiled)
         working-directory: apps/desktop
-        run: cargo tauri build --target x86_64-apple-darwin
-
-      - name: Bundle libonnxruntime.dylib into the .app and fix up its rpath
+        env:
+          # env RUSTFLAGS *replaces* .cargo/config.toml's rustflags rather than
+          # appending — keep /usr/lib/swift (libswift_Concurrency, pulled in by
+          # screencapturekit) or the x64 app dyld-aborts on it. See release.yml.
+          RUSTFLAGS: "-C link-arg=-Wl,-rpath,/usr/lib/swift -C link-arg=-Wl,-rpath,@executable_path/../Frameworks"
         run: |
-          APP_PATH=$(find target/x86_64-apple-darwin/release/bundle/macos -maxdepth 1 -name '*.app' | head -n1)
-          if [ -z "$APP_PATH" ]; then
-            echo "No .app bundle found" >&2
-            exit 1
-          fi
-          BIN_PATH="$APP_PATH/Contents/MacOS/vzt-flow-desktop"
-          mkdir -p "$APP_PATH/Contents/Frameworks"
-          cp /tmp/ort-x64/lib/libonnxruntime.*.dylib "$APP_PATH/Contents/Frameworks/"
-          # system-strategy linking leaves an @rpath reference with no
-          # matching LC_RPATH on the binary — add one pointing at the
-          # dylib we just bundled, or the app fails to launch (dyld:
-          # Library not loaded) on a real machine.
-          install_name_tool -add_rpath "@executable_path/../Frameworks" "$BIN_PATH"
-          # install_name_tool invalidates any existing signature; CI builds
-          # are already unsigned/ad-hoc (no notarization here), so re-sign
-          # ad-hoc rather than leave a broken signature.
-          codesign --force --deep -s - "$APP_PATH"
-          otool -l "$BIN_PATH" | grep -A2 LC_RPATH
+          cargo tauri build --target x86_64-apple-darwin \
+            --config "{\"bundle\":{\"macOS\":{\"frameworks\":[\"${ORT_DYLIB}\"]}}}"
 
       - name: Locate dmg artifact
         id: find_dmg
@@ -195,6 +197,41 @@ jobs:
             exit 1
           fi
           echo "path=$DMG" >> "$GITHUB_OUTPUT"
+
+      # Mounts the actual dmg this job uploads (not the .app left behind in
+      # bundle/macos/) so this check can't be fooled by the same
+      # dmg-cut-before-fixup ordering bug it exists to catch.
+      - name: Verify bundle (mounts the uploaded .dmg)
+        run: |
+          set -euo pipefail
+          DMG="${{ steps.find_dmg.outputs.path }}"
+          MOUNT=$(mktemp -d)
+          cleanup() { hdiutil detach "$MOUNT" -quiet >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+          hdiutil attach -nobrowse -readonly -mountpoint "$MOUNT" "$DMG"
+
+          APP=$(find "$MOUNT" -maxdepth 1 -name '*.app' | head -n1)
+          [ -n "$APP" ] || { echo "::error::no .app found inside $DMG"; exit 1; }
+
+          /usr/libexec/PlistBuddy -c "Print :NSMicrophoneUsageDescription" "$APP/Contents/Info.plist" >/dev/null 2>&1 \
+            || { echo "::error::NSMicrophoneUsageDescription missing from the dmg's app — the app will be killed by TCC the moment a user talks"; exit 1; }
+
+          if codesign -dv --verbose=2 "$APP" 2>&1 | grep -q "Sealed Resources=none"; then
+            echo "::error::dmg's bundle resources are not sealed — a quarantined download will fail Gatekeeper (\"app is damaged\") with no Open Anyway option"
+            exit 1
+          fi
+          codesign --verify --deep --strict "$APP" \
+            || { echo "::error::dmg's bundle signature does not verify"; exit 1; }
+
+          DYLIB=$(find "$APP/Contents/Frameworks" -maxdepth 1 -name 'libonnxruntime.*.dylib' 2>/dev/null | head -n1)
+          [ -n "$DYLIB" ] || { echo "::error::libonnxruntime dylib missing from dmg's Contents/Frameworks — the app will abort at dyld load"; exit 1; }
+          RPATHS=$(otool -l "$APP/Contents/MacOS/vzt-flow-desktop" | grep -A2 LC_RPATH | grep "path " || true)
+          grep -q "@executable_path/../Frameworks" <<<"$RPATHS" \
+            || { echo "::error::dmg's binary has no @executable_path/../Frameworks LC_RPATH — dyld will fail to locate libonnxruntime at launch"; exit 1; }
+          grep -q "/usr/lib/swift" <<<"$RPATHS" \
+            || { echo "::error::dmg's binary lost its /usr/lib/swift LC_RPATH — dyld will fail on libswift_Concurrency.dylib. Did an env RUSTFLAGS clobber .cargo/config.toml?"; exit 1; }
+
+          echo "bundle OK (verified inside dmg): mic purpose string present, resources sealed, signature verifies, onnxruntime dylib + rpath present"
 
       - uses: actions/upload-artifact@v4
         with:

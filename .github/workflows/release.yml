@@ -41,34 +41,6 @@ jobs:
         working-directory: apps/desktop
         run: cargo tauri build --target aarch64-apple-darwin
 
-      # Two regressions shipped to users before this guard existed, both
-      # invisible on the maintainer's machine:
-      #   1. No NSMicrophoneUsageDescription. macOS TCC *terminates* a process
-      #      that opens a mic stream with no purpose string. It never bit the
-      #      maintainer because a Terminal-launched binary inherits Terminal as
-      #      its TCC responsible process, and Terminal already has mic access.
-      #   2. The bundle was only linker-signed (Sealed Resources=none), so it
-      #      had no stable code identity for TCC to hang Accessibility/Input
-      #      Monitoring grants on. Only the x86_64 job ever re-signed.
-      # Both are now fixed at the source (src-tauri/Info.plist +
-      # bundle.macOS.signingIdentity). Fail the release if either regresses.
-      - name: Verify bundle (mic purpose string + sealed signature)
-        run: |
-          set -euo pipefail
-          APP=$(find target/aarch64-apple-darwin/release/bundle/macos -maxdepth 1 -name '*.app' | head -n1)
-          [ -n "$APP" ] || { echo "::error::no .app bundle found"; exit 1; }
-
-          /usr/libexec/PlistBuddy -c "Print :NSMicrophoneUsageDescription" "$APP/Contents/Info.plist" >/dev/null 2>&1 \
-            || { echo "::error::NSMicrophoneUsageDescription missing — the app will be killed by TCC the moment a user talks"; exit 1; }
-
-          if codesign -dv --verbose=2 "$APP" 2>&1 | grep -q "Sealed Resources=none"; then
-            echo "::error::bundle resources are not sealed — Accessibility/Input Monitoring grants will not stick"
-            exit 1
-          fi
-          codesign --verify --deep --strict "$APP" \
-            || { echo "::error::bundle signature does not verify"; exit 1; }
-          echo "bundle OK: mic purpose string present, resources sealed, signature verifies"
-
       - name: Build flow CLI (release)
         run: cargo build --release --target aarch64-apple-darwin -p flow-cli
 
@@ -86,6 +58,62 @@ jobs:
           fi
           echo "path=$DMG" >> "$GITHUB_OUTPUT"
           echo "name=$(basename "$DMG")" >> "$GITHUB_OUTPUT"
+
+      # Two regressions shipped to users before this guard existed, both
+      # invisible on the maintainer's machine:
+      #   1. No NSMicrophoneUsageDescription. macOS TCC *terminates* a process
+      #      that opens a mic stream with no purpose string. It never bit the
+      #      maintainer because a Terminal-launched binary inherits Terminal as
+      #      its TCC responsible process, and Terminal already has mic access.
+      #   2. The bundle was only linker-signed (Sealed Resources=none). A
+      #      frontier diagnosis found the original comment here overstated
+      #      the TCC impact — grants ARE recorded against ad-hoc/linker-signed
+      #      builds (pinned by cdhash via csreq) and persist fine for a fixed
+      #      released binary; they only break across *rebuilds* (a separate,
+      #      already-documented cdhash-churn gotcha, see CLAUDE.md (a)). What
+      #      an unsealed bundle actually breaks is Gatekeeper: a quarantined
+      #      copy (browser download, or a `brew` cask, which quarantines by
+      #      default) fails `gktool scan` with "the software has been
+      #      altered" — the un-bypassable "VZT Flow is damaged and can't be
+      #      opened" dialog, no "Open Anyway" escape hatch. (`curl | bash`
+      #      only escapes it because curl never sets the quarantine xattr.)
+      #      Only the x86_64 job ever re-signed, and even there the fix-up
+      #      ran on the ALREADY-BUILT .app while the .dmg had already been
+      #      produced from the pre-fixup bundle — the guard below inspects
+      #      the .app INSIDE the shipped .dmg, not the one left behind in
+      #      bundle/macos/, so it can't be fooled by that ordering bug again.
+      # Both are now fixed at the source (src-tauri/Info.plist +
+      # bundle.macOS.signingIdentity). Fail the release if either regresses.
+      # ORDERING CONSTRAINT for anyone touching the x64 job: any mutation of
+      # the .app (copying the onnxruntime dylib in, adding rpaths) must
+      # happen BEFORE codesign, codesign must be the last mutation, and dmg
+      # creation must come after signing — cargo-tauri's own dmg bundling
+      # step already does all three in that order via the frameworks/
+      # signingIdentity config, so do not add a second post-build mutation
+      # pass that edits the .app after the dmg has already been cut from it.
+      - name: Verify bundle (mounts the shipped .dmg — the actual artifact users download)
+        run: |
+          set -euo pipefail
+          DMG="${{ steps.find_dmg.outputs.path }}"
+          MOUNT=$(mktemp -d)
+          cleanup() { hdiutil detach "$MOUNT" -quiet >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+          hdiutil attach -nobrowse -readonly -mountpoint "$MOUNT" "$DMG"
+
+          APP=$(find "$MOUNT" -maxdepth 1 -name '*.app' | head -n1)
+          [ -n "$APP" ] || { echo "::error::no .app found inside $DMG"; exit 1; }
+
+          /usr/libexec/PlistBuddy -c "Print :NSMicrophoneUsageDescription" "$APP/Contents/Info.plist" >/dev/null 2>&1 \
+            || { echo "::error::NSMicrophoneUsageDescription missing from the shipped dmg's app — the app will be killed by TCC the moment a user talks"; exit 1; }
+
+          if codesign -dv --verbose=2 "$APP" 2>&1 | grep -q "Sealed Resources=none"; then
+            echo "::error::shipped dmg's bundle resources are not sealed — a quarantined download will fail Gatekeeper (\"app is damaged\") with no Open Anyway option"
+            exit 1
+          fi
+          codesign --verify --deep --strict "$APP" \
+            || { echo "::error::shipped dmg's bundle signature does not verify"; exit 1; }
+
+          echo "bundle OK (verified inside shipped dmg): mic purpose string present, resources sealed, signature verifies"
 
       - name: Prune MCP node_modules to production deps
         # dist/index.js imports @modelcontextprotocol/sdk and zod at
@@ -167,6 +195,9 @@ jobs:
           curl -fsSL "https://github.com/microsoft/onnxruntime/releases/download/v${ONNXRUNTIME_VERSION}/onnxruntime-osx-x86_64-${ONNXRUNTIME_VERSION}.tgz" \
             | tar xz -C /tmp/ort-x64 --strip-components=1
           echo "ORT_LIB_PATH=/tmp/ort-x64/lib" >> "$GITHUB_ENV"
+          DYLIB=$(find /tmp/ort-x64/lib -name 'libonnxruntime.*.dylib' | head -n1)
+          [ -n "$DYLIB" ] || { echo "::error::libonnxruntime dylib not found under /tmp/ort-x64/lib after extracting the release tarball"; exit 1; }
+          echo "ORT_DYLIB=$DYLIB" >> "$GITHUB_ENV"
 
       - name: OpenSSL headers for llama.cpp vendored httplib (macOS 26 runners)
         run: |
@@ -177,45 +208,49 @@ jobs:
       - name: Install Tauri CLI
         run: cargo install tauri-cli --version "^2" --locked
 
-      - name: tauri build (x86_64, unsigned/local build — no notarization in CI, cross-compiled)
+      # The previous version of this step built the .app AND cut the .dmg in
+      # one `cargo tauri build` call, then a later step mutated the already-
+      # built .app in bundle/macos/ — but the .dmg had already been packaged
+      # from the PRE-fixup app, so every shipped Intel dmg contained an
+      # unsigned app with no bundled onnxruntime dylib and no rpath to find
+      # it (verified against the v0.2.0 x64 dmg: unsigned, no
+      # Contents/Frameworks, LC_RPATH only /usr/lib/swift — every Intel user
+      # aborted at dyld load on every launch). Fixed by doing both mutations
+      # BEFORE the bundler cuts the dmg instead of after:
+      #   - RUSTFLAGS adds the rpath at link time (the bundler's --config
+      #     frameworks option does NOT run install_name_tool for you).
+      #   - --config bundle.macOS.frameworks tells the bundler to copy the
+      #     dylib into Contents/Frameworks and include it in sign_paths, so
+      #     the bundler's own signing (bundle.macOS.signingIdentity: "-" in
+      #     tauri.conf.json) covers it and the dmg it cuts already has both.
+      # RUSTFLAGS and --config are scoped to this step only — arm64
+      # statically links ort and has no frameworks entry to add.
+      - name: tauri build (x86_64, ad-hoc signed with onnxruntime bundled + rpath — cross-compiled)
         working-directory: apps/desktop
-        run: cargo tauri build --target x86_64-apple-darwin
+        env:
+          # An env RUSTFLAGS *replaces* .cargo/config.toml's `rustflags`, it
+          # does not append to them (verified: with only the @executable_path
+          # entry here, the built binary's sole LC_RPATH became
+          # @executable_path/../Frameworks and /usr/lib/swift vanished). That
+          # config entry is load-bearing — screencapturekit pulls in
+          # Swift-backed crates needing libswift_Concurrency.dylib from
+          # /usr/lib/swift. Dropping it would trade the onnxruntime dyld abort
+          # for a libswift_Concurrency one. Carry BOTH rpaths.
+          RUSTFLAGS: "-C link-arg=-Wl,-rpath,/usr/lib/swift -C link-arg=-Wl,-rpath,@executable_path/../Frameworks"
+        run: |
+          cargo tauri build --target x86_64-apple-darwin \
+            --config "{\"bundle\":{\"macOS\":{\"frameworks\":[\"${ORT_DYLIB}\"]}}}"
 
       - name: Build flow CLI (release)
         run: cargo build --release --target x86_64-apple-darwin -p flow-cli
 
-      - name: Bundle libonnxruntime.dylib into the .app and the CLI, fix up rpaths
+      - name: Stage onnxruntime dylib + rpath for the standalone CLI tarball
+        # The CLI binary ships with no app bundle, so it isn't covered by
+        # the bundler's frameworks/signing above — stage the dylib alongside
+        # it by hand and point a matching rpath at it.
         run: |
-          APP_PATH=$(find target/x86_64-apple-darwin/release/bundle/macos -maxdepth 1 -name '*.app' | head -n1)
-          if [ -z "$APP_PATH" ]; then
-            echo "No .app bundle found" >&2
-            exit 1
-          fi
-          DYLIB=$(find /tmp/ort-x64/lib -name 'libonnxruntime.*.dylib' | head -n1)
-          mkdir -p "$APP_PATH/Contents/Frameworks"
-          cp "$DYLIB" "$APP_PATH/Contents/Frameworks/"
-          install_name_tool -add_rpath "@executable_path/../Frameworks" "$APP_PATH/Contents/MacOS/vzt-flow-desktop"
-          # --force --deep re-seals the bundle after install_name_tool
-          # invalidated the signature. Keep it ad-hoc and WITHOUT hardened
-          # runtime: hardened runtime would demand a
-          # com.apple.security.device.audio-input entitlement for the mic, and
-          # its library validation would reject the unsigned libonnxruntime
-          # dylib copied in just above.
-          codesign --force --deep -s - "$APP_PATH"
-
-          # Same guard as the aarch64 job — see the comment there.
-          /usr/libexec/PlistBuddy -c "Print :NSMicrophoneUsageDescription" "$APP_PATH/Contents/Info.plist" >/dev/null 2>&1 \
-            || { echo "::error::NSMicrophoneUsageDescription missing — the app will be killed by TCC the moment a user talks"; exit 1; }
-          if codesign -dv --verbose=2 "$APP_PATH" 2>&1 | grep -q "Sealed Resources=none"; then
-            echo "::error::bundle resources are not sealed"; exit 1
-          fi
-          codesign --verify --deep --strict "$APP_PATH" \
-            || { echo "::error::bundle signature does not verify"; exit 1; }
-
-          # The CLI binary is standalone (no bundle) — ship the dylib
-          # alongside it in the release tarball and point the rpath there.
           mkdir -p cli-x64-stage/lib
-          cp "$DYLIB" cli-x64-stage/lib/
+          cp "$ORT_DYLIB" cli-x64-stage/lib/
           cp target/x86_64-apple-darwin/release/flow cli-x64-stage/flow
           install_name_tool -add_rpath "@executable_path/lib" cli-x64-stage/flow
           codesign --force -s - cli-x64-stage/flow
@@ -230,6 +265,45 @@ jobs:
             exit 1
           fi
           echo "path=$DMG" >> "$GITHUB_OUTPUT"
+
+      # Same guard shape as the aarch64 job (mounts the shipped .dmg, not the
+      # .app left behind in bundle/macos/) plus x64-specific checks that the
+      # onnxruntime dylib and its rpath actually made it into the dmg.
+      - name: Verify bundle (mounts the shipped .dmg — the actual artifact users download)
+        run: |
+          set -euo pipefail
+          DMG="${{ steps.find_dmg.outputs.path }}"
+          MOUNT=$(mktemp -d)
+          cleanup() { hdiutil detach "$MOUNT" -quiet >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+          hdiutil attach -nobrowse -readonly -mountpoint "$MOUNT" "$DMG"
+
+          APP=$(find "$MOUNT" -maxdepth 1 -name '*.app' | head -n1)
+          [ -n "$APP" ] || { echo "::error::no .app found inside $DMG"; exit 1; }
+
+          /usr/libexec/PlistBuddy -c "Print :NSMicrophoneUsageDescription" "$APP/Contents/Info.plist" >/dev/null 2>&1 \
+            || { echo "::error::NSMicrophoneUsageDescription missing from the shipped dmg's app — the app will be killed by TCC the moment a user talks"; exit 1; }
+
+          if codesign -dv --verbose=2 "$APP" 2>&1 | grep -q "Sealed Resources=none"; then
+            echo "::error::shipped dmg's bundle resources are not sealed — a quarantined download will fail Gatekeeper (\"app is damaged\") with no Open Anyway option"
+            exit 1
+          fi
+          codesign --verify --deep --strict "$APP" \
+            || { echo "::error::shipped dmg's bundle signature does not verify"; exit 1; }
+
+          DYLIB=$(find "$APP/Contents/Frameworks" -maxdepth 1 -name 'libonnxruntime.*.dylib' 2>/dev/null | head -n1)
+          [ -n "$DYLIB" ] || { echo "::error::libonnxruntime dylib missing from shipped dmg's Contents/Frameworks — the app will abort at dyld load"; exit 1; }
+          RPATHS=$(otool -l "$APP/Contents/MacOS/vzt-flow-desktop" | grep -A2 LC_RPATH | grep "path " || true)
+          grep -q "@executable_path/../Frameworks" <<<"$RPATHS" \
+            || { echo "::error::shipped dmg's binary has no @executable_path/../Frameworks LC_RPATH — dyld will fail to locate libonnxruntime at launch"; exit 1; }
+          # An env RUSTFLAGS on the build step replaces .cargo/config.toml's
+          # rustflags outright, which silently drops this one. Without it,
+          # libswift_Concurrency.dylib (screencapturekit -> Swift crates) is
+          # unresolvable and the app dyld-aborts just as surely.
+          grep -q "/usr/lib/swift" <<<"$RPATHS" \
+            || { echo "::error::shipped dmg's binary lost its /usr/lib/swift LC_RPATH — dyld will fail on libswift_Concurrency.dylib. Did an env RUSTFLAGS clobber .cargo/config.toml?"; exit 1; }
+
+          echo "bundle OK (verified inside shipped dmg): mic purpose string present, resources sealed, signature verifies, onnxruntime dylib + rpath present"
 
       - name: Prune MCP node_modules to production deps
         working-directory: mcp
