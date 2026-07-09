@@ -11,6 +11,7 @@ import { z } from "zod";
 import { callDaemon, isDaemonAlive } from "./daemon.js";
 import { extractTranscript, runFlowCli } from "./flow-cli.js";
 import { formatHistory, readHistoryFile } from "./history.js";
+import { listMeetingFiles, meetingsDir, readMeetingTranscript } from "./meeting.js";
 
 const server = new McpServer({ name: "vzt-flow", version: "0.1.0" });
 
@@ -31,7 +32,13 @@ server.registerTool(
         .enum(["raw", "clean", "polish", "code"])
         .default("clean")
         .describe("Pipeline mode: raw (verbatim), clean (filler-word removal), polish (rewritten), code (identifier/symbol transform)."),
-      max_seconds: z.number().int().positive().default(120).describe("Hard cap on recording duration, in seconds."),
+      max_seconds: z
+        .number()
+        .int()
+        .positive()
+        .max(600)
+        .default(120)
+        .describe("Hard cap on recording duration, in seconds (up to 600 = 10min, matching the app's max_hold_secs/max_handsfree_secs)."),
     },
   },
   async ({ mode, max_seconds }) => {
@@ -110,6 +117,32 @@ server.registerTool(
       }
     }
     return { content: [{ type: "text", text: formatHistory(readHistoryFile(n)) }] };
+  },
+);
+
+server.registerTool(
+  "meeting_transcript",
+  {
+    title: "Meeting transcript",
+    description:
+      "Return the text of a locally-recorded meeting transcript written by `flow meeting`. " +
+      "Select by index (0 = latest, 1 = next most recent, ...) or by filename. Long transcripts " +
+      "are truncated to a head + tail. Use to read, summarize, or extract action items from a call.",
+    inputSchema: {
+      meeting: z
+        .union([z.number().int().nonnegative(), z.string()])
+        .default(0)
+        .describe("Meeting selector: a numeric index (0 = latest) or a transcript filename."),
+    },
+  },
+  async ({ meeting }) => {
+    const files = listMeetingFiles();
+    if (files.length === 0) {
+      return {
+        content: [{ type: "text", text: `No meeting transcripts found in ${meetingsDir()}. Record one with \`flow meeting\`.` }],
+      };
+    }
+    return { content: [{ type: "text", text: readMeetingTranscript(meeting) }] };
   },
 );
 

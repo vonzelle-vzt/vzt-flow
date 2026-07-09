@@ -13,3 +13,5 @@ flow-core = { path = "../flow-core" }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 hound = "3.5"
+# SIGINT handler for `flow meeting` (Ctrl+C -> graceful stop + summarize).
+ctrlc = "3"

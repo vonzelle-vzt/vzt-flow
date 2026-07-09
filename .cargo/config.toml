@@ -1,0 +1,14 @@
+# Meeting mode's ScreenCaptureKit dependency (screencapturekit v8) pulls in
+# Swift-backed crates (apple-cf, apple-metal) whose runtime needs
+# libswift_Concurrency.dylib. That library ships with macOS in the Swift
+# runtime directory (/usr/lib/swift, resolved via the dyld shared cache)
+# rather than on a binary's default rpath, so Swift-linked Rust binaries can
+# fail to load it with:
+#
+#   dyld: Library not loaded: @rpath/libswift_Concurrency.dylib
+#
+# Adding /usr/lib/swift to the rpath lets every macOS binary in this workspace
+# (the `flow` CLI, its tests, and the desktop app) resolve it. Harmless on
+# machines/toolchains where the loader already finds it.
+[target.'cfg(target_os = "macos")']
+rustflags = ["-C", "link-arg=-Wl,-rpath,/usr/lib/swift"]

@@ -9,6 +9,7 @@ pub mod history;
 pub mod hotkey;
 pub mod insert;
 pub mod ipc;
+pub mod meeting;
 pub mod model_manager;
 pub mod models;
 pub mod permissions;

@@ -31,6 +31,20 @@ enum Commands {
         #[arg(long, alias = "clean")]
         mode: Option<String>,
     },
+    /// Live-transcribe a meeting (Zoom/Meet/Teams) fully locally: captures
+    /// system/app audio (the other participants) and your microphone at once,
+    /// writing a timestamped transcript. Ctrl+C stops and appends a summary.
+    /// `flow meeting list` shows recent transcripts. macOS only.
+    Meeting {
+        /// Meeting title (used in the header and filename). Defaults to "meeting".
+        #[arg(long)]
+        title: Option<String>,
+        /// Output directory. Defaults to ~/Documents/vzt-flow/meetings/.
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+        #[command(subcommand)]
+        action: Option<MeetingAction>,
+    },
     /// Manage local models.
     Models {
         #[command(subcommand)]
@@ -77,6 +91,15 @@ enum Commands {
 }
 
 #[derive(Subcommand)]
+enum MeetingAction {
+    /// List recent meeting transcripts (newest first).
+    List {
+        #[arg(short = 'n', long, default_value_t = 10)]
+        n: usize,
+    },
+}
+
+#[derive(Subcommand)]
 enum ModelsAction {
     /// Download a model. Supports: parakeet-v3 (default), cleanup.
     Download {
@@ -92,6 +115,10 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         Commands::Listen { mode, max_secs } => commands::listen::run(mode, max_secs),
         Commands::Transcribe { file, mode } => commands::transcribe::run(&file, mode.as_deref()),
+        Commands::Meeting { title, out, action } => match action {
+            Some(MeetingAction::List { n }) => commands::meeting::list(n),
+            None => commands::meeting::run(title, out),
+        },
         Commands::Models { action } => match action {
             ModelsAction::Download { model, force } => commands::models::download(&model, force),
         },

@@ -5,6 +5,7 @@ pub mod daemon_client;
 pub mod doctor;
 pub mod history;
 pub mod listen;
+pub mod meeting;
 pub mod models;
 pub mod paste_test;
 pub mod status;
