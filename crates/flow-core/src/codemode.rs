@@ -57,6 +57,7 @@ const TWO_WORD_SYMBOLS: &[(&str, &str, &str)] = &[
     ("close", "bracket", "]"),
     ("at", "sign", "@"),
     ("dollar", "sign", "$"),
+    ("single", "quote", "'"),
 ];
 
 const ONE_WORD_SYMBOLS: &[(&str, &str)] = &[
@@ -75,6 +76,8 @@ const ONE_WORD_SYMBOLS: &[(&str, &str)] = &[
     ("minus", "-"),
     ("percent", "%"),
     ("hash", "#"),
+    ("quote", "\""),
+    ("comma", ","),
 ];
 
 const OPEN_SYMBOLS: &[&str] = &["(", "{", "["];
@@ -182,25 +185,50 @@ fn tokenize(input: &str) -> (Vec<String>, Vec<bool>) {
     (words, stops)
 }
 
-/// No space before `)`, before/after `(`, or around `.` — call and
-/// member-access syntax read wrong with spaces in them.
+/// No space before `)`, `,`, before/after `(`, or around `.` — call,
+/// member-access, and argument-list syntax read wrong with spaces in them.
+/// `"` is deliberately excluded here: unlike the other symbols it's the same
+/// literal character whether spoken quote opens or closes a string, so its
+/// tightness depends on *position* (see [`join_atoms`]'s `quote_is_open`
+/// pass) rather than being a fixed property of the character alone.
 fn is_tight_before(a: &str) -> bool {
-    a == ")" || a == "(" || a == "."
+    a == ")" || a == "(" || a == "." || a == ","
 }
 fn is_tight_after(a: &str) -> bool {
     a == "(" || a == "."
 }
 
 fn join_atoms(atoms: &[String]) -> String {
-    let mut out = String::new();
-    for (i, a) in atoms.iter().enumerate() {
-        if i > 0 {
-            let prev = &atoms[i - 1];
-            if !is_tight_after(prev) && !is_tight_before(a) {
-                out.push(' ');
-            }
+    // A `"` atom alternates opening/closing across the sequence (spoken
+    // code dictation has one "quote" word for both, unlike `open
+    // paren`/`close paren`): the 1st, 3rd, 5th... occurrence opens a string
+    // (tight *after* — glued to what follows) and the 2nd, 4th, 6th...
+    // closes one (tight *before* — glued to what precedes), e.g. `quote
+    // react quote` -> `"react"` with a space before the opening quote but
+    // none inside.
+    let mut quote_is_open = vec![false; atoms.len()];
+    let mut next_quote_opens = true;
+    for (idx, a) in atoms.iter().enumerate() {
+        if a == "\"" {
+            quote_is_open[idx] = next_quote_opens;
+            next_quote_opens = !next_quote_opens;
         }
-        out.push_str(a);
+    }
+    let tight_before = |idx: usize| -> bool {
+        let a = atoms[idx].as_str();
+        (a == "\"" && !quote_is_open[idx]) || is_tight_before(a)
+    };
+    let tight_after = |idx: usize| -> bool {
+        let a = atoms[idx].as_str();
+        (a == "\"" && quote_is_open[idx]) || is_tight_after(a)
+    };
+
+    let mut out = String::new();
+    for i in 0..atoms.len() {
+        if i > 0 && !tight_after(i - 1) && !tight_before(i) {
+            out.push(' ');
+        }
+        out.push_str(&atoms[i]);
     }
     out
 }
@@ -389,5 +417,60 @@ mod tests {
         // No opener follows, so "get user" stays two separate words rather
         // than being guessed into an identifier.
         assert_eq!(transform("get user"), "get user");
+    }
+
+    #[test]
+    fn comma_symbol() {
+        assert_eq!(transform("comma"), ",");
+    }
+
+    #[test]
+    fn quote_symbol() {
+        assert_eq!(transform("quote"), "\"");
+    }
+
+    #[test]
+    fn single_quote_symbol() {
+        assert_eq!(transform("single quote"), "'");
+    }
+
+    #[test]
+    fn quoted_string_literal_from_the_brief() {
+        assert_eq!(transform("import react from quote react quote"), "import react from \"react\"");
+    }
+
+    #[test]
+    fn comma_has_no_space_before_it_but_a_space_after() {
+        assert_eq!(transform("one comma two"), "one, two");
+    }
+
+    #[test]
+    fn list_case_phrasing() {
+        assert_eq!(transform("open bracket one comma two close bracket"), "[ one, two ]");
+    }
+
+    #[test]
+    fn identifier_terminated_by_comma() {
+        // The case-keyword consumption loop must still stop at "comma" now
+        // that it's a recognized symbol, the same way it already stops at
+        // dictated trailing punctuation and language keywords — the comma
+        // itself is then emitted as its own tight-before atom.
+        assert_eq!(transform("camel case user id comma"), "userId,");
+    }
+
+    #[test]
+    fn case_group_stops_at_quote_symbol() {
+        assert_eq!(transform("camel case user id quote hello quote"), "userId \"hello\"");
+    }
+
+    #[test]
+    fn second_quote_pair_reopens_correctly_after_a_closed_pair() {
+        // Two separate quoted strings in one utterance: the open/closed
+        // toggle must reset correctly per pair rather than drifting after
+        // the first close.
+        assert_eq!(
+            transform("quote hello quote comma quote world quote"),
+            "\"hello\", \"world\""
+        );
     }
 }

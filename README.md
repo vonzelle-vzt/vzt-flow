@@ -257,7 +257,7 @@ under `~/.config/vzt-flow/models/`:
 
 | Model | Purpose | Size |
 |---|---|---|
-| Parakeet TDT v3 (int8 ONNX) | Speech-to-text (always required) | ~456MB |
+| Parakeet TDT v3 (int8 ONNX) | Speech-to-text (always required) | 456 MB download (~640 MB on disk) |
 | Qwen3-1.7B-Instruct (Q4_K_M GGUF) | Optional `clean`/`polish` LLM rewrite | ~1.1GB |
 
 ```bash

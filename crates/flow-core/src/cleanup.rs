@@ -293,6 +293,23 @@ mod llama_impl {
 
     impl CleanupProvider for LlamaCleanupProvider {
         fn clean(&self, raw: &str, mode: Mode, ctx: &CleanupContext, cancel: &AtomicBool) -> Result<String> {
+            // An empty (or whitespace-only) user turn has nothing for the
+            // model to "correct" — sent through the dictionary-injected
+            // system prompt anyway (any mode but Raw, which never touches
+            // the LLM to begin with), Qwen3 completes by echoing the
+            // glossary term list back instead (e.g. `flow clean-test ""`
+            // pasted 19 brand names on a silent hotkey press). Short-circuit
+            // before the prompt is even built, for every mode.
+            // `Ok(String::new())` (not `Ok(raw.to_string())`) so this hits
+            // the exact same `text.trim().is_empty()` "no usable output"
+            // branch every caller already has for a failed/empty
+            // generation — both `cleanup_manager::spawn` and
+            // `clean_test::run` fall back to the original raw text there,
+            // which for an empty/whitespace `raw` means pasting nothing (or
+            // harmless whitespace), never LLM output.
+            if raw.trim().is_empty() {
+                return Ok(String::new());
+            }
             if mode == Mode::Raw {
                 return Ok(raw.to_string());
             }
@@ -404,6 +421,89 @@ mod tests {
             provider.clean("um so like hello", Mode::Raw, &ctx, &cancel).unwrap(),
             "um so like hello"
         );
+    }
+
+    /// A provider that ignores its input entirely and "echoes" the
+    /// dictionary terms baked into `ctx`, standing in for what a real LLM
+    /// does with a dictionary-injected system prompt and an empty user
+    /// turn (nothing to correct, so it completes by reciting the glossary).
+    /// Used to prove callers never see that echo once `clean()` itself
+    /// short-circuits on empty/whitespace input — this provider intentionally
+    /// has no such guard, so a test bug in the guard would show up as this
+    /// echo leaking through.
+    struct GlossaryEchoProvider;
+    impl CleanupProvider for GlossaryEchoProvider {
+        fn clean(&self, raw: &str, _mode: Mode, ctx: &CleanupContext, _cancel: &AtomicBool) -> Result<String> {
+            if raw.trim().is_empty() {
+                return Ok(ctx.dictionary_terms.join(" "));
+            }
+            Ok(raw.to_string())
+        }
+    }
+
+    #[test]
+    fn glossary_echo_provider_reproduces_the_bug_when_unguarded() {
+        // Sanity check on the stand-in itself: without a guard, an empty
+        // user turn against a dictionary-injected prompt echoes the
+        // glossary — this is the bug `flow clean-test ""` hit in
+        // production before the `raw.trim().is_empty()` short-circuit was
+        // added to the real `LlamaCleanupProvider::clean`.
+        let provider = GlossaryEchoProvider;
+        let ctx = CleanupContext {
+            dictionary_terms: vec!["Supabase".into(), "Whop".into(), "VZT".into(), "Resend".into()],
+            ..Default::default()
+        };
+        let cancel = AtomicBool::new(false);
+        let out = provider.clean("", Mode::Clean, &ctx, &cancel).unwrap();
+        assert_eq!(out, "Supabase Whop VZT Resend");
+    }
+
+    #[cfg(target_os = "macos")]
+    mod llama_provider_empty_input {
+        use super::*;
+
+        /// End-to-end regression test for the empty-input glossary echo,
+        /// against the real `LlamaCleanupProvider` (not a mock) — but never
+        /// reaches generation, since `clean()` short-circuits before
+        /// building the prompt or creating an llama.cpp context, so it's
+        /// cheap: only pays the one-time model load, no token decoding.
+        /// Skips (rather than failing) if the cleanup model isn't
+        /// downloaded on this machine, since CI/dev boxes without it
+        /// shouldn't fail the suite over a missing multi-GB download.
+        fn load_or_skip() -> Option<LlamaCleanupProvider> {
+            let path = match crate::models::cleanup_model_path() {
+                Ok(p) if p.exists() => p,
+                _ => {
+                    eprintln!("skipping: cleanup model not downloaded on this machine");
+                    return None;
+                }
+            };
+            LlamaCleanupProvider::load(&path).ok()
+        }
+
+        #[test]
+        fn empty_input_returns_empty_without_touching_the_glossary() {
+            let Some(provider) = load_or_skip() else { return };
+            let ctx = CleanupContext {
+                dictionary_terms: vec!["Supabase".into(), "Whop".into(), "VZT".into(), "Resend".into()],
+                ..Default::default()
+            };
+            let cancel = AtomicBool::new(false);
+            let out = provider.clean("", Mode::Clean, &ctx, &cancel).unwrap();
+            assert_eq!(out, "");
+        }
+
+        #[test]
+        fn whitespace_only_input_returns_empty_without_touching_the_glossary() {
+            let Some(provider) = load_or_skip() else { return };
+            let ctx = CleanupContext {
+                dictionary_terms: vec!["Supabase".into(), "Whop".into(), "VZT".into(), "Resend".into()],
+                ..Default::default()
+            };
+            let cancel = AtomicBool::new(false);
+            let out = provider.clean("   \n\t  ", Mode::Polish, &ctx, &cancel).unwrap();
+            assert_eq!(out, "");
+        }
     }
 
     /// A provider that "generates" one token per loop iteration and
