@@ -28,6 +28,12 @@ jobs:
           npm ci --prefix mcp
           npm run build --prefix mcp
 
+      - name: OpenSSL headers for llama.cpp vendored httplib (macOS 26 runners)
+        run: |
+          brew list openssl@3 >/dev/null 2>&1 || brew install openssl@3
+          echo "OPENSSL_ROOT_DIR=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
+          echo "CPATH=$(brew --prefix openssl@3)/include" >> "$GITHUB_ENV"
+          echo "LIBRARY_PATH=$(brew --prefix openssl@3)/lib" >> "$GITHUB_ENV"
       - name: Install Tauri CLI
         run: cargo install tauri-cli --version "^2" --locked
 
@@ -134,6 +140,12 @@ jobs:
             | tar xz -C /tmp/ort-x64 --strip-components=1
           echo "ORT_LIB_PATH=/tmp/ort-x64/lib" >> "$GITHUB_ENV"
 
+      - name: OpenSSL headers for llama.cpp vendored httplib (macOS 26 runners)
+        run: |
+          brew list openssl@3 >/dev/null 2>&1 || brew install openssl@3
+          echo "OPENSSL_ROOT_DIR=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
+          echo "CPATH=$(brew --prefix openssl@3)/include" >> "$GITHUB_ENV"
+          echo "LIBRARY_PATH=$(brew --prefix openssl@3)/lib" >> "$GITHUB_ENV"
       - name: Install Tauri CLI
         run: cargo install tauri-cli --version "^2" --locked
 
