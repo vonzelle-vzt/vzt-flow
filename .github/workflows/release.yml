@@ -37,9 +37,37 @@ jobs:
       - name: Install Tauri CLI
         run: cargo install tauri-cli --version "^2" --locked
 
-      - name: tauri build (aarch64, unsigned/local build — no notarization in CI)
+      - name: tauri build (aarch64, ad-hoc signed — not notarized in CI)
         working-directory: apps/desktop
         run: cargo tauri build --target aarch64-apple-darwin
+
+      # Two regressions shipped to users before this guard existed, both
+      # invisible on the maintainer's machine:
+      #   1. No NSMicrophoneUsageDescription. macOS TCC *terminates* a process
+      #      that opens a mic stream with no purpose string. It never bit the
+      #      maintainer because a Terminal-launched binary inherits Terminal as
+      #      its TCC responsible process, and Terminal already has mic access.
+      #   2. The bundle was only linker-signed (Sealed Resources=none), so it
+      #      had no stable code identity for TCC to hang Accessibility/Input
+      #      Monitoring grants on. Only the x86_64 job ever re-signed.
+      # Both are now fixed at the source (src-tauri/Info.plist +
+      # bundle.macOS.signingIdentity). Fail the release if either regresses.
+      - name: Verify bundle (mic purpose string + sealed signature)
+        run: |
+          set -euo pipefail
+          APP=$(find target/aarch64-apple-darwin/release/bundle/macos -maxdepth 1 -name '*.app' | head -n1)
+          [ -n "$APP" ] || { echo "::error::no .app bundle found"; exit 1; }
+
+          /usr/libexec/PlistBuddy -c "Print :NSMicrophoneUsageDescription" "$APP/Contents/Info.plist" >/dev/null 2>&1 \
+            || { echo "::error::NSMicrophoneUsageDescription missing — the app will be killed by TCC the moment a user talks"; exit 1; }
+
+          if codesign -dv --verbose=2 "$APP" 2>&1 | grep -q "Sealed Resources=none"; then
+            echo "::error::bundle resources are not sealed — Accessibility/Input Monitoring grants will not stick"
+            exit 1
+          fi
+          codesign --verify --deep --strict "$APP" \
+            || { echo "::error::bundle signature does not verify"; exit 1; }
+          echo "bundle OK: mic purpose string present, resources sealed, signature verifies"
 
       - name: Build flow CLI (release)
         run: cargo build --release --target aarch64-apple-darwin -p flow-cli
@@ -167,7 +195,22 @@ jobs:
           mkdir -p "$APP_PATH/Contents/Frameworks"
           cp "$DYLIB" "$APP_PATH/Contents/Frameworks/"
           install_name_tool -add_rpath "@executable_path/../Frameworks" "$APP_PATH/Contents/MacOS/vzt-flow-desktop"
+          # --force --deep re-seals the bundle after install_name_tool
+          # invalidated the signature. Keep it ad-hoc and WITHOUT hardened
+          # runtime: hardened runtime would demand a
+          # com.apple.security.device.audio-input entitlement for the mic, and
+          # its library validation would reject the unsigned libonnxruntime
+          # dylib copied in just above.
           codesign --force --deep -s - "$APP_PATH"
+
+          # Same guard as the aarch64 job — see the comment there.
+          /usr/libexec/PlistBuddy -c "Print :NSMicrophoneUsageDescription" "$APP_PATH/Contents/Info.plist" >/dev/null 2>&1 \
+            || { echo "::error::NSMicrophoneUsageDescription missing — the app will be killed by TCC the moment a user talks"; exit 1; }
+          if codesign -dv --verbose=2 "$APP_PATH" 2>&1 | grep -q "Sealed Resources=none"; then
+            echo "::error::bundle resources are not sealed"; exit 1
+          fi
+          codesign --verify --deep --strict "$APP_PATH" \
+            || { echo "::error::bundle signature does not verify"; exit 1; }
 
           # The CLI binary is standalone (no bundle) — ship the dylib
           # alongside it in the release tarball and point the rpath there.

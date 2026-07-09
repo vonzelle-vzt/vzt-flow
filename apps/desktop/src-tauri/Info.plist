@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Merged into the Tauri-generated Info.plist at bundle time (see
+  https://tauri.app/distribute/macos-application-bundle/#native-configuration).
+
+  NSMicrophoneUsageDescription is NOT optional. macOS TCC *terminates* a
+  process the instant it opens a microphone input stream with no purpose
+  string in its Info.plist — no dialog, no error, just a kill. Without this
+  key the app force-quits the moment a user holds the dictation key.
+
+  This went unnoticed for so long because a binary launched from a Terminal
+  (`nohup <dev-path binary> &`, as CLAUDE.md prescribes for the daily driver)
+  inherits Terminal as its TCC *responsible process*, and Terminal already
+  holds a Microphone grant. Double-clicking the .app makes it its own
+  responsible process, and the missing key becomes fatal. Build the bundle,
+  double-click it, and hold the key — don't test this path from a shell.
+
+  Accessibility and Input Monitoring have no purpose-string keys; they are
+  TCC services granted from System Settings, so there is nothing to add here
+  for them.
+-->
+<plist version="1.0">
+  <dict>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>VZT Flow records audio only while you hold the dictation key. Speech is transcribed on this device and never leaves your machine.</string>
+  </dict>
+</plist>
