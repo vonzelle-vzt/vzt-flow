@@ -262,8 +262,8 @@ VZT Flow needs three grants, all in **System Settings → Privacy & Security**:
   > are transparently split into ~30s chunks (cut at the quietest point of a
   > 25–35s window, so seams land in natural pauses) and transcribed one after
   > another on the same engine, bounding peak memory to a single chunk's
-  > footprint. A ~7min (438s) clip now completes in ~32s (RTF ~0.07) with a
-  > peak of ~8.9GB — comfortably within the 10min (`max_hold_secs`) cap. See
+  > footprint. A ~7min (438s) clip now completes in 32.5s (RTF 0.074) with a
+  > peak of 8.9GB RSS — comfortably within the 10min (`max_hold_secs`) cap. See
   > `crates/flow-core/src/chunking.rs`. The underlying transcribe-rs quadratic
   > memory growth is unchanged upstream; the chunker is what makes the raised
   > cap safe, so there is no longer a reason to keep long holds under ~90s.
@@ -692,7 +692,8 @@ Check registration status any time with `flow doctor` (it shells out to
   dictionary it's less likely to get "corrected" back to a mishearing during
   the cleanup pass too.
 
-**Checking logs:**
+#### Checking logs
+
 - The desktop app is normally launched via Finder/Dock/menu bar with no
   visible console. Launch it from a terminal instead to see its stderr
   output live:

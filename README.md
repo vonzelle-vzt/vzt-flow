@@ -54,9 +54,11 @@ it (press+release faster than the 300ms hold threshold) to start a
 **hands-free** recording instead, which auto-stops after ~2.5s of
 continuous silence following at least one loud frame, or stops on a second
 tap. **Esc** cancels an in-progress recording outright — nothing is
-transcribed or pasted. Every recording mode is hard-capped (120s held, 300s
-hands-free) so a stuck key can never record forever; hitting the cap
-transcribes what was captured rather than discarding it.
+transcribed or pasted. Every recording mode is hard-capped at **600s
+(10min)** for both held and hands-free recording (configurable via
+`max_hold_secs`/`max_handsfree_secs`) so a stuck key can never record
+forever; hitting the cap transcribes what was captured rather than
+discarding it.
 
 A small floating pill overlay tracks the whole lifecycle: a live level
 meter while **Recording**, a mode badge (raw/clean/polish/code) while
@@ -74,6 +76,40 @@ synthesized clip): **0.83s wall time, RTF 0.097x** — about 10x realtime.
 Windows runs the same model on plain CPU ONNX (no CoreML there), so expect a
 lower realtime factor. Per NVIDIA's model card, Parakeet TDT v3 covers 25
 European languages.
+
+### Long-form dictation: 10-minute holds, chunked so they don't OOM
+
+Recording caps are sized for holding the key down for several minutes at a
+stretch, not just short commands. The bundled Parakeet engine
+(`transcribe-rs`) has no internal audio chunking and its memory use grows
+faster than linearly — roughly quadratically — with a single recording's
+length: measured on this repo's M5, ~15.6GB peak for 49s of audio, ~37GB for
+93s, and an out-of-memory kill at ~146s. Rather than lower the cap to match
+that ceiling, recordings longer than ~35s are transparently split into ~30s
+chunks (cut at the quietest point of a 25-35s window, so seams land in
+natural pauses — see `crates/flow-core/src/chunking.rs`) and transcribed one
+after another on the same engine, bounding peak memory to a single chunk's
+footprint regardless of total recording length. Measured on a real ~7-minute
+(438s) take: **~32.5s wall time, RTF 0.074, ~8.9GB peak RSS** — comfortably
+inside the 10-minute cap. The cleanup-LLM deadline scales with transcript
+length too (`cleanup_timeout_ms` base + `cleanup_timeout_per_char_ms` per
+character, capped at `cleanup_timeout_max_ms`), and the overlay pill shows a
+running mm:ss timer with an amber warning in the last 30s before the cap.
+
+### Meeting transcription: local, dual-stream, speaker-labelled
+
+`flow meeting` live-transcribes a Zoom/Google Meet/Microsoft Teams call (or
+anything else playing audio) fully locally — no audio ever leaves the
+machine. It captures **system/participant audio via ScreenCaptureKit** and
+**your microphone** as two separate streams, transcribes both through the
+same local Parakeet engine, and writes a timestamped `Me:`/`Them:` Markdown
+transcript with an echo filter (Jaccard similarity > 0.7 on time-overlapping
+lines) that drops your own mic re-picking-up speaker audio from participants
+without headphones. Stopping the meeting appends a local Qwen3-generated
+summary and action items. A `meeting_transcript` MCP tool exposes transcripts
+to Claude Code ("summarize my last meeting", "pull the action items"). macOS
+only (ScreenCaptureKit is a macOS 13+ framework). Full guide, permissions,
+and transcript-format details: [docs/MEETINGS.md](docs/MEETINGS.md).
 
 ### AI cleanup: on-device Qwen3-1.7B, three modes, a hard deadline
 
@@ -342,14 +378,17 @@ require a restart: [docs/USAGE-macOS.md#config-reference-configtoml](docs/USAGE-
 | `hotkey_keycode` | `61` (Right Option) | Hold-to-talk key |
 | `hold_threshold_ms` | `300` | Hold vs. tap threshold (ms) |
 | `idle_unload_secs` | `300` | Model idle-unload timer (s) |
-| `max_hold_secs` | `120` | Hard cap on a held recording (s) |
-| `max_handsfree_secs` | `300` | Hard cap on hands-free recording (s) |
+| `max_hold_secs` | `600` | Hard cap on a held recording (s) |
+| `max_handsfree_secs` | `600` | Hard cap on hands-free recording (s) |
 | `cleanup_timeout_ms` | `2500` | LLM cleanup deadline before raw fallback (ms) |
 | `handsfree_silence_secs` | `2.5` | Silence before hands-free auto-stops (s) |
 | `launch_at_login` | `false` | Mirrors `tauri-plugin-autostart` |
 
 ## Roadmap
 
+- Meeting auto-detect — automatically offering/starting `flow meeting` when a
+  call app becomes frontmost, rather than requiring a manual `flow meeting
+  --title ...` invocation (in progress)
 - Windows daemon socket + per-app profiles + `clean`/`polish` cleanup LLM
   (all currently macOS-only)
 - Real-hardware validation on Windows (everything today is CI-built, never
@@ -359,6 +398,8 @@ require a restart: [docs/USAGE-macOS.md#config-reference-configtoml](docs/USAGE-
   the manual remove/re-add workaround
 - A dedicated "polish for Claude Code" cleanup mode tuned for dictating
   prompts rather than prose
+- Command mode ("rewrite selection") — voice-driven editing of existing
+  text/code rather than only inserting new dictation
 
 ## Contributing
 

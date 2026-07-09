@@ -57,7 +57,7 @@ extended (a concurrent workstream may be mid-merge)
 | MCP voice input for Claude Code | ✅ | `mcp/src/index.ts`: `listen`, `transcribe_file`, `dictation_history` tools, backed by the daemon socket when available, standalone `flow` CLI otherwise. The headline differentiator — no other dictation product exposes an MCP tool for coding agents. |
 | Meeting transcription + summary | ✅ | `flow meeting` — dual-stream capture (ScreenCaptureKit for system/participant audio + mic), both transcribed by the same local Parakeet engine, speaker-labelled Markdown transcript with an echo filter (Jaccard similarity > 0.7 on time-overlapping lines) to dedupe your own mic picking up speaker audio. On stop, local Qwen3 appends a summary + action items. `meeting_transcript` MCP tool exposes transcripts to Claude Code. macOS-only (ScreenCaptureKit is a macOS 13+ framework). |
 | Meeting auto-detect | 🚧 | Merging concurrently (tray/meeting/config workstream) — automatic start of `flow meeting` when a call app becomes frontmost, rather than requiring a manual `flow meeting --title ...` invocation. |
-| Long-audio chunking | 🚧 | Merging concurrently (engine.rs/model_manager/chunking.rs workstream). Today, `transcribe-rs`'s bundled Parakeet engine has **no internal audio chunking** (`supports_streaming: false`) — see Non-functional/memory below for the measured failure mode this is fixing. |
+| Long-audio chunking | ✅ | Shipped `4757636`. `transcribe-rs`'s bundled Parakeet engine has **no internal audio chunking** (`supports_streaming: false`) and quadratic memory growth (see Non-functional/memory below) — recordings longer than ~35s are transparently split into ~30s silence-cut chunks (`crates/flow-core/src/chunking.rs`) and transcribed sequentially, bounding peak memory to a single chunk regardless of total length. Measured on a real ~7min (438s) clip: **~32.5s wall time, RTF 0.074, ~8.9GB peak RSS**. |
 | Cross-platform builds | ✅ macOS · 🚧 Windows | CI (`build.yml`/`release.yml`) builds macOS Apple Silicon (`aarch64-apple-darwin`, primary/tested) and Intel (`x86_64-apple-darwin`, CI-built, never run on real Intel hardware — effective OS floor is macOS 13.3, not the 12.0 `tauri.conf.json` advertises). Windows x64 (`x86_64-pc-windows-msvc`) is CI-built and experimental (never run on real hardware); Windows Arm (`aarch64-pc-windows-msvc`) is attempted as an allowed-to-fail job. |
 
 ## Non-functional requirements
@@ -91,10 +91,14 @@ quadratic) memory growth** with audio length. Measured on this repo's M5:
 **~15GB peak for 49s of audio, ~37GB for 93s, and an out-of-memory kill for
 ~146s (2m26s)**. A ~7min clip failed outright with a CoreML "dynamically
 resizing for sequence length" error. This is why `max_hold_secs`/
-`max_handsfree_secs` are capped at 600s but the *safe* single-recording
-length today is much lower (~90s) until the chunking workstream (🚧 above)
-lands — the hard cap prevents "recording forever," it does not by itself
-prevent the OOM/crash failure mode for a long single recording.
+`max_handsfree_secs` are capped at 600s, and why long-audio chunking
+(shipped `4757636`, ✅ above) is what makes that cap safe: recordings longer
+than ~35s are transparently split into ~30s chunks before ever reaching the
+engine, bounding peak memory to a single chunk's footprint regardless of
+total recording length. A real ~7min (438s) clip now measures **~32.5s wall
+time, RTF 0.074, ~8.9GB peak RSS** — well within budget. The underlying
+`transcribe-rs` quadratic growth is unchanged upstream; the chunker is the
+fix, not a raised ceiling.
 
 ### Offline-only guarantee
 
