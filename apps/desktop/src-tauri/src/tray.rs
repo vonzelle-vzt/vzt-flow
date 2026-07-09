@@ -1,7 +1,9 @@
-use tauri::menu::{CheckMenuItem, Menu, MenuBuilder, MenuItem};
+use tauri::menu::{CheckMenuItem, Menu, MenuBuilder, MenuItem, SubmenuBuilder};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Manager, State};
 use tauri_plugin_autostart::ManagerExt;
+
+use flow_core::config::MeetingAuto;
 
 use crate::coordinator::CoordinatorMsg;
 use crate::state::{AppState, DictationState, ModelLifecycle};
@@ -29,9 +31,53 @@ pub fn build_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
         "Stop dictation"
     };
 
+    // --- meeting transcription state ---
+    let meeting_active = crate::meeting_ctl::is_active(app);
+    let meeting_auto = state.config.lock().unwrap().meeting_auto_mode();
+    let meeting_toggle_label = if meeting_active {
+        "Stop meeting transcription (\u{25cf} recording)"
+    } else {
+        "Start meeting transcription"
+    };
+
     let status_item = MenuItem::with_id(app, "status", &status_label, false, None::<&str>)?;
     let toggle_item = MenuItem::with_id(app, "toggle_dictation", toggle_label, true, None::<&str>)?;
     let copy_item = MenuItem::with_id(app, "copy_last", "Copy last transcript", true, None::<&str>)?;
+
+    let meeting_toggle_item =
+        MenuItem::with_id(app, "toggle_meeting", meeting_toggle_label, true, None::<&str>)?;
+    let meeting_folder_item =
+        MenuItem::with_id(app, "open_meetings", "Open meetings folder", true, None::<&str>)?;
+    // Auto-detect submenu: three checked-radio-style options bound to config.
+    let auto_ask = CheckMenuItem::with_id(
+        app,
+        "meeting_auto_ask",
+        "Ask",
+        true,
+        meeting_auto == MeetingAuto::Ask,
+        None::<&str>,
+    )?;
+    let auto_auto = CheckMenuItem::with_id(
+        app,
+        "meeting_auto_auto",
+        "Auto",
+        true,
+        meeting_auto == MeetingAuto::Auto,
+        None::<&str>,
+    )?;
+    let auto_off = CheckMenuItem::with_id(
+        app,
+        "meeting_auto_off",
+        "Off",
+        true,
+        meeting_auto == MeetingAuto::Off,
+        None::<&str>,
+    )?;
+    let auto_submenu = SubmenuBuilder::new(app, "Meeting auto-detect")
+        .item(&auto_ask)
+        .item(&auto_auto)
+        .item(&auto_off)
+        .build()?;
     let settings_item = MenuItem::with_id(app, "settings", "Settings…", true, None::<&str>)?;
     let test_overlay_item =
         MenuItem::with_id(app, "test_overlay", "Test overlay", true, None::<&str>)?;
@@ -50,6 +96,10 @@ pub fn build_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
         .separator()
         .item(&toggle_item)
         .item(&copy_item)
+        .separator()
+        .item(&meeting_toggle_item)
+        .item(&meeting_folder_item)
+        .item(&auto_submenu)
         .separator()
         .item(&settings_item)
         .item(&test_overlay_item)
@@ -104,6 +154,21 @@ fn handle_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
         }
         "copy_last" => {
             copy_last_transcript(app, &state);
+        }
+        "toggle_meeting" => {
+            crate::meeting_ctl::toggle(app);
+        }
+        "open_meetings" => {
+            crate::meeting_ctl::open_folder(app);
+        }
+        "meeting_auto_ask" => {
+            crate::meeting_ctl::set_auto_mode(app, MeetingAuto::Ask);
+        }
+        "meeting_auto_auto" => {
+            crate::meeting_ctl::set_auto_mode(app, MeetingAuto::Auto);
+        }
+        "meeting_auto_off" => {
+            crate::meeting_ctl::set_auto_mode(app, MeetingAuto::Off);
         }
         "settings" => {
             crate::settings::show_settings(app);

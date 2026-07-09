@@ -291,10 +291,31 @@ Click the mic icon in the menu bar:
 | `Status: <idle/recording/…> · model <unloaded/loading…/loaded>` | Read-only status line |
 | Start/Stop dictation | Manual hands-free toggle — same effect as tapping the hotkey |
 | Copy last transcript | Puts the most recent dictation back on the clipboard |
+| Start/Stop meeting transcription (● recording) | Toggle a live meeting transcription (Zoom/Meet/Teams or any call). Stopping generates the summary and notifies "Transcript ready" |
+| Open meetings folder | Reveals `~/Documents/vzt-flow/meetings/` in Finder |
+| Meeting auto-detect ▸ Ask/Auto/Off | How VZT Flow reacts to a detected call (see below) |
 | Settings… | Opens the Settings window (hotkey rebind, permission status, history) |
 | Test overlay | Cycles the overlay through Recording→Transcribing→Done with no mic/model involved — visual QA only |
 | Launch at login | Checkbox; mirrors `tauri-plugin-autostart` |
 | Quit VZT Flow | Exits the app (this is the only path that actually terminates the process — closing all windows does not, since it's a menu-bar-only app) |
+
+### Meeting transcription (no terminal)
+
+The tray transcribes video calls without touching the terminal, and can
+**auto-detect** a Zoom/Google Meet/Microsoft Teams call:
+
+- **Ask** (default) — a notification asks you to start; click the menu-bar icon
+  → **Start meeting transcription**.
+- **Auto** — starts transcribing the moment a call is detected.
+- **Off** — no detection; use the manual toggle only.
+
+Detection is **local and titles-only** (window titles + a mic-in-use boolean —
+no screenshots, no OCR, no audio inspection, no network) and needs the **Screen
+Recording** permission (same one meeting capture uses) to read window titles.
+Muting yourself never ends a meeting; the transcript + summary land in the
+meetings folder. Hold-to-talk dictation keeps working during a meeting. Full
+details, privacy model, and the transcript format are in
+[`docs/MEETINGS.md`](./MEETINGS.md).
 
 ### Secure fields
 
@@ -514,6 +535,7 @@ Persisted at `~/.config/vzt-flow/config.toml`. Every field, with its default
 | `cleanup_timeout_max_ms` | `20000` | Absolute ceiling (ms) on the cleanup deadline regardless of input length; on miss, the raw transcript is used instead |
 | `handsfree_silence_secs` | `2.5` | Seconds of continuous sub-threshold audio (after at least one loud frame) before hands-free auto-stops |
 | `cleanup_enabled` | `true` | Set `false` to force every profile to behave as `raw` mode without editing `profiles.toml` — skips ever loading the cleanup model, for low-RAM machines. Wired into `flow-cli`'s standalone pipeline; the desktop daemon path doesn't check it yet. |
+| `meeting_auto` | `"ask"` | Meeting auto-detect behavior: `"ask"` (notify on a detected call), `"auto"` (start transcribing immediately), or `"off"` (disable). Also settable from the tray's **Meeting auto-detect** submenu. See [`docs/MEETINGS.md`](./MEETINGS.md). |
 
 The file is created with these defaults on first run if it doesn't exist.
 Most fields (notably `hotkey_keycode` and `hold_threshold_ms`) take effect

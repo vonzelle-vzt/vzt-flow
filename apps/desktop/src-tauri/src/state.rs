@@ -97,6 +97,11 @@ pub struct AppState {
     /// applies) for the current recording, set alongside `recording_started`
     /// — used to compute the overlay's last-30s warning state.
     pub recording_max_secs: Mutex<Option<u64>>,
+    /// The in-progress meeting-transcription session, if any (owned by
+    /// `meeting_ctl`). `Some` while a meeting is being transcribed; taken and
+    /// joined on stop. Independent of the dictation state machine above — a
+    /// meeting and hold-to-talk dictation can be active at the same time.
+    pub meeting_session: Mutex<Option<flow_core::meeting::MeetingHandle>>,
 }
 
 impl AppState {
@@ -133,6 +138,7 @@ impl AppState {
             hotkey_monitor_active: AtomicBool::new(false),
             recording_started: Mutex::new(None),
             recording_max_secs: Mutex::new(None),
+            meeting_session: Mutex::new(None),
         }
     }
 

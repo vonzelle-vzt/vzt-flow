@@ -15,7 +15,66 @@ action items.
 
 > macOS only. ScreenCaptureKit (system-audio capture) is a macOS 13+ framework.
 
-## Usage
+## No-terminal usage (menu-bar app)
+
+You don't need the terminal. The VZT Flow **menu-bar app** transcribes meetings
+from its tray menu, and can **auto-detect** a Zoom/Meet/Teams call and offer to
+start for you.
+
+**Tray menu items:**
+
+- **Start meeting transcription** / **Stop meeting transcription (● recording)**
+  — a single toggle. Starting captures system + mic audio (same engine as the
+  CLI) and writes the transcript live; stopping generates the summary and shows
+  a **"Transcript ready"** notification.
+- **Open meetings folder** — reveals `~/Documents/vzt-flow/meetings/` in Finder.
+- **Meeting auto-detect ▸ Ask / Auto / Off** — see below.
+
+### Auto-detect modes
+
+VZT Flow can notice when you're in a call and act automatically. The mode is set
+from the tray submenu (**Meeting auto-detect**) and stored in `config.toml` as
+`meeting_auto`:
+
+| Mode        | Behavior                                                                 |
+|-------------|--------------------------------------------------------------------------|
+| `ask` (default) | On detecting a call, shows a **notification** asking you to start. Click the menu-bar icon → **Start meeting transcription** to begin. |
+| `auto`      | On detecting a call, **starts transcribing immediately** and shows a "Transcribing meeting…" notification. |
+| `off`       | No detection. Only the manual tray toggle starts a meeting.              |
+
+When a detected meeting ends (or you stop it manually), the session stops, the
+summary is generated, and a **"Transcript ready"** notification names the file.
+
+> The "ask" prompt instructs you to click the tray item rather than offering an
+> in-notification button — the bundled notification plugin has no reliable
+> cross-version action-button/click callback, so we ship the robust path.
+
+Hold-to-talk **dictation keeps working while a meeting is being transcribed** —
+the two use independent microphone streams (macOS CoreAudio shares the input
+device across streams), so you can dictate into another app mid-call.
+
+### How detection works (privacy)
+
+Detection is **100% local and metadata-only — window titles, never pixels**. No
+screenshots, no OCR, no audio inspection, no network. It combines two cheap
+signals polled every 5 seconds:
+
+- **A meeting window is open** — the app reads on-screen window *titles* via
+  `CGWindowListCopyWindowInfo` and matches them against a small table (Zoom's
+  "Zoom Meeting" window, a browser tab titled "Meet – …" / `meet.google.com`, a
+  "Microsoft Teams" window titled with "Meeting"). Reading other apps' window
+  titles requires the **Screen Recording** permission — the same grant meeting
+  capture already needs — so detection is inactive (and logs a one-time note)
+  until it's granted.
+- **The microphone is live** — a single CoreAudio boolean
+  (`kAudioDevicePropertyDeviceIsRunningSomewhere`).
+
+A meeting is only considered active when **both** hold for two consecutive polls
+(debounced against transient matches), and only considered ended after the
+window has been gone for three consecutive polls — muting yourself (which turns
+the mic-live signal off) never ends a meeting.
+
+## Usage (CLI)
 
 ```bash
 # Start a meeting. Ctrl+C stops it and appends the summary.

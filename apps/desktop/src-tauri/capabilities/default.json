@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "Capability for the overlay and settings windows",
   "windows": ["overlay", "settings"],
-  "permissions": ["core:default"]
+  "permissions": ["core:default", "notification:default"]
 }

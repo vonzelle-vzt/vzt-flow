@@ -10,6 +10,7 @@
 //! off macOS `run` returns a clear error.
 
 pub mod dedup;
+pub mod detect;
 pub mod transcriber;
 
 #[cfg(target_os = "macos")]
@@ -17,6 +18,9 @@ mod syscapture;
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread::JoinHandle;
 
 use anyhow::{Context, Result};
 
@@ -134,6 +138,56 @@ fn parse_leading_timestamp(line: &str) -> Option<String> {
         Some(ts.to_string())
     } else {
         None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// In-process session handle (used by the desktop app's tray integration).
+// ---------------------------------------------------------------------------
+
+/// A meeting session started in-process on a background thread. Wraps the same
+/// [`run`] entry the CLI uses (with its own cooperative stop flag) so the
+/// desktop app can start/stop a session without shelling out to `flow
+/// meeting`. Purely additive over [`run`]; the CLI path is unchanged.
+pub struct MeetingHandle {
+    stop: Arc<AtomicBool>,
+    join: Option<JoinHandle<Result<PathBuf>>>,
+}
+
+/// Starts a meeting session on a background thread and returns a handle. The
+/// session captures + transcribes until [`MeetingHandle::stop`] is called,
+/// which also triggers the on-stop summary. `title`/`out_dir` mirror [`run`]'s
+/// arguments (default title `"meeting"`, default dir
+/// [`default_meetings_dir`]).
+pub fn start(title: Option<String>, out_dir: Option<PathBuf>) -> MeetingHandle {
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = stop.clone();
+    let join = std::thread::Builder::new()
+        .name("vzt-flow-meeting-session".into())
+        .spawn(move || run(title, out_dir, thread_stop))
+        .expect("failed to spawn meeting session thread");
+    MeetingHandle { stop, join: Some(join) }
+}
+
+impl MeetingHandle {
+    /// Signals the session to stop, blocks until it has flushed its tails and
+    /// generated the summary, and returns the transcript path.
+    ///
+    /// **Blocking**: summary generation can take 10-60s, so call this from a
+    /// background thread, never a UI/coordinator thread.
+    pub fn stop(mut self) -> Result<PathBuf> {
+        self.stop.store(true, Ordering::SeqCst);
+        match self.join.take() {
+            Some(j) => j
+                .join()
+                .map_err(|_| anyhow::anyhow!("meeting session thread panicked"))?,
+            None => anyhow::bail!("meeting session already stopped"),
+        }
+    }
+
+    /// Whether the session thread is still running (has not returned/panicked).
+    pub fn is_running(&self) -> bool {
+        self.join.as_ref().map(|j| !j.is_finished()).unwrap_or(false)
     }
 }
 

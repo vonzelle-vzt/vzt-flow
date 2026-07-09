@@ -15,6 +15,51 @@ pub const DEFAULT_HOTKEY_KEYCODE: u16 = 61;
 /// in-progress recording.
 pub const ESCAPE_KEYCODE: u16 = 53;
 
+/// Environment variable that overrides the config directory. Additive and
+/// useful forever (scripted/isolated runs, tests) — lets a second app
+/// instance point at its own `config.toml` / `daemon.sock` / meeting output
+/// without touching the user's real `~/.config/vzt-flow`.
+pub const CONFIG_DIR_ENV: &str = "VZT_FLOW_CONFIG_DIR";
+
+/// Auto-detect behavior for meetings (see `meeting::detect`). Serialized as
+/// the lowercase string stored in [`Config::meeting_auto`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeetingAuto {
+    /// Detect a call, then ask (via notification) before transcribing.
+    Ask,
+    /// Detect a call and start transcribing immediately.
+    Auto,
+    /// Never auto-detect; the tray's manual Start/Stop is the only path.
+    Off,
+}
+
+impl MeetingAuto {
+    /// Parses the config string, defaulting to [`MeetingAuto::Ask`] for any
+    /// unrecognized value so a typo never silently disables detection.
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" => MeetingAuto::Auto,
+            "off" => MeetingAuto::Off,
+            _ => MeetingAuto::Ask,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            MeetingAuto::Ask => "ask",
+            MeetingAuto::Auto => "auto",
+            MeetingAuto::Off => "off",
+        }
+    }
+}
+
+/// Default value for [`Config::meeting_auto`] — kept as a free fn so serde's
+/// `#[serde(default)]` populates it when an older `config.toml` predates the
+/// field.
+fn default_meeting_auto() -> String {
+    MeetingAuto::Ask.as_str().to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -71,6 +116,14 @@ pub struct Config {
     /// at the call sites that check it (see `crates/flow-cli`'s standalone
     /// pipeline; the desktop daemon path is not yet wired to this flag).
     pub cleanup_enabled: bool,
+    /// Meeting auto-detection behavior: `"ask"` (default) shows a notification
+    /// when a Zoom/Meet/Teams call is detected, `"auto"` starts transcribing
+    /// immediately, `"off"` disables detection entirely. Parsed via
+    /// [`MeetingAuto::parse`]; see `meeting::detect` for the detection logic.
+    /// `#[serde(default)]` on the struct means a `config.toml` written before
+    /// this field existed loads fine and gets `"ask"`.
+    #[serde(default = "default_meeting_auto")]
+    pub meeting_auto: String,
 }
 
 impl Default for Config {
@@ -88,7 +141,15 @@ impl Default for Config {
             cleanup_timeout_max_ms: 20_000,
             handsfree_silence_secs: 2.5,
             cleanup_enabled: true,
+            meeting_auto: default_meeting_auto(),
         }
+    }
+}
+
+impl Config {
+    /// Typed view of [`Config::meeting_auto`].
+    pub fn meeting_auto_mode(&self) -> MeetingAuto {
+        MeetingAuto::parse(&self.meeting_auto)
     }
 }
 
@@ -98,6 +159,13 @@ impl Default for Config {
 /// `~/.config` path). On Windows there is no `~/.config` convention, so we
 /// use `dirs::config_dir()` there instead, which resolves to `%APPDATA%`.
 pub fn config_dir() -> Result<PathBuf> {
+    // An explicit override wins on every platform (isolated/scripted runs,
+    // tests) — see [`CONFIG_DIR_ENV`].
+    if let Some(dir) = std::env::var_os(CONFIG_DIR_ENV) {
+        if !dir.is_empty() {
+            return Ok(PathBuf::from(dir));
+        }
+    }
     #[cfg(target_os = "macos")]
     {
         let home = dirs::home_dir().context("could not determine home directory")?;
@@ -136,5 +204,51 @@ impl Config {
         let raw = toml::to_string_pretty(self).context("failed to serialize config")?;
         fs::write(config_path()?, raw).context("failed to write config.toml")?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `config.toml` written before `meeting_auto` existed must still load,
+    /// defaulting the new field to `"ask"` (the additive-field contract).
+    #[test]
+    fn old_config_without_meeting_auto_loads_and_defaults_to_ask() {
+        let old = r#"
+            hotkey_keycode = 61
+            hotkey_label = "Right Option"
+            hold_threshold_ms = 300
+            idle_unload_secs = 300
+            max_hold_secs = 600
+            max_handsfree_secs = 600
+            launch_at_login = false
+            cleanup_timeout_ms = 2500
+            cleanup_timeout_per_char_ms = 6
+            cleanup_timeout_max_ms = 20000
+            handsfree_silence_secs = 2.5
+            cleanup_enabled = true
+        "#;
+        let cfg: Config = toml::from_str(old).expect("old config must still parse");
+        assert_eq!(cfg.meeting_auto, "ask");
+        assert_eq!(cfg.meeting_auto_mode(), MeetingAuto::Ask);
+    }
+
+    #[test]
+    fn meeting_auto_round_trips_and_parses() {
+        let mut cfg = Config::default();
+        cfg.meeting_auto = "auto".to_string();
+        let raw = toml::to_string_pretty(&cfg).unwrap();
+        let back: Config = toml::from_str(&raw).unwrap();
+        assert_eq!(back.meeting_auto_mode(), MeetingAuto::Auto);
+    }
+
+    #[test]
+    fn meeting_auto_parse_is_lenient() {
+        assert_eq!(MeetingAuto::parse("AUTO"), MeetingAuto::Auto);
+        assert_eq!(MeetingAuto::parse(" off "), MeetingAuto::Off);
+        assert_eq!(MeetingAuto::parse("ask"), MeetingAuto::Ask);
+        // Unrecognized values default to Ask, never silently disabling detection.
+        assert_eq!(MeetingAuto::parse("banana"), MeetingAuto::Ask);
     }
 }

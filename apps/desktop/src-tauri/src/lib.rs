@@ -1,6 +1,7 @@
 mod commands;
 mod coordinator;
 mod daemon;
+mod meeting_ctl;
 mod overlay;
 mod settings;
 mod state;
@@ -16,10 +17,12 @@ use tauri::Manager;
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     #[allow(unused_mut)]
-    let mut builder = tauri::Builder::default().plugin(tauri_plugin_autostart::init(
-        tauri_plugin_autostart::MacosLauncher::LaunchAgent,
-        None,
-    ));
+    let mut builder = tauri::Builder::default()
+        .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ));
 
     // Windows hold-to-talk hotkey uses this plugin (see coordinator.rs's
     // `spawn_hotkey_monitor`); macOS uses flow-core's CGEventTap instead and
@@ -82,6 +85,11 @@ pub fn run() {
             // Pre-create (hidden) so the first `show_overlay` call has no
             // window-creation latency mid-recording.
             let _ = overlay::ensure_overlay(&handle);
+
+            // Background meeting auto-detector (Zoom/Meet/Teams). Always
+            // spawned; it no-ops when `meeting_auto = "off"` and reads the
+            // mode live so the tray submenu takes effect immediately.
+            meeting_ctl::spawn_detector(handle.clone());
 
             Ok(())
         })
