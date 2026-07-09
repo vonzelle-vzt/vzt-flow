@@ -15,8 +15,11 @@ hard way.
 ## Before you start
 
 - `git pull --rebase` first. This is a **shared worktree** — other agents
-  may have uncommitted WIP in tracked files. Never `git stash` or
-  `git add -A`; stage only the files you intentionally changed.
+  may have uncommitted WIP in tracked files. Never `git stash`, `git add -A`,
+  or `git add .`; a broad add **sweeps another agent's in-flight files into
+  your commit**. Stage by explicit pathspec only — name each file you changed
+  on the `git add` line, never a wildcard/directory. Leave
+  `.claude/agent-memory/` and `.claude/worktrees/` untracked.
 - If you're given FILES_IN_SCOPE, treat it as a hard boundary — if the task
   needs a file outside it, stop and report the conflict rather than
   expanding scope.
@@ -32,6 +35,18 @@ hard way.
   Parakeet engine has no internal chunking and memory grows
   faster-than-linear with length (measured: ~15GB/49s, ~37GB/93s, OOM at
   ~146s). Route long audio through `crates/flow-core/src/chunking.rs`.
+- **Long-audio latency *and* memory are already solved — extend, don't
+  reinvent.** `crates/flow-core/src/chunking.rs` bounds peak memory;
+  `crates/flow-core/src/rolling.rs` bounds release latency by transcribing
+  silence-completed chunks *during* recording (measured: end-latency
+  25.15s → 0.53s on a 465s clip). Reuse `plan_cut`/seam-dedup from the
+  chunker rather than writing a parallel cutter.
+- **Windows named-pipe recv-timeout is unsupported on CI runners.** The
+  Windows daemon transport (`crates/flow-core/src/ipc.rs::windows`) must
+  tolerate `set_recv_timeout` failing on named-pipe client streams (GitHub
+  windows-2025 rejects it) — log and fall back to a blocking read, don't hard-
+  error; callers gate on `is_alive` first. Also don't add a recv-timeout-
+  dependent test to `ipc::windows_tests` expecting it to hold on the runner.
 - **Never detach an LLM generation thread** — cleanup racing against the
   deadline must cancel+join on timeout, or a slow generation leaks a live
   Metal context.

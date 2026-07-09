@@ -55,7 +55,13 @@ internal chunking (`supports_streaming: false`). Measured on this repo's M5:
 `.transcribe()` on >60s of audio directly** — route long audio through the
 chunked path (`crates/flow-core/src/chunking.rs`) instead. See
 [docs/PRD.md](docs/PRD.md#memory-budget-including-the-quadratic-asr-lesson)
-for the full numbers.
+for the full numbers. **Long-audio latency is handled separately from
+memory** by `crates/flow-core/src/rolling.rs`: it transcribes
+silence-completed chunks *during* recording (reusing the chunker's `plan_cut`
++ seam-dedup) so only the final <35s tail runs at release (measured: end-
+latency 25.15s → 0.53s on a 465s clip). Both the memory ceiling (chunking)
+and the release-latency wall (rolling) are already solved — don't reinvent
+either; extend them.
 
 **(c) SCK `CMSampleBuffer` audio needs `make_data_ready()`.** ScreenCaptureKit
 system-audio capture (`crates/flow-core/src/meeting/syscapture.rs`) will
@@ -79,6 +85,17 @@ bounding a shell command instead of GNU `timeout(1)`:
 perl -e 'alarm 30; exec @ARGV' -- <command> <args...>
 ```
 
+**(g) `interprocess` named-pipe `set_recv_timeout` is unsupported on Windows
+CI runners.** The Windows daemon transport (`crates/flow-core/src/ipc.rs`,
+`pub mod windows`) opens a named pipe at `\\.\pipe\vzt-flow-daemon`. GitHub's
+windows-2025 runners reject `set_recv_timeout` on named-pipe *client* streams
+("failed to set read timeout"), which broke `flow status`/`toggle`/`listen`
+at the first daemon call and hung/failed the `ipc::windows_tests`. The fix is
+a **blocking-read degradation**: log and continue if `set_recv_timeout`
+errors — callers already gate on `is_alive` first, so an unanswerable pipe is
+caught before the read rather than by a timeout. Don't turn that into a hard
+error, and don't assume a recv-timeout is available on any named-pipe stream.
+
 ## Verification norms
 
 - **Test with real TTS audio**, not silence/noise: `say -o /tmp/clip.aiff
@@ -99,7 +116,12 @@ perl -e 'alarm 30; exec @ARGV' -- <command> <args...>
 ## Shared-worktree hygiene
 
 Multiple agents may be working in `~/vzt-flow` concurrently. Never
-`git stash` or `git add -A` — another agent's uncommitted WIP can be sitting
-in the same tracked files and either command can interleave or clobber it.
-`git pull --rebase` before pushing; stage only the specific files you
-intentionally changed.
+`git stash` or `git add -A`/`git add .` — another agent's uncommitted WIP can
+be sitting in the same tracked files, and a broad `git add` will **sweep
+their in-flight files into your commit** (this has happened here — the Linux
+port had to ship a combined green tree because isolating hunks risked
+destroying a parallel agent's WIP). **Stage by explicit pathspec only** —
+name each file you intentionally changed on the `git add` line, never a
+wildcard or directory. `git pull --rebase` before pushing; never force-push.
+Note `.claude/agent-memory/` and `.claude/worktrees/` are expected untracked
+noise — leave them, and never `git add` them.

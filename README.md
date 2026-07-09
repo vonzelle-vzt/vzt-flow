@@ -67,6 +67,19 @@ meter while **Recording**, a mode badge (raw/clean/polish/code) while
 for non-fatal issues ("Secure field — transcript on clipboard", "No
 Accessibility permission", "Microphone disconnected").
 
+Two safety nets sit on the input path. Right Option is macOS's
+special-character modifier (Option+e = ´, Option+n = ˜, …), so holding it and
+pressing **any other key** is treated as typing, not push-to-talk: the
+*accidental-press guard* suppresses the hands-free toggle and discards any
+recording already started, while the typed character still reaches the app
+(the hotkey tap is `ListenOnly`, so it never swallows the keystroke). And
+after each synthetic Cmd+V, *paste verification* reads the focused field via
+the Accessibility API (~150ms later); if the field is readable and the
+transcript tail is missing, the paste is retried once, then (still missing)
+left on the clipboard with a "paste may have failed" overlay. Unreadable
+fields — most web/Electron/secure inputs — are assumed successful (prior
+behavior), and the whole check is bounded under 400ms.
+
 ### On-device ASR: Parakeet TDT 0.6B v3
 
 Speech-to-text runs through [transcribe-rs](https://github.com/cjpais/transcribe-rs)
@@ -96,6 +109,20 @@ inside the 10-minute cap. The cleanup-LLM deadline scales with transcript
 length too (`cleanup_timeout_ms` base + `cleanup_timeout_per_char_ms` per
 character, capped at `cleanup_timeout_max_ms`), and the overlay pill shows a
 running mm:ss timer with an amber warning in the last 30s before the cap.
+
+**Rolling transcription** takes long holds one step further: instead of
+waiting for release to transcribe everything, each silence-completed ~30s
+chunk is transcribed *while you're still talking* (on the same engine,
+reusing the chunker's cut points and seam-dedup), so at release only the
+final <35s tail remains. Measured on a real ~7¾-minute (465s) M5 clip, the
+transcript pastes **~0.5s after you release the key instead of ~25s**
+(0.53s vs. 25.15s — an identical 7745-char transcript, just with the work
+moved off the critical path; peak RSS stays ONNX-inference-bound, unchanged).
+A subdued live-preview line in the pill shows the raw tail as it accrues. On
+by default (`rolling_transcription`); recordings under ~35s are unaffected
+(no chunks to roll, single transcribe at release). See
+`crates/flow-core/src/rolling.rs`; exercise it on any wav with the hidden
+`flow rolling-test <file>`.
 
 ### Meeting transcription: local, dual-stream, speaker-labelled
 
@@ -209,7 +236,12 @@ flow doctor                            # environment/model/daemon diagnostics
 with a fully standalone fallback (capture/transcribe/cleanup, no daemon
 required) — see [CLI reference](docs/USAGE-macOS.md#cli-reference) for the
 complete command list, including the hidden diagnostic commands
-(`paste-test`, `clean-test`, `code-test`).
+(`paste-test`, `clean-test`, `code-test`). On **Windows** the same daemon
+path now runs over a native named pipe (`\\.\pipe\vzt-flow-daemon`), so
+`flow status`/`toggle`/`cancel`/`listen` and the MCP server are daemon-first
+there too — CI-unit-tested (a real pipe connect + status round trip), though
+the full desktop-app-as-daemon path is still unverified on real Windows
+hardware.
 
 ### Resource discipline
 
@@ -231,6 +263,22 @@ curl -fsSL https://raw.githubusercontent.com/vonzelle-vzt/vzt-flow/main/scripts/
 Downloads the latest GitHub Release, installs `VZT Flow.app` to
 `/Applications`, the `flow` CLI to a PATH directory, and registers the MCP
 server with `claude mcp add` if the `claude` CLI is present.
+
+### macOS: Homebrew
+
+```bash
+brew install --cask vonzelle-vzt/vzt/vzt-flow
+```
+
+Installs `VZT Flow.app` from the
+[vonzelle-vzt/homebrew-vzt](https://github.com/vonzelle-vzt/homebrew-vzt) tap
+(Apple Silicon or Intel `.dmg` auto-selected by arch). Some Homebrew versions
+refuse to install a cask from a third-party tap that isn't marked trusted —
+if `brew install --cask` errors on that, run `brew trust --cask
+vonzelle-vzt/vzt/vzt-flow` first, then re-run the install. The cask installs
+the menu-bar app only; run the one-liner above afterward for the `flow` CLI +
+MCP server (it detects the brew-installed app and won't overwrite it). See
+`brew info --cask vzt-flow` for the first-run permission/model-download notes.
 
 ### Manual: download from Releases
 
@@ -289,9 +337,11 @@ this build works around.
 
 > [!WARNING]
 > Compiles and is CI-built on every push, but **has never been run on real
-> Windows hardware**. No daemon socket, no per-app profiles, no
-> `clean`/`polish` cleanup LLM yet, Ctrl+V paste with no secure-field
-> detection. Default hotkey is **Ctrl+Shift+Space**.
+> Windows hardware**. The daemon control socket now works over a Windows
+> named pipe (`\\.\pipe\vzt-flow-daemon`) — CI-unit-tested, but the full
+> desktop-app-as-daemon round trip is unverified on real hardware. Still no
+> per-app profiles, no `clean`/`polish` cleanup LLM yet, Ctrl+V paste with no
+> secure-field detection. Default hotkey is **Ctrl+Shift+Space**.
 
 ```powershell
 cargo build --release -p flow-cli
@@ -336,7 +386,7 @@ source steps: [docs/USAGE-Linux.md](docs/USAGE-Linux.md).
 |---|---|---|
 | macOS Apple Silicon (`aarch64-apple-darwin`) | **Supported, tested** | Primary dev platform (M5 MacBook Air); Metal cleanup + CoreML ASR |
 | macOS Intel (`x86_64-apple-darwin`) | Built in CI, CPU-only inference | Never run on real Intel hardware; effective floor is macOS **13.3**, not the 12.0 in `tauri.conf.json` — see [USAGE-macOS.md](docs/USAGE-macOS.md#hardware-requirements) |
-| Windows x64 (`x86_64-pc-windows-msvc`) | Built in CI, experimental | Never run on real Windows hardware; no daemon/profiles/cleanup LLM yet |
+| Windows x64 (`x86_64-pc-windows-msvc`) | Built in CI, experimental | Never run on real Windows hardware; daemon control socket now works over a named pipe (CI-unit-tested); still no per-app profiles/cleanup LLM |
 | Windows Arm (`aarch64-pc-windows-msvc`) | Attempted in CI, allowed to fail | Status depends on upstream (`ort`, WebView2-on-Arm) support this week — check the latest `build` workflow run |
 | Linux x64 (`x86_64-unknown-linux-gnu`) | Built + CI-tested, experimental | Never run on real Linux hardware. `.deb` + `.AppImage` in CI. **X11**: hotkey/paste/tray/overlay all work as designed. **Wayland**: degraded — no global hotkey across native apps, clipboard-only paste, best-effort overlay (Wayland denies clients global input grabs). No cleanup LLM / profiles / meeting mode (as Windows). See [USAGE-Linux.md](docs/USAGE-Linux.md) |
 
@@ -413,8 +463,8 @@ require a restart: [docs/USAGE-macOS.md#config-reference-configtoml](docs/USAGE-
 
 ## Roadmap
 
-- Windows daemon socket + per-app profiles + `clean`/`polish` cleanup LLM
-  (all currently macOS-only)
+- Windows per-app profiles + `clean`/`polish` cleanup LLM (still macOS-only;
+  the daemon control socket already works on Windows over a named pipe)
 - Real-hardware validation on Windows (everything today is CI-built, never
   hand-tested — see [docs/USAGE-Windows.md](docs/USAGE-Windows.md))
 - Apple's on-device `SpeechAnalyzer` as an alternate ASR engine option
