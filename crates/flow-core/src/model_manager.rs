@@ -5,7 +5,8 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use crate::engine::{ParakeetTranscriber, Transcript, Transcriber};
+use crate::chunking::transcribe_long;
+use crate::engine::{ParakeetTranscriber, Transcript};
 
 pub enum ModelCommand {
     Transcribe {
@@ -68,8 +69,11 @@ pub fn spawn(
                         // thread — that would wedge every future dictation in
                         // Transcribing forever. Catch it, reply Err, and drop
                         // the transcriber so the next command reloads cleanly.
+                        // `transcribe_long` chunks multi-minute audio so the
+                        // engine's quadratic memory growth can't OOM-kill the
+                        // daemon; ≤35s clips still take the single-pass path.
                         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            transcriber.transcribe(&samples)
+                            transcribe_long(&samples, transcriber)
                         }));
                         let infer_time = started.elapsed();
                         match result {

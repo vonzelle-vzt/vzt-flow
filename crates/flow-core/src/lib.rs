@@ -1,4 +1,5 @@
 pub mod audio;
+pub mod chunking;
 pub mod cleanup;
 pub mod cleanup_manager;
 pub mod codemode;
@@ -17,6 +18,7 @@ pub mod profiles;
 pub mod snippets;
 
 pub use audio::{AudioCommand, AudioRecorder, AudioReply};
+pub use chunking::transcribe_long;
 pub use config::Config;
 pub use engine::{ParakeetTranscriber, Transcript, TranscriptSegment, Transcriber};
 pub use models::{model_root_dir, parakeet_model_dir, ModelStatus};

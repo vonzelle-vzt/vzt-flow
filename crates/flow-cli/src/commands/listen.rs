@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use flow_core::ipc::Request;
-use flow_core::{dictionary, parakeet_model_dir, AudioRecorder, ParakeetTranscriber, Transcriber};
+use flow_core::{dictionary, parakeet_model_dir, transcribe_long, AudioRecorder, ParakeetTranscriber};
 
 use super::daemon_client;
 
@@ -53,7 +53,8 @@ fn run_standalone(mode: Option<String>, max_secs: Option<u64>) -> Result<()> {
     eprintln!("[vzt-flow] model load time: {:.2}s", engine.load_time.as_secs_f64());
 
     let started = Instant::now();
-    let transcript = engine.transcribe(&samples)?;
+    // Chunk long recordings so a several-minute hold doesn't OOM the engine.
+    let transcript = transcribe_long(&samples, &mut engine)?;
     let elapsed = started.elapsed();
     let rtf = if duration.as_secs_f64() > 0.0 { elapsed.as_secs_f64() / duration.as_secs_f64() } else { 0.0 };
     eprintln!(

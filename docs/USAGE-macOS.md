@@ -252,14 +252,21 @@ VZT Flow needs three grants, all in **System Settings → Privacy & Security**:
   whatever was captured — it isn't discarded. The overlay pill shows a
   running mm:ss elapsed timer while recording, and switches to a subtle
   amber warning appearance in the last 30s before the cap.
-  > **Known limitation:** the bundled Parakeet ASR engine has no internal
-  > audio chunking (`supports_streaming: false` in transcribe-rs), so very
-  > long single recordings can hit steep, faster-than-linear memory growth
-  > well before the 10min cap — measured on an M5 Mac: ~15GB peak for 49s of
-  > audio, ~37GB for 93s, and an out-of-memory kill for a ~146s (2m26s) clip.
-  > A ~7min clip failed outright with a CoreML "dynamically resizing for
-  > sequence length" error. If you hit a crash/hang on a long hold, keep
-  > sessions under ~90s until the ASR pipeline gains chunking support.
+  > **Long recordings are handled via automatic chunking** (since commit
+  > `PLACEHOLDER_COMMIT`). The bundled Parakeet ASR engine has no internal
+  > streaming (`supports_streaming: false` in transcribe-rs) and its memory
+  > use grows faster than linearly — ≈quadratically — in the length of a
+  > single `transcribe` call: measured on an M5 Mac, ~15.6GB peak for 49s of
+  > audio, ~37GB for 93s, and an out-of-memory kill at ~146s (2m26s). To keep
+  > that behavior from ever reaching the engine, recordings longer than ~35s
+  > are transparently split into ~30s chunks (cut at the quietest point of a
+  > 25–35s window, so seams land in natural pauses) and transcribed one after
+  > another on the same engine, bounding peak memory to a single chunk's
+  > footprint. A ~7min (438s) clip now completes in ~32s (RTF ~0.07) with a
+  > peak of ~8.9GB — comfortably within the 10min (`max_hold_secs`) cap. See
+  > `crates/flow-core/src/chunking.rs`. The underlying transcribe-rs quadratic
+  > memory growth is unchanged upstream; the chunker is what makes the raised
+  > cap safe, so there is no longer a reason to keep long holds under ~90s.
 - Rebind the key from the Settings window (tray → **Settings…**).
 
 ### Overlay pill

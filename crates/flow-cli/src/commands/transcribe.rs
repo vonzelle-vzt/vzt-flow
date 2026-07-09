@@ -2,7 +2,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use anyhow::Result;
-use flow_core::{dictionary, parakeet_model_dir, ParakeetTranscriber, Transcriber};
+use flow_core::{dictionary, parakeet_model_dir, transcribe_long, ParakeetTranscriber};
 
 use super::listen::apply_standalone_pipeline;
 use super::load_audio_as_f32;
@@ -18,7 +18,9 @@ pub fn run(file: &Path, mode: Option<&str>) -> Result<()> {
     println!("Model load time: {:.2}s", engine.load_time.as_secs_f64());
 
     let started = Instant::now();
-    let transcript = engine.transcribe(&samples)?;
+    // Route through the chunker so multi-minute clips don't OOM the engine;
+    // audio ≤35s still takes the single-pass path inside `transcribe_long`.
+    let transcript = transcribe_long(&samples, &mut engine)?;
     let elapsed = started.elapsed();
 
     let rtf = if duration.as_secs_f64() > 0.0 {

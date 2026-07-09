@@ -125,9 +125,11 @@ pub fn truncate_for_summary(transcript: &str, max_chars: usize) -> (String, bool
     (tail, true)
 }
 
-/// Root-mean-square energy of a frame. Local copy (the one in `audio.rs` is
-/// private to that module) so this module has no cross-module coupling.
-fn rms(frame: &[f32]) -> f32 {
+/// Root-mean-square energy of a frame. Shared with the long-form dictation
+/// chunker (`crate::chunking`), which reuses this module's RMS-frame helpers
+/// and thresholds rather than re-implementing them. (The copy in `audio.rs`
+/// stays private to that module.)
+pub(crate) fn rms(frame: &[f32]) -> f32 {
     if frame.is_empty() {
         return 0.0;
     }
