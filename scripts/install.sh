@@ -34,9 +34,26 @@ if [ "$(uname -s)" != "Darwin" ]; then
 fi
 
 ARCH="$(uname -m)"
-if [ "$ARCH" != "arm64" ]; then
-  die "VZT Flow currently ships Apple Silicon (arm64) builds only — detected: $ARCH"
-fi
+case "$ARCH" in
+  arm64)
+    DMG_PATTERN="*aarch64*.dmg"
+    CLI_PATTERN="vzt-flow-cli-macos-aarch64.tar.gz"
+    ;;
+  x86_64)
+    # Intel Mac: CPU-only inference (no Metal/CoreML) — see the README
+    # hardware compat matrix. Built and packaged in CI, cross-compiled from
+    # an arm64 runner; not verified on real Intel hardware.
+    warn "Intel Mac detected — CPU-only inference (no Metal/CoreML), slower than Apple Silicon. See README for details."
+    # Tauri names the x86_64 dmg with "x64", not "x86_64" (see
+    # tauri-bundler's dmg/mod.rs: Arch::X86_64 => "x64") — e.g.
+    # "VZT Flow_0.1.0_x64.dmg". The CLI tarball name is ours, not Tauri's.
+    DMG_PATTERN="*_x64.dmg"
+    CLI_PATTERN="vzt-flow-cli-macos-x86_64.tar.gz"
+    ;;
+  *)
+    die "unsupported macOS architecture: $ARCH (VZT Flow ships arm64 and x86_64 builds only)"
+    ;;
+esac
 
 WORKDIR="$(mktemp -d)"
 cleanup() { rm -rf "$WORKDIR"; }
@@ -110,13 +127,16 @@ fetch_asset() {
 
 # --- download release assets ----------------------------------------------
 
-log "fetching latest release assets for ${REPO}"
-fetch_asset "*.dmg"
-fetch_asset "vzt-flow-cli-macos-aarch64.tar.gz"
+log "fetching latest release assets for ${REPO} (arch: $ARCH)"
+# Two .dmg assets ship per release (aarch64 + x86_64) — fetch the one
+# matching this machine's arch specifically, not a bare "*.dmg" glob, or
+# we'd risk grabbing the wrong one when both are present in $WORKDIR.
+fetch_asset "$DMG_PATTERN"
+fetch_asset "$CLI_PATTERN"
 
 DMG_PATH="$(find "$WORKDIR" -maxdepth 1 -name '*.dmg' | head -n1)"
 [ -n "$DMG_PATH" ] || die "download succeeded but no .dmg found in $WORKDIR"
-TARBALL_PATH="$WORKDIR/vzt-flow-cli-macos-aarch64.tar.gz"
+TARBALL_PATH="$WORKDIR/$CLI_PATTERN"
 [ -f "$TARBALL_PATH" ] || die "download succeeded but CLI tarball not found in $WORKDIR"
 
 # --- install the .app -----------------------------------------------------

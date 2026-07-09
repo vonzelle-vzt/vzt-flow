@@ -64,8 +64,90 @@ open ./vzt-flow-dmg/*.dmg
 Via the Actions UI: open the repo → **Actions** → **build** → pick a green
 run → scroll to **Artifacts** → download `vzt-flow-macos-aarch64-dmg`.
 
-This is an Intel-incompatible **aarch64 (Apple Silicon) only** build — CI
-does not currently produce an `x86_64-apple-darwin` bundle.
+An Intel Mac build is also produced, as artifact `vzt-flow-macos-x86_64-dmg`
+(dmg named `VZT Flow_0.1.0_x64.dmg` by Tauri's own arch-naming convention —
+see [Hardware requirements](#hardware-requirements) below for what's
+different about it).
+
+### Building from source on Intel (x86_64-apple-darwin)
+
+`ort` (the ONNX Runtime bindings `transcribe-rs` uses for Parakeet) ships
+**no prebuilt binaries for `x86_64-apple-darwin`** — verified directly:
+`cargo check --target x86_64-apple-darwin` fails with `ort does not provide
+prebuilt binaries for the target x86_64-apple-darwin`. The workaround is to
+link against Microsoft's own official ONNX Runtime release for that target
+instead of `ort`'s prebuilt-binary CDN:
+
+```bash
+curl -fsSL -o ort-x64.tgz \
+  https://github.com/microsoft/onnxruntime/releases/download/v1.22.0/onnxruntime-osx-x86_64-1.22.0.tgz
+mkdir -p /tmp/ort-x64 && tar xzf ort-x64.tgz -C /tmp/ort-x64 --strip-components=1
+
+export ORT_STRATEGY=system
+export ORT_PREFER_DYNAMIC_LINK=1
+export ORT_LIB_PATH=/tmp/ort-x64/lib
+
+cargo build --release --target x86_64-apple-darwin -p flow-cli
+```
+
+That builds and links cleanly (confirmed locally), but the resulting binary
+references `libonnxruntime.dylib` via `@rpath` with no `LC_RPATH` entry set
+(the `system` linking strategy doesn't add one), so it won't find the dylib
+at runtime unless you either add an rpath yourself
+(`install_name_tool -add_rpath <dir-containing-the-dylib> <binary>`) or put
+`libonnxruntime.*.dylib` on `DYLD_LIBRARY_PATH`. The CI build
+(`.github/workflows/build.yml`'s `macos-x64` job) does this automatically
+and bundles the dylib into the `.app`/CLI tarball, which is the easier path
+for most people — see [Option B](#option-b-grab-the-ci-built-dmg-from-github-actions)
+above.
+
+## Hardware requirements
+
+| | Apple Silicon | Intel (x86_64) |
+|---|---|---|
+| ASR (Parakeet) | CoreML execution provider (ANE-accelerated) | Plain CPU ONNX — no CoreML |
+| Cleanup (`clean`/`polish`, Qwen3) | Metal-offloaded llama.cpp | CPU-only llama.cpp build (no `metal` feature — see `crates/flow-core/Cargo.toml`'s `target_arch` split) |
+| Status | Actively developed and tested (this repo's own dev hardware is an M5 MacBook Air) | Built and packaged by CI (`macos-x64` job), cross-compiled from an arm64 runner — never run on real Intel hardware; community testing welcome |
+| Minimum OS | macOS 12.0 (`tauri.conf.json`'s `minimumSystemVersion`) | **Effectively macOS 13.3**, not 12.0 — verified via `otool -l` on Microsoft's official `onnxruntime-osx-x86_64-1.22.0` dylib (`LC_BUILD_VERSION`'s `minos` is `13.3`). The app's `Info.plist` still says 12.0 (that value isn't arch-specific in `tauri.conf.json`), but dyld will refuse to load the bundled ONNX Runtime dylib below 13.3, so the Intel build's real floor is higher than what it advertises. Not yet fixed — would need a per-target Tauri config override. |
+
+**Honest performance estimate for Intel:** CPU-only int8 Parakeet is
+typically still faster than realtime on modern x86_64 (roughly 5-10x
+realtime is a reasonable estimate for a recent Intel Mac, vs. the ~10x this
+repo measures on Apple Silicon with CoreML — see the README's ASR section
+for the measured number), but cleanup is meaningfully slower without Metal:
+a 1.7B-parameter model decoding on CPU alone is commonly single-digit
+tokens/sec rather than the ~40-60 tok/s this repo measures on M5 with
+Metal. On an older/lower-end Intel Mac, that likely means `clean`/`polish`
+routinely miss the cleanup deadline and fall back to the raw transcript
+(harmless — dictation still works, just without the LLM rewrite) — consider
+setting `cleanup_enabled = false` in `config.toml` (see below), or using
+`raw`/`code` mode via `profiles.toml`, on older Intel hardware rather than
+paying the load-and-usually-timeout cost every dictation.
+
+**Memory footprint** (measured on this repo's dev machine — an M5
+MacBook Air — via `ps`; Intel figures are the same models/runtime and
+should be architecturally similar, not independently measured):
+- **Idle** (both models unloaded, the common steady state after
+  `idle_unload_secs` of inactivity): **~30-40MB RSS** for the desktop app
+  process — verified directly against the running dev build (`ps -o rss`
+  on `vzt-flow-desktop`, no models loaded).
+- **During dictation with ASR loaded**: roughly **~2GB**, engineering
+  estimate from the Parakeet int8 ONNX model's ~456MB on-disk footprint
+  plus ONNX Runtime session/execution-provider overhead — not independently
+  re-measured for this pass.
+- **During dictation with cleanup also loaded** (`clean`/`polish` mode):
+  roughly **~3.5GB**, estimate adding the ~1.1GB Qwen3 GGUF plus its 8192-
+  token llama.cpp context allocation on top of the ASR figure above.
+- **Disk**: ~2.5GB total for both models combined (456MB Parakeet archive +
+  1.1GB Qwen3 GGUF, plus some overhead for the extracted/staged files).
+
+**8GB Mac note:** VZT Flow works on an 8GB machine, Apple Silicon or Intel.
+The cleanup model is the biggest optional cost — skip installing it
+entirely (just never run `flow models download cleanup`) to stay ASR-only
+and avoid the ~3.5GB peak, or install it but set `cleanup_enabled = false`
+in `config.toml` (`~/.config/vzt-flow/config.toml`) to keep the file
+present without ever loading it. Either way, `raw`/`code` mode dictation is
+completely unaffected — only `clean`/`polish` need the cleanup model.
 
 ## First run: model downloads
 
@@ -163,9 +245,21 @@ VZT Flow needs three grants, all in **System Settings → Privacy & Security**:
   whatever app is frontmost; only its "cancel recording" *effect* is gated
   on whether a recording is active.
 - Recording is hard-capped so a stuck key or wedged hands-free session can
-  never run forever: **120s** for a held recording (`max_hold_secs`), **300s**
-  for hands-free (`max_handsfree_secs`). Hitting the cap auto-stops and
-  transcribes whatever was captured — it isn't discarded.
+  never run forever: **600s (10min)** for both a held recording
+  (`max_hold_secs`) and hands-free (`max_handsfree_secs`) — sized for
+  long-form dictation (holding the key for several minutes at a stretch),
+  not just short commands. Hitting the cap auto-stops and transcribes
+  whatever was captured — it isn't discarded. The overlay pill shows a
+  running mm:ss elapsed timer while recording, and switches to a subtle
+  amber warning appearance in the last 30s before the cap.
+  > **Known limitation:** the bundled Parakeet ASR engine has no internal
+  > audio chunking (`supports_streaming: false` in transcribe-rs), so very
+  > long single recordings can hit steep, faster-than-linear memory growth
+  > well before the 10min cap — measured on an M5 Mac: ~15GB peak for 49s of
+  > audio, ~37GB for 93s, and an out-of-memory kill for a ~146s (2m26s) clip.
+  > A ~7min clip failed outright with a CoreML "dynamically resizing for
+  > sequence length" error. If you hit a crash/hang on a long hold, keep
+  > sessions under ~90s until the ASR pipeline gains chunking support.
 - Rebind the key from the Settings window (tray → **Settings…**).
 
 ### Overlay pill
@@ -224,9 +318,16 @@ Four pipeline modes, resolved per-app via `profiles.toml`:
 | `code` | Deterministic, no-LLM transform of spoken code syntax into real punctuation/casing (see [Code mode](#code-mode-spoken-form-reference) below) |
 
 `clean`/`polish` are deadline-bound: if the LLM hasn't produced output within
-`cleanup_timeout_ms` (2500ms default), the raw (dictionary-corrected)
-transcript is pasted instead — cleanup is never allowed to add unbounded
-latency to a dictation.
+a computed deadline, the raw (dictionary-corrected) transcript is pasted
+instead — cleanup is never allowed to add unbounded latency to a dictation.
+The deadline scales with input length rather than being a flat value:
+`cleanup_timeout_ms` (2500ms base) + `cleanup_timeout_per_char_ms` (6ms
+default) per character of input, capped at `cleanup_timeout_max_ms` (20000ms
+default) so even a very long dictation can't make you wait more than 20s for
+the LLM. A one-sentence dictation gets a deadline close to the 2.5s base; a
+multi-minute ramble (many hundreds of words) hits the 20s cap and, if the LLM
+hasn't finished by then, falls back to the raw transcript rather than
+blocking further.
 
 ### `profiles.toml`
 
@@ -398,11 +499,14 @@ Persisted at `~/.config/vzt-flow/config.toml`. Every field, with its default
 | `hotkey_label` | `"Right Option"` | Human-readable label shown in Settings |
 | `hold_threshold_ms` | `300` | Minimum hold duration (ms) before a press counts as "hold" rather than a tap that toggles hands-free |
 | `idle_unload_secs` | `300` | Seconds of transcriber/cleanup-model inactivity before it's unloaded from memory |
-| `max_hold_secs` | `120` | Hard cap (seconds) on a single hold-to-talk recording |
-| `max_handsfree_secs` | `300` | Hard cap (seconds) on a single hands-free recording |
+| `max_hold_secs` | `600` | Hard cap (seconds) on a single hold-to-talk recording (10min, for long-form dictation) |
+| `max_handsfree_secs` | `600` | Hard cap (seconds) on a single hands-free recording |
 | `launch_at_login` | `false` | Mirrors `tauri-plugin-autostart` state |
-| `cleanup_timeout_ms` | `2500` | Hard deadline (ms) for the LLM cleanup pass; on miss, the raw transcript is used instead |
+| `cleanup_timeout_ms` | `2500` | Base component (ms) of the LLM cleanup deadline; see `cleanup_timeout_per_char_ms` |
+| `cleanup_timeout_per_char_ms` | `6` | Additional cleanup deadline (ms) granted per character of input, so long dictations get a longer window |
+| `cleanup_timeout_max_ms` | `20000` | Absolute ceiling (ms) on the cleanup deadline regardless of input length; on miss, the raw transcript is used instead |
 | `handsfree_silence_secs` | `2.5` | Seconds of continuous sub-threshold audio (after at least one loud frame) before hands-free auto-stops |
+| `cleanup_enabled` | `true` | Set `false` to force every profile to behave as `raw` mode without editing `profiles.toml` — skips ever loading the cleanup model, for low-RAM machines. Wired into `flow-cli`'s standalone pipeline; the desktop daemon path doesn't check it yet. |
 
 The file is created with these defaults on first run if it doesn't exist.
 Most fields (notably `hotkey_keycode` and `hold_threshold_ms`) take effect
@@ -459,10 +563,14 @@ Hidden diagnostic commands (not shown in `--help`, but real and useful):
 
 ```
 flow paste-test "<text>"          # exercises save/set/[Cmd+V]/restore in isolation
-flow clean-test "<text>" [--mode clean|polish] [--timeout-ms 2500]
+flow clean-test "<text>" [--mode clean|polish] [--timeout-ms <ms>]
                                    # runs the LLM cleanup pass standalone, reporting
                                    # model-load time, warm-up time, and which path won
-                                   # (llm vs. deadline/raw fallback)
+                                   # (llm vs. deadline/raw fallback). --timeout-ms
+                                   # defaults to the same length-scaled deadline formula
+                                   # the app uses (base + per-char, capped) rather than
+                                   # a flat value; pass it explicitly to force a specific
+                                   # deadline, e.g. a tiny one to test the raw fallback.
 flow code-test "<text>"           # runs the deterministic code-mode transform, no mic/model
 ```
 
@@ -493,7 +601,7 @@ resolver checks `FLOW_BIN`, then `~/vzt-flow/target/release/flow`, then bare
 
 | Tool | Args | Behavior |
 |---|---|---|
-| `listen` | `mode` (raw/clean/polish/code, default `clean`), `max_seconds` (default `120`) | Records from the mic and returns the transcribed, cleaned text |
+| `listen` | `mode` (raw/clean/polish/code, default `clean`), `max_seconds` (default `120`, up to `600`) | Records from the mic and returns the transcribed, cleaned text |
 | `transcribe_file` | `path` (absolute path) | Transcribes an existing audio file through dictionary correction |
 | `dictation_history` | `n` (default `10`) | Returns recent dictation history entries |
 

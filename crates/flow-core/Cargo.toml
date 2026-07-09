@@ -26,6 +26,9 @@ arboard = "3"
 enigo = "0.6"
 strsim = "0.11"
 encoding_rs = "0.8"
+# Local-time formatting for meeting transcript filenames/headers. Already in
+# the dependency tree transitively; pinned here as a direct dep for meeting mode.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
@@ -35,10 +38,27 @@ objc2-application-services = "0.3"
 core-foundation = "0.10"
 # `hotkey.rs`'s CGEventTap monitor is macOS-only (see its module docs).
 core-graphics = "0.25"
+# Meeting mode: system/app audio capture via Apple's ScreenCaptureKit
+# (audio-only SCStream). macOS 13+; safe Rust bindings (v8, current 2026-06).
+screencapturekit = "8"
+
+# Apple Silicon: llama.cpp's Metal backend is what makes cleanup fast
+# (~0.3s warm generation on M-series). It's arm64-oriented (Apple's GPU
+# family on Intel Macs is a different, much smaller install base and
+# llama.cpp's Metal kernels aren't tuned/tested for it) and CoreML's ANE
+# acceleration for transcribe-rs's ONNX backend is Apple-Silicon-only too.
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
 llama-cpp-2 = { version = "0.1", features = ["metal"] }
 # CoreML execution provider for transcribe-rs's ONNX backend (see the
 # comment on the base `transcribe-rs` dependency above).
 transcribe-rs = { version = "0.3", features = ["ort-coreml"] }
+
+# Intel Mac: no Metal, no CoreML — both ASR (ONNX, plain CPU EP) and
+# cleanup (llama.cpp, CPU-only build) run on the CPU. Slower than Apple
+# Silicon but functionally the same pipeline; see the README hardware
+# compat matrix for measured/estimated throughput.
+[target.'cfg(all(target_os = "macos", target_arch = "x86_64"))'.dependencies]
+llama-cpp-2 = "0.1"
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 # CPU-only ONNX inference (Parakeet) and llama.cpp (cleanup model) on

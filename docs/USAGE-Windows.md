@@ -10,6 +10,29 @@
 > code does, untested in practice" statement. If you try it, please report
 > back — see [Help us test](#help-us-test) at the bottom.
 
+## Hardware requirements
+
+- **CPU**: x86_64 always works (built + CI-tested). arm64 (Windows on Arm)
+  is attempted (`windows-arm64` job in `.github/workflows/build.yml`, marked
+  `continue-on-error: true`) — whether it actually produces a working build
+  depends on whether `ort` (ONNX Runtime) and Tauri's WebView2 host have
+  usable Windows-arm64 support this week; check the latest `build` workflow
+  run for current status rather than trusting this doc to stay perfectly in
+  sync. The cleanup LLM (`llama-cpp-2`) is entirely macOS-only already (see
+  [Differences vs. macOS](#differences-vs-macos) below), so arm64 Windows
+  isn't blocked by that dependency the way Intel Mac is.
+- **OS floor**: Windows 10 version 1803 (April 2018 Update) or newer, or
+  Windows 11 — this is WebView2's own minimum, not something VZT Flow adds
+  on top ([Tauri's WebView2 docs](https://v2.tauri.app/reference/webview-versions/)).
+  WebView2 ships as part of the OS from 1803 onward; on anything older, the
+  NSIS/MSI installer bootstraps it. Unverified on real hardware either way —
+  see the warning banner above.
+- **Memory/disk**: same models as macOS (Parakeet ~456MB, no cleanup LLM
+  applicable here) — see [USAGE-macOS.md's Hardware requirements
+  section](USAGE-macOS.md#hardware-requirements) for the general shape of
+  the numbers; Windows-specific measurements don't exist since this hasn't
+  run on real hardware.
+
 ## Install
 
 ### Option A: download the CI-built installer
@@ -82,7 +105,7 @@ emits, and both platforms feed the *same* `run_coordinator` state machine in
 - **Tap** (press+release faster than `hold_threshold_ms`, 300ms default) to
   toggle a hands-free recording, which auto-stops after
   `handsfree_silence_secs` (2.5s default) of silence.
-- The same `max_hold_secs` (120s) / `max_handsfree_secs` (300s) caps apply.
+- The same `max_hold_secs` (600s) / `max_handsfree_secs` (600s) caps apply.
 
 Untested caveat: `tauri-plugin-global-shortcut`'s Windows implementation may
 deliver press/release differently than macOS's raw `CGEventTap` under key

@@ -97,6 +97,126 @@ jobs:
           path: vzt-flow-cli-macos-aarch64.tar.gz
           if-no-files-found: error
 
+  # Intel Mac — see build.yml's macos-x64 job for the full rationale
+  # (no Metal, no ort prebuilt binaries so we link Microsoft's official
+  # osx-x86_64 ONNX Runtime release via ORT_STRATEGY=system, and the
+  # resulting @rpath reference needs an rpath added by hand). Cross-compiled
+  # from the arm64 macos-latest runner; never run on real or emulated Intel
+  # hardware.
+  macos-x64:
+    runs-on: macos-latest
+    env:
+      ORT_STRATEGY: system
+      ORT_PREFER_DYNAMIC_LINK: "1"
+      ONNXRUNTIME_VERSION: "1.22.0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+          key: x86_64-apple-darwin
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install frontend/MCP dependencies
+        run: |
+          npm ci --prefix apps/desktop
+          npm ci --prefix mcp
+          npm run build --prefix mcp
+
+      - name: Download Microsoft's official ONNX Runtime (osx-x86_64) — ort has no prebuilt binaries for this target
+        run: |
+          mkdir -p /tmp/ort-x64
+          curl -fsSL "https://github.com/microsoft/onnxruntime/releases/download/v${ONNXRUNTIME_VERSION}/onnxruntime-osx-x86_64-${ONNXRUNTIME_VERSION}.tgz" \
+            | tar xz -C /tmp/ort-x64 --strip-components=1
+          echo "ORT_LIB_PATH=/tmp/ort-x64/lib" >> "$GITHUB_ENV"
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^2" --locked
+
+      - name: tauri build (x86_64, unsigned/local build — no notarization in CI, cross-compiled)
+        working-directory: apps/desktop
+        run: cargo tauri build --target x86_64-apple-darwin
+
+      - name: Build flow CLI (release)
+        run: cargo build --release --target x86_64-apple-darwin -p flow-cli
+
+      - name: Bundle libonnxruntime.dylib into the .app and the CLI, fix up rpaths
+        run: |
+          APP_PATH=$(find target/x86_64-apple-darwin/release/bundle/macos -maxdepth 1 -name '*.app' | head -n1)
+          if [ -z "$APP_PATH" ]; then
+            echo "No .app bundle found" >&2
+            exit 1
+          fi
+          DYLIB=$(find /tmp/ort-x64/lib -name 'libonnxruntime.*.dylib' | head -n1)
+          mkdir -p "$APP_PATH/Contents/Frameworks"
+          cp "$DYLIB" "$APP_PATH/Contents/Frameworks/"
+          install_name_tool -add_rpath "@executable_path/../Frameworks" "$APP_PATH/Contents/MacOS/vzt-flow-desktop"
+          codesign --force --deep -s - "$APP_PATH"
+
+          # The CLI binary is standalone (no bundle) — ship the dylib
+          # alongside it in the release tarball and point the rpath there.
+          mkdir -p cli-x64-stage/lib
+          cp "$DYLIB" cli-x64-stage/lib/
+          cp target/x86_64-apple-darwin/release/flow cli-x64-stage/flow
+          install_name_tool -add_rpath "@executable_path/lib" cli-x64-stage/flow
+          codesign --force -s - cli-x64-stage/flow
+
+      - name: Locate dmg artifact
+        id: find_dmg
+        run: |
+          DMG=$(find target/x86_64-apple-darwin/release/bundle/dmg -name '*.dmg' | head -n1)
+          if [ -z "$DMG" ]; then
+            echo "No .dmg found — bundle tree:" >&2
+            find target -maxdepth 5 -name bundle -type d >&2 || true
+            exit 1
+          fi
+          echo "path=$DMG" >> "$GITHUB_OUTPUT"
+
+      - name: Prune MCP node_modules to production deps
+        working-directory: mcp
+        run: npm prune --omit=dev
+
+      - name: Package CLI tarball (flow binary + bundled onnxruntime dylib + mcp/dist + mcp/node_modules)
+        run: |
+          STAGE=$(mktemp -d)/vzt-flow-cli-macos-x86_64
+          mkdir -p "$STAGE/bin" "$STAGE/mcp"
+          cp cli-x64-stage/flow "$STAGE/bin/flow"
+          mkdir -p "$STAGE/bin/lib"
+          cp cli-x64-stage/lib/libonnxruntime.*.dylib "$STAGE/bin/lib/"
+          cp -R mcp/dist "$STAGE/mcp/dist"
+          cp -R mcp/node_modules "$STAGE/mcp/node_modules"
+          cp mcp/package.json "$STAGE/mcp/package.json"
+          cat > "$STAGE/mcp/README-snippet.md" <<'EOF'
+          # VZT Flow MCP server (Intel Mac build)
+
+          Register with Claude Code:
+
+              claude mcp add vzt-flow --scope user -- node <path-to>/mcp/dist/index.js
+
+          The `flow` CLI must be on your PATH (or set VZT_FLOW_BIN) for the
+          MCP server's listen/transcribe tools to work. node_modules/ is
+          bundled alongside dist/ — dist/index.js needs it at runtime. This
+          is the Intel (x86_64) build: no Metal/CoreML, CPU-only inference —
+          see the README hardware compat matrix.
+          EOF
+          tar -C "$(dirname "$STAGE")" -czf vzt-flow-cli-macos-x86_64.tar.gz "$(basename "$STAGE")"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vzt-flow-macos-x86_64-dmg
+          path: ${{ steps.find_dmg.outputs.path }}
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vzt-flow-cli-macos-x86_64
+          path: vzt-flow-cli-macos-x86_64.tar.gz
+          if-no-files-found: error
+
   windows:
     runs-on: windows-latest
     steps:
@@ -143,8 +263,55 @@ jobs:
           path: ci-artifacts/*
           if-no-files-found: error
 
+  # Attempt only — see build.yml's windows-arm64 job for the rationale.
+  # continue-on-error means the `release` job below still proceeds (and
+  # still picks up this job's installers if it succeeds) even if this job
+  # fails outright.
+  windows-arm64:
+    runs-on: windows-11-arm
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+          key: aarch64-pc-windows-msvc
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install frontend/MCP dependencies
+        run: |
+          npm ci --prefix apps/desktop
+          npm ci --prefix mcp
+          npm run build --prefix mcp
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^2" --locked
+
+      - name: tauri build (arm64, unsigned — no code signing in CI)
+        working-directory: apps/desktop
+        run: cargo tauri build --target aarch64-pc-windows-msvc
+
+      - name: Locate msi/nsis artifacts
+        id: find_installers
+        shell: bash
+        run: |
+          mkdir -p ci-artifacts
+          find target/aarch64-pc-windows-msvc/release/bundle \
+            \( -name '*.msi' -o -name '*.exe' \) -exec cp {} ci-artifacts/ \;
+          ls -la ci-artifacts
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vzt-flow-windows-arm64-installers
+          path: ci-artifacts/*
+          if-no-files-found: error
+
   release:
-    needs: [macos, windows]
+    needs: [macos, macos-x64, windows, windows-arm64]
     runs-on: ubuntu-latest
     permissions:
       contents: write

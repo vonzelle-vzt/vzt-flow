@@ -5,8 +5,8 @@
 [![Build](https://github.com/vonzelle-vzt/vzt-flow/actions/workflows/build.yml/badge.svg)](https://github.com/vonzelle-vzt/vzt-flow/actions/workflows/build.yml)
 [![Release](https://img.shields.io/github/v/release/vonzelle-vzt/vzt-flow)](https://github.com/vonzelle-vzt/vzt-flow/releases)
 [![License: MIT](https://img.shields.io/github/license/vonzelle-vzt/vzt-flow)](LICENSE)
-![macOS](https://img.shields.io/badge/macOS-Apple%20Silicon-black?logo=apple)
-![Windows](https://img.shields.io/badge/Windows-experimental-blue?logo=windows)
+![macOS](https://img.shields.io/badge/macOS-Apple%20Silicon%20%2B%20Intel-black?logo=apple)
+![Windows](https://img.shields.io/badge/Windows-x64%20experimental-blue?logo=windows)
 
 Hold a key, talk, and the transcript lands wherever your cursor is — no
 subscription, no word limits, and nothing but the model *downloads* ever
@@ -232,6 +232,18 @@ new code signature, and macOS silently revokes Input Monitoring/Accessibility
 grants for the previous one. If the hotkey stops working right after a
 rebuild, that's almost always why.
 
+### Intel Mac
+
+CI also builds and packages an `x86_64-apple-darwin` `.dmg`/CLI tarball
+(`vzt-flow-macos-x86_64-dmg` / `vzt-flow-cli-macos-x86_64.tar.gz`), cross-
+compiled from an Apple Silicon runner. CPU-only inference (no Metal/CoreML)
+— slower than Apple Silicon, especially for `clean`/`polish` cleanup, but
+functionally the same pipeline. `scripts/install.sh` auto-detects Intel vs.
+Apple Silicon and grabs the right asset. Never run on real Intel hardware —
+see [Hardware requirements](docs/USAGE-macOS.md#hardware-requirements) for
+the honest performance estimate and the `ort`-has-no-prebuilt-binaries gap
+this build works around.
+
 ### Windows (experimental)
 
 > [!WARNING]
@@ -250,7 +262,25 @@ cargo tauri build --target x86_64-pc-windows-msvc
 ```
 
 Every verified difference from macOS is documented in
-[docs/USAGE-Windows.md](docs/USAGE-Windows.md).
+[docs/USAGE-Windows.md](docs/USAGE-Windows.md). Windows on Arm (`aarch64-pc-windows-msvc`)
+is attempted in CI as an allowed-to-fail job — see
+[docs/USAGE-Windows.md#hardware-requirements](docs/USAGE-Windows.md#hardware-requirements)
+for current status.
+
+## Hardware compat matrix
+
+| Platform | Status | Notes |
+|---|---|---|
+| macOS Apple Silicon (`aarch64-apple-darwin`) | **Supported, tested** | Primary dev platform (M5 MacBook Air); Metal cleanup + CoreML ASR |
+| macOS Intel (`x86_64-apple-darwin`) | Built in CI, CPU-only inference | Never run on real Intel hardware; effective floor is macOS **13.3**, not the 12.0 in `tauri.conf.json` — see [USAGE-macOS.md](docs/USAGE-macOS.md#hardware-requirements) |
+| Windows x64 (`x86_64-pc-windows-msvc`) | Built in CI, experimental | Never run on real Windows hardware; no daemon/profiles/cleanup LLM yet |
+| Windows Arm (`aarch64-pc-windows-msvc`) | Attempted in CI, allowed to fail | Status depends on upstream (`ort`, WebView2-on-Arm) support this week — check the latest `build` workflow run |
+| Linux | Not built, not attempted | No CI job targets it; `cfg(not(target_os = "macos"))` code paths exist but are only exercised by the Windows job |
+
+None of the non-"tested" rows are claimed to work beyond "compiles and
+packages in CI" — see each platform's usage doc for what's actually been
+verified vs. what's an honest "should work per the code, untested"
+statement.
 
 ## Screenshots
 
@@ -366,5 +396,8 @@ you talking, so it's typically already warm by the time you finish speaking.
 
 **Does it work offline?** Yes, fully, once the models are downloaded.
 
-**Apple Silicon only?** On macOS, yes — arm64 (`aarch64-apple-darwin`)
-only, no Intel builds. Windows builds target `x86_64-pc-windows-msvc`.
+**Apple Silicon only?** No — Intel Macs (`x86_64-apple-darwin`) are also
+built in CI (CPU-only inference, no Metal/CoreML; never run on real Intel
+hardware — see [Hardware compat matrix](#hardware-compat-matrix)). Windows
+builds target `x86_64-pc-windows-msvc`, with `aarch64-pc-windows-msvc`
+attempted as an allowed-to-fail CI job.

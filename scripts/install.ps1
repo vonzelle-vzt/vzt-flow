@@ -36,14 +36,24 @@ if (-not $InstallYes -and -not $env:INSTALL_YES) {
 $WorkDir = Join-Path $env:TEMP ("vzt-flow-install-" + [guid]::NewGuid())
 New-Item -ItemType Directory -Path $WorkDir | Out-Null
 
+# Tauri names the NSIS installer "{productName}_{version}_{arch}-setup.exe",
+# where {arch} is "x64" or "arm64" (see tauri-bundler's nsis/mod.rs) — pick
+# the one matching this machine so an arm64 box doesn't silently install (or
+# fail to find) the wrong installer once both are shipped.
+$WinArch = if ([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture -eq [System.Runtime.InteropServices.Architecture]::Arm64) { "arm64" } else { "x64" }
+if ($WinArch -eq "arm64") {
+    Write-Host "==> Windows on Arm detected — this build is attempted-only in CI (may not exist for every release)" -ForegroundColor Yellow
+}
+$SetupPattern = "*_${WinArch}-setup.exe"
+
 function Get-LatestSetupExe {
-    param([string]$DestDir)
+    param([string]$DestDir, [string]$Pattern)
 
     $gh = Get-Command gh -ErrorAction SilentlyContinue
     if ($gh) {
-        Write-Host "==> downloading via gh release download"
-        & gh release download --repo $Repo --pattern "*-setup.exe" --dir $DestDir --clobber
-        if ($LASTEXITCODE -ne 0) { throw "gh release download failed" }
+        Write-Host "==> downloading via gh release download (pattern: $Pattern)"
+        & gh release download --repo $Repo --pattern $Pattern --dir $DestDir --clobber
+        if ($LASTEXITCODE -ne 0) { throw "gh release download failed (no asset matching '$Pattern'? arm64 builds are attempted-only in CI)" }
         return
     }
 
@@ -55,8 +65,9 @@ function Get-LatestSetupExe {
     $headers = @{ Accept = "application/vnd.github+json" }
     if ($token) { $headers["Authorization"] = "Bearer $token" }
     $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest" -Headers $headers
-    $asset = $release.assets | Where-Object { $_.name -like "*-setup.exe" } | Select-Object -First 1
-    if (-not $asset) { throw "no *-setup.exe asset found on latest release" }
+    $regex = [regex]::Escape($Pattern) -replace '\\\*', '.*'
+    $asset = $release.assets | Where-Object { $_.name -match "^$regex$" } | Select-Object -First 1
+    if (-not $asset) { throw "no asset matching '$Pattern' found on latest release (arm64 builds are attempted-only in CI)" }
 
     $dlHeaders = @{ Accept = "application/octet-stream" }
     if ($token) { $dlHeaders["Authorization"] = "Bearer $token" }
@@ -64,7 +75,7 @@ function Get-LatestSetupExe {
     Invoke-WebRequest -Uri $asset.url -Headers $dlHeaders -OutFile $outFile
 }
 
-Get-LatestSetupExe -DestDir $WorkDir
+Get-LatestSetupExe -DestDir $WorkDir -Pattern $SetupPattern
 
 $Setup = Get-ChildItem -Path $WorkDir -Filter "*-setup.exe" | Select-Object -First 1
 if (-not $Setup) {

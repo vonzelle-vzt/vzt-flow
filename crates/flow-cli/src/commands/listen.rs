@@ -86,6 +86,11 @@ pub(crate) fn apply_standalone_pipeline(corrected: &str, mode: &str) -> String {
         return corrected.to_string();
     }
 
+    if !flow_core::Config::load().map(|c| c.cleanup_enabled).unwrap_or(true) {
+        eprintln!("[vzt-flow] cleanup_enabled=false in config.toml; skipping cleanup (dictionary-corrected text only)");
+        return corrected.to_string();
+    }
+
     #[cfg(target_os = "macos")]
     {
         use flow_core::cleanup::{CleanupContext, CleanupProvider, LlamaCleanupProvider, Mode};
