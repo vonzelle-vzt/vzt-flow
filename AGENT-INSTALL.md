@@ -6,6 +6,15 @@ install [VZT Flow](README.md) for its human. It is a runbook, not prose: run
 the steps in order, verify with the stated command, and stop where it says to
 stop.
 
+> **Agent: read this file verbatim, not a summary of it.** If you reached it
+> through a fetch tool that summarizes pages, the flags and stop conditions
+> below get compressed away — and a summarized read of this file has, in
+> testing, invented steps that aren't here. Pull it down and read the bytes:
+>
+> ```bash
+> curl -fsSL https://raw.githubusercontent.com/vonzelle-vzt/vzt-flow/main/AGENT-INSTALL.md -o /tmp/vzt-agent-install.md
+> ```
+
 Humans: you don't need this file. Use the
 [one-liner](README.md#macos-one-liner). If you'd rather have your agent do it,
 paste this into Claude Code:
@@ -107,6 +116,8 @@ the CLI and MCP server.
 
 ## 2. Download the models
 
+**Windows: skip to Step 3.** There is no `flow` binary to run.
+
 Parakeet (speech-to-text) is **required**; nothing transcribes without it. The
 cleanup LLM is **optional** — it powers `clean`/`polish` modes, and `raw`/`code`
 modes never touch it. macOS only for now; Windows and Linux have no cleanup LLM.
@@ -137,10 +148,12 @@ interactive agent session that will time out.
 
 ## 3. Permissions — hand this to your human
 
-Launch the app once, then stop and ask:
+Confirm the app actually landed before launching it — if Step 1 failed, `open -a`
+reports `Unable to find application named "VZT Flow"`, which reads like a
+permissions problem and isn't one:
 
 ```bash
-open -a "VZT Flow"
+test -d "/Applications/VZT Flow.app" && open -a "VZT Flow" || echo "app missing — Step 1 did not complete"
 ```
 
 macOS will prompt for permissions as they're first needed. If the prompts were
@@ -170,6 +183,9 @@ to make. On **Windows** there are none of these.
 ---
 
 ## 4. Verify — and don't skip this
+
+**Windows: skip this step** — no `flow` binary. Verify by launching the app and
+asking your human whether the tray icon appears and Ctrl+Shift+Space records.
 
 `flow doctor` is the oracle. It reports every piece of state this install
 touches, so read its output rather than assuming:
@@ -266,6 +282,8 @@ Deeper: [docs/USAGE-macOS.md](docs/USAGE-macOS.md) ·
 ---
 
 ## Uninstall
+
+macOS and Linux. (Windows: uninstall "VZT Flow" from Settings → Apps.)
 
 ```bash
 claude mcp remove vzt-flow --scope user
