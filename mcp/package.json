@@ -1,6 +1,6 @@
 {
   "name": "vzt-flow-mcp",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "private": true,
   "description": "MCP server exposing VZT Flow voice dictation (listen, transcribe_file, dictation_history) to Claude Code.",
   "type": "module",
