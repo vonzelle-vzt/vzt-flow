@@ -105,22 +105,45 @@ jobs:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # Notarization via App Store Connect API key, not an Apple ID + an
+          # app-specific password. sign.rs:99 prefers the APPLE_ID branch when it
+          # sees APPLE_ID + APPLE_PASSWORD + APPLE_TEAM_ID, so those two must not
+          # merely be blank — they must be ABSENT. They are not declared here,
+          # and the loop below deletes any APPLE_* that arrived empty anyway.
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
         run: |
           # A key declared in `env:` is exported even when the secret behind it
           # does not exist — it arrives as "" rather than absent. tauri-bundler
-          # tests these with var_os() (sign.rs:20), for which set-but-empty is
-          # present, so it imports an empty .p12 and kills the bundle:
-          # "failed to run command security import". Unsetting them is what lets
-          # the unsigned path fall through to signingIdentity "-" in
-          # tauri.conf.json. Do not replace this with an `env:` expression —
-          # every form of it still exports the key.
-          if [ "$SIGNED" != "true" ]; then
-            unset APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY \
-                  APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID
+          # tests these with var_os() (sign.rs:20, sign.rs:99), for which
+          # set-but-empty reads as PRESENT. That is what killed the v0.3.0
+          # release: an absent APPLE_CERTIFICATE became "", the bundler tried to
+          # import an empty .p12, and `security import` aborted the build.
+          #
+          # So delete every APPLE_* that is empty, rather than special-casing one
+          # of them. This is the general form of that bug, and it is what lets
+          # both fall-throughs work: no certificate -> ad-hoc `signingIdentity:
+          # "-"`, and no Apple ID -> notarize with the API key instead.
+          # Do not replace this with an `env:` expression: every form of one
+          # still exports the key.
+          for v in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY \
+                   APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID \
+                   APPLE_API_KEY APPLE_API_ISSUER APPLE_API_KEY_PATH; do
+            eval "val=\${$v-}"
+            [ -n "$val" ] || unset "$v"
+          done
+
+          # notarytool wants the key as a file. sign.rs:115 reads the path with
+          # var() (not var_os()), so an empty value here would also be "present".
+          if [ -n "${APPLE_API_KEY_P8:-}" ] && [ -n "${APPLE_API_KEY:-}" ]; then
+            printf '%s' "$APPLE_API_KEY_P8" | base64 --decode > "$RUNNER_TEMP/AuthKey_${APPLE_API_KEY}.p8"
+            chmod 600 "$RUNNER_TEMP/AuthKey_${APPLE_API_KEY}.p8"
+            export APPLE_API_KEY_PATH="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY}.p8"
           fi
+          unset APPLE_API_KEY_P8
+
           OVERLAY='${{ steps.signing.outputs.overlay }}'
           if [ -n "$OVERLAY" ]; then
             cargo tauri build --target aarch64-apple-darwin --config "$OVERLAY"
@@ -398,9 +421,12 @@ jobs:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # See the aarch64 job: APPLE_ID/APPLE_PASSWORD are deliberately NOT
+          # declared, so notarization takes the API-key branch (sign.rs:99).
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
         run: |
           # `--config` DEEP-merges into tauri.conf.json ("merge with the default
           # configuration file", per `tauri build --help`), so signingIdentity and
@@ -416,17 +442,25 @@ jobs:
           # per-target override here.
           #
           # A key declared in `env:` is exported even when the secret behind it
-          # does not exist — it arrives as "" rather than absent. tauri-bundler
-          # tests these with var_os() (sign.rs:20), for which set-but-empty is
-          # present, so it imports an empty .p12 and kills the bundle:
-          # "failed to run command security import". Unsetting them is what lets
-          # the unsigned path fall through to signingIdentity "-" in
-          # tauri.conf.json. Do not replace this with an `env:` expression —
-          # every form of it still exports the key.
-          if [ "$SIGNED" != "true" ]; then
-            unset APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY \
-                  APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID
+          # does not exist — it arrives as "" rather than absent, and
+          # tauri-bundler's var_os() reads set-but-empty as PRESENT. Delete every
+          # APPLE_* that is empty. See the aarch64 job for the full story.
+          for v in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY \
+                   APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID \
+                   APPLE_API_KEY APPLE_API_ISSUER APPLE_API_KEY_PATH; do
+            eval "val=\${$v-}"
+            [ -n "$val" ] || unset "$v"
+          done
+
+          # notarytool wants the key as a file. sign.rs:115 reads the path with
+          # var(), for which an empty value would also count as present.
+          if [ -n "${APPLE_API_KEY_P8:-}" ] && [ -n "${APPLE_API_KEY:-}" ]; then
+            printf '%s' "$APPLE_API_KEY_P8" | base64 --decode > "$RUNNER_TEMP/AuthKey_${APPLE_API_KEY}.p8"
+            chmod 600 "$RUNNER_TEMP/AuthKey_${APPLE_API_KEY}.p8"
+            export APPLE_API_KEY_PATH="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY}.p8"
           fi
+          unset APPLE_API_KEY_P8
+
           # Composed with jq so the signing keys MERGE into this overlay rather
           # than a second --config replacing it. hardenedRuntime + entitlements
           # only appear when a certificate exists (see "Decide signing mode").
