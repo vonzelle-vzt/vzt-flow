@@ -1,6 +1,15 @@
 # VZT Flow — Linux Usage Guide
 
 > [!WARNING]
+> **Linux is unsupported and community-maintained.** It has never been run on
+> real Linux hardware, has no global hotkey under Wayland (see the support
+> matrix below), and does not get the same verification the macOS build does
+> before a release. The `.deb`/`.AppImage`/CLI artifacts keep shipping every
+> release — people have installed them since v0.2.1 — but they're provided
+> as-is: use at your own risk, and please [report back](#help-us-test) if you
+> try it.
+
+> [!WARNING]
 > **Status: EXPERIMENTAL — compiles and is CI-tested, never run on real Linux
 > hardware.** The Linux build is compiled *and* unit-tested by CI
 > (`.github/workflows/build.yml`'s `linux` job runs `cargo test --release

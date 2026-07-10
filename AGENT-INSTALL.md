@@ -16,8 +16,9 @@ stop.
 > ```
 
 Humans: you don't need this file. Use the
-[one-liner](README.md#macos-one-liner). If you'd rather have your agent do it,
-paste this into Claude Code:
+[one-liner](README.md#macos-one-liner). If you'd rather have your agent do it —
+Claude Code, Codex CLI, Gemini CLI, or anything comparable with shell access —
+paste this into it:
 
 > Install VZT Flow on this machine by following
 > https://raw.githubusercontent.com/vonzelle-vzt/vzt-flow/main/AGENT-INSTALL.md
@@ -51,6 +52,7 @@ what they're getting:
 | macOS Intel | CI-built, CPU-only inference, never run on real Intel hardware | `scripts/install.sh` | app + CLI + MCP |
 | Linux x86_64 | Experimental; CI-built, never run on real Linux hardware. X11 full, Wayland degraded. No cleanup LLM, no meeting mode | `scripts/install.sh` | app + CLI + MCP |
 | Windows x64 | Experimental; CI-built, never run on real Windows hardware. No cleanup LLM, no per-app profiles | `scripts/install.ps1` | **app only** |
+<!-- TODO(windows-packaging): flip this row to "app + CLI + MCP" once install.ps1 lands CLI+MCP packaging. -->
 
 **Windows is the app only.** `install.ps1` does not package the `flow` CLI or
 the MCP server — that packaging doesn't exist yet. Steps 2 and 4 below assume a
@@ -58,6 +60,9 @@ the MCP server — that packaging doesn't exist yet. Steps 2 and 4 below assume 
 works, and the CLI can be built from source
 ([docs/USAGE-Windows.md](docs/USAGE-Windows.md)). Don't promise your human an
 MCP `listen` tool on Windows.
+<!-- TODO(windows-packaging): once install.ps1 ships the flow CLI + MCP server,
+     rewrite this callout — Steps 2 and 4 will apply on Windows too, and the
+     MCP `listen` tool will exist there. -->
 
 Anything else (Windows on Arm, 32-bit, BSD): stop and say so. Don't improvise a
 build from source unless asked.
@@ -100,12 +105,42 @@ The flags exist for you specifically:
 | `INSTALL_MODELS=none\|asr\|all` | Model download. Left at `none` here on purpose — see Step 2. |
 | `GITHUB_TOKEN` | Only if unauthenticated GitHub API calls are rate-limited (60/hr per IP). Not normally needed; the repo is public. |
 
-The installer registers the MCP server itself if the `claude` CLI is on PATH.
-If it wasn't, register it after the fact:
+The installer auto-registers the MCP server with **Claude Code only**, if the
+`claude` CLI is on PATH (and only if `node` is also on PATH — see
+[Step 0.5](#05-node-is-required-for-the-mcp-server-not-for-flow-itself)). For
+any agent, the MCP server itself is a plain stdio server — only the
+*registration* step differs. The node entry path is the same for every agent:
+`$HOME/.vzt-flow/mcp/index.js`.
 
-```bash
-claude mcp add vzt-flow --scope user -- node "$HOME/.vzt-flow/mcp/index.js"
-```
+| Agent | Registration |
+|---|---|
+| **Claude Code** | `claude mcp add vzt-flow --scope user -- node "$HOME/.vzt-flow/mcp/index.js"` (done automatically by Step 1 if `claude` and `node` are both on PATH) |
+| **Codex CLI** | Add to `~/.codex/config.toml`: <br>`[mcp_servers.vzt-flow]`<br>`command = "node"`<br>`args = ["<absolute path to $HOME>/.vzt-flow/mcp/index.js"]` |
+| **Gemini CLI** | Add to `~/.gemini/settings.json`, under an `mcpServers` object: <br>`{ "mcpServers": { "vzt-flow": { "command": "node", "args": ["<absolute path to $HOME>/.vzt-flow/mcp/index.js"] } } }` |
+
+Resolve `$HOME` to an absolute path yourself before writing the TOML/JSON —
+neither format expands shell variables.
+
+Sources checked for the Codex/Gemini syntax above (fetched directly, not
+recalled from memory): Codex CLI MCP config —
+<https://developers.openai.com/codex/mcp> (redirects to
+<https://learn.chatgpt.com/docs/extend/mcp?surface=cli>); Gemini CLI MCP
+config — <https://geminicli.com/docs/tools/mcp-server/>. Both formats can
+churn between releases — if `claude mcp add` / `codex mcp list` / `gemini mcp
+list` (below) shows the server as registered but not connected, re-check
+these docs rather than assuming the snippet above is still current.
+
+### 0.5. node is required for the MCP server, not for `flow` itself
+
+`flow` (the CLI and the app) is a standalone Rust binary — no node needed.
+The MCP server is a compiled Node/TypeScript stdio server and does need node
+(>=18; `@modelcontextprotocol/sdk`'s declared minimum). `scripts/install.sh`
+checks for `node` before registering the MCP server: missing or too old, it
+still installs the app + CLI and skips MCP registration with a warning
+instead of writing a registration that fails at runtime. If you see "MCP
+server: skipped — node not found" in the installer's summary, install node
+(<https://nodejs.org>) and re-run the registration command for your agent
+from the table above.
 
 **Already installed via Homebrew?** `brew install --cask vonzelle-vzt/vzt/vzt-flow`
 installs the `.app` only. Running the script afterward is the supported path —
@@ -117,6 +152,9 @@ the CLI and MCP server.
 ## 2. Download the models
 
 **Windows: skip to Step 3.** There is no `flow` binary to run.
+<!-- TODO(windows-packaging): once install.ps1 ships the flow CLI, this step
+     applies on Windows too — drop the skip notice and add the .exe form of
+     the commands below. -->
 
 Parakeet (speech-to-text) is **required**; nothing transcribes without it. The
 cleanup LLM is **optional** — it powers `clean`/`polish` modes, and `raw`/`code`
@@ -186,6 +224,9 @@ to make. On **Windows** there are none of these.
 
 **Windows: skip this step** — no `flow` binary. Verify by launching the app and
 asking your human whether the tray icon appears and Ctrl+Shift+Space records.
+<!-- TODO(windows-packaging): once install.ps1 ships the flow CLI, this step
+     applies on Windows too — drop the skip notice and use the .exe form of
+     `flow doctor` / `flow transcribe`. -->
 
 `flow doctor` is the oracle. It reports every piece of state this install
 touches, so read its output rather than assuming:
@@ -207,7 +248,11 @@ MCP registration: vzt-flow IS registered with `claude mcp`
 
 `Parakeet v3 model: MISSING` means Step 2 didn't finish. `Daemon socket` absent
 means the app isn't running — fine if you passed `NO_LAUNCH=1` and haven't
-opened it yet, a problem otherwise.
+opened it yet, a problem otherwise. Note `flow doctor`'s `MCP registration`
+line currently only checks `claude mcp` specifically — if you're running as
+Codex CLI or Gemini CLI, its `NOT registered` reading doesn't mean your
+agent's own registration (checked below) is missing; this is a known gap in
+`flow doctor`'s current wording, not yours to work around.
 
 Then prove the transcription pipeline actually works, end to end, on real
 audio. This needs no microphone, no permissions, and no network — `say` and
@@ -234,13 +279,15 @@ it does **not** cover: microphone capture, the global hotkey, and the paste
 step all depend on Step 3's grants and can only be verified by a human holding
 Right Option and talking. Ask them to, then report.
 
-Last, confirm the MCP server is reachable:
+Last, confirm the MCP server is reachable — the check differs per agent:
 
-```bash
-claude mcp list   # expect: vzt-flow ... ✔ Connected
-```
+| Agent | Verify |
+|---|---|
+| **Claude Code** | `claude mcp list` — expect `vzt-flow ... ✔ Connected` |
+| **Codex CLI** | `codex mcp list` — expect `vzt-flow` with a healthy status (add `--json` for a scriptable check) |
+| **Gemini CLI** | `gemini mcp list` — expect `vzt-flow` as `Connected` (stdio servers show `Disconnected` in an untrusted folder — run `gemini trust` first if so) |
 
-A fresh `claude` session is required before the `listen` /
+A fresh session of your agent is required before the `listen` /
 `transcribe_file` / `dictation_history` / `meeting_transcript` tools appear.
 
 ---

@@ -6,15 +6,41 @@ import os from "node:os";
 import path from "node:path";
 
 /**
- * Resolves the `flow` binary: an explicit `FLOW_BIN` env var wins, then the
- * known local build output for this repo (this MCP server ships alongside
- * vzt-flow, not as a standalone package), then bare `flow` on PATH.
+ * Resolves the `flow` binary. Order:
+ *   1. `VZT_FLOW_BIN` env var (the documented name — every install script,
+ *      README snippet, and release note tells users to set this one).
+ *   2. `FLOW_BIN` — deprecated alias, kept so anyone already relying on the
+ *      old var name doesn't silently break.
+ *   3. The real locations `scripts/install.sh` installs `flow` to: prefers
+ *      `/usr/local/bin` (already on PATH for most users), falling back to
+ *      `~/.local/bin` when `/usr/local/bin` isn't writable. On Windows, the
+ *      installer places `flow.exe` under
+ *      `%LOCALAPPDATA%\Programs\vzt-flow\bin`.
+ *   4. The dev-tree build output (`~/vzt-flow/target/release/flow`) — last
+ *      resort before bare `flow`, kept only because this MCP server is
+ *      developed alongside vzt-flow in-repo and a contributor may be running
+ *      it against a local build that was never `install.sh`'d.
+ *   5. Bare `flow`/`flow.exe` on PATH.
  */
-function resolveFlowBin(): string {
+export function resolveFlowBin(): string {
+  if (process.env.VZT_FLOW_BIN) return process.env.VZT_FLOW_BIN;
   if (process.env.FLOW_BIN) return process.env.FLOW_BIN;
-  const knownBuild = path.join(os.homedir(), "vzt-flow", "target", "release", "flow");
+
+  const isWindows = process.platform === "win32";
+  const exeName = isWindows ? "flow.exe" : "flow";
+
+  const installedCandidates = isWindows
+    ? [path.join(process.env.LOCALAPPDATA ?? path.join(os.homedir(), "AppData", "Local"), "Programs", "vzt-flow", "bin", "flow.exe")]
+    : ["/usr/local/bin/flow", path.join(os.homedir(), ".local", "bin", "flow")];
+
+  for (const candidate of installedCandidates) {
+    if (fs.existsSync(candidate)) return candidate;
+  }
+
+  const knownBuild = path.join(os.homedir(), "vzt-flow", "target", "release", exeName);
   if (fs.existsSync(knownBuild)) return knownBuild;
-  return "flow";
+
+  return exeName;
 }
 
 export function runFlowCli(args: string[], timeoutMs: number): Promise<string> {

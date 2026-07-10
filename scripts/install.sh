@@ -6,7 +6,13 @@
 # Downloads the latest GitHub Release (.dmg + CLI tarball), installs
 # "VZT Flow.app" to /Applications, the `flow` CLI to a PATH dir, and the
 # MCP server to ~/.vzt-flow/mcp (registering it with `claude mcp add` when
-# the `claude` CLI is present).
+# the `claude` CLI is present). node (>=18) is required only for the MCP
+# server — `flow` itself is a standalone Rust binary. If node is missing or
+# too old, the app + CLI install still completes; MCP registration is
+# skipped with an actionable warning instead of silently failing at runtime.
+# Model downloads (see INSTALL_MODELS below) are preceded by a disk-space
+# check against $HOME's filesystem so a full disk fails fast and clearly
+# rather than leaving a half-extracted staging directory.
 #
 # The repo is public, so no authentication is needed for the default path.
 #
@@ -16,11 +22,14 @@
 #   GITHUB_TOKEN      optional; only needed as a fallback if `gh` isn't
 #                     installed and unauthenticated GitHub API requests are
 #                     rate-limited (60/hr per IP), or for a private fork
-#   INSTALL_MODELS    opt-in, non-interactive model download so an agent/CI
-#                     can complete a full end-to-end install in one command.
-#                     One of: none (default — matches prior behavior, run
-#                     `flow models download` yourself later), asr (fetches
-#                     parakeet-v3 only), all (parakeet-v3 then cleanup).
+#   INSTALL_MODELS    opt-in, non-interactive model download so the one-liner
+#                     leaves a working, transcription-capable install.
+#                     One of: asr (default — fetches parakeet-v3 only, so ASR
+#                     works immediately), all (parakeet-v3 then cleanup),
+#                     none (skip both, run `flow models download` yourself
+#                     later — this is what agent-driven installs pass
+#                     explicitly, since a 456MB fetch can exceed an agent
+#                     shell tool's timeout; see AGENT-INSTALL.md).
 #                     parakeet-v3 is ~456MB download (~640MB on disk);
 #                     cleanup is ~1.1GB. Both land in
 #                     ~/.config/vzt-flow/models/. A failed download warns
@@ -31,7 +40,7 @@ REPO="vonzelle-vzt/vzt-flow"
 APP_NAME="VZT Flow.app"
 INSTALL_YES="${INSTALL_YES:-0}"
 NO_LAUNCH="${NO_LAUNCH:-0}"
-INSTALL_MODELS="${INSTALL_MODELS:-none}"
+INSTALL_MODELS="${INSTALL_MODELS:-asr}"
 
 log() { printf '==> %s\n' "$1"; }
 warn() { printf 'warning: %s\n' "$1" >&2; }
@@ -107,6 +116,29 @@ trap cleanup EXIT
 HAVE_GH=0
 if command -v gh >/dev/null 2>&1; then
   HAVE_GH=1
+fi
+
+# --- node preflight (needed for MCP registration only) ---------------------
+# `flow` itself is a standalone Rust binary and needs no node. The MCP server
+# does: it's a compiled Node/TypeScript stdio server (mcp/dist/index.js),
+# registered via `claude mcp add -- node <entry>`. mcp/package.json has no
+# `engines` field of its own, but its @modelcontextprotocol/sdk dependency
+# declares `"engines": {"node": ">=18"}` (checked directly against the
+# installed package.json) — CI builds/tests against node 24. If node is
+# missing, the app + CLI install is still fully useful (dictation doesn't
+# need node); we skip MCP registration with an actionable warning rather
+# than writing a registration that fails with an opaque spawn error later.
+NODE_MIN_MAJOR=18
+HAVE_NODE=0
+NODE_VERSION_OK=1
+MCP_STATUS="MCP server: skipped — node not found (need node >=${NODE_MIN_MAJOR}); install node then run: claude mcp add vzt-flow --scope user -- node \"\$HOME/.vzt-flow/mcp/index.js\""
+if command -v node >/dev/null 2>&1; then
+  HAVE_NODE=1
+  NODE_MAJOR="$(node -e 'process.stdout.write(String(process.versions.node.split(".")[0]))' 2>/dev/null || printf '0')"
+  if [ -n "$NODE_MAJOR" ] && [ "$NODE_MAJOR" -lt "$NODE_MIN_MAJOR" ] 2>/dev/null; then
+    NODE_VERSION_OK=0
+    warn "node $(node -v 2>/dev/null) found, but the MCP server's @modelcontextprotocol/sdk dependency requires node >=${NODE_MIN_MAJOR} — MCP tools may fail at runtime. Upgrade node (https://nodejs.org), then run: claude mcp add vzt-flow --scope user -- node \"\$HOME/.vzt-flow/mcp/index.js\""
+  fi
 fi
 
 download_with_gh() {
@@ -236,14 +268,20 @@ install_linux() {
   cp "$cli_src/mcp/README-snippet.md" "$HOME/.vzt-flow/mcp-README.md" 2>/dev/null || true
 
   local mcp_entry="$mcp_dest/index.js"
-  if [ -f "$mcp_entry" ] && command -v claude >/dev/null 2>&1; then
+  if [ "$HAVE_NODE" != "1" ]; then
+    warn "node not found — the flow CLI and app are installed and fully usable, but the MCP server needs node (>=${NODE_MIN_MAJOR}) to run. Skipping MCP registration."
+  elif [ -f "$mcp_entry" ] && command -v claude >/dev/null 2>&1; then
     log "registering vzt-flow with claude mcp"
     claude mcp remove vzt-flow --scope user >/dev/null 2>&1 || true
-    claude mcp add vzt-flow --scope user -- node "$mcp_entry" \
-      || warn "failed to register MCP server via 'claude mcp add' — retry:\n  claude mcp add vzt-flow --scope user -- node \"$mcp_entry\""
+    if claude mcp add vzt-flow --scope user -- node "$mcp_entry"; then
+      MCP_STATUS="MCP server: registered with claude mcp (node $(node -v 2>/dev/null))"
+    else
+      warn "failed to register MCP server via 'claude mcp add' — retry:\n  claude mcp add vzt-flow --scope user -- node \"$mcp_entry\""
+    fi
   else
     [ -f "$mcp_entry" ] || warn "MCP entry file not found at $mcp_entry — skipping claude mcp registration"
     command -v claude >/dev/null 2>&1 || log "claude CLI not found — skipping MCP registration (install later with: claude mcp add vzt-flow --scope user -- node \"$mcp_entry\")"
+    MCP_STATUS="MCP server: skipped — claude CLI not found or entry missing (install later with: claude mcp add vzt-flow --scope user -- node \"$mcp_entry\")"
   fi
 
   cat <<'EOF'
@@ -267,30 +305,66 @@ Runtime notes (full X11-vs-Wayland support matrix in docs/USAGE-Linux.md):
 CLI:  flow --help    (run 'flow doctor' first)
 MCP:  claude mcp list   (should show "vzt-flow")
 EOF
+  printf '\n%s\n' "$MCP_STATUS"
   print_models_next_steps "$cli_dest"
+}
+
+# --- disk space preflight -------------------------------------------------
+# parakeet-v3 is a measured 478,517,071-byte download that peaks at ~700MB on
+# disk while the archive and its extracted copy briefly coexist; cleanup is a
+# measured 1,107,409,472-byte single-file download with no comparable
+# extraction blowup. Both padded with headroom below. Checked against $HOME's
+# filesystem (~/.config/vzt-flow/models/ is where both land) with `df -Pk`
+# (POSIX -P output + -k for kilobyte blocks, portable across macOS/Linux).
+REQUIRED_BYTES_PARAKEET=800000000   # ~800MB headroom over the ~700MB peak
+REQUIRED_BYTES_CLEANUP=1300000000   # ~1.3GB headroom over the ~1.1GB file
+
+check_disk_space() {
+  local required_bytes="$1" label="$2"
+  local avail_kb
+  avail_kb="$(df -Pk "$HOME" 2>/dev/null | awk 'NR==2 {print $4}')"
+  if [ -z "$avail_kb" ]; then
+    warn "could not determine free disk space — proceeding without a preflight check for $label"
+    return 0
+  fi
+  local avail_bytes=$((avail_kb * 1024))
+  if [ "$avail_bytes" -lt "$required_bytes" ]; then
+    warn "insufficient free disk space for $label (need ~$((required_bytes / 1000000))MB, have ~$((avail_bytes / 1000000))MB free on \$HOME's filesystem) — skipping this model download. Free up space, then retry manually."
+    return 1
+  fi
+  return 0
 }
 
 # --- opt-in model download (INSTALL_MODELS=asr|all) -----------------------
 # Shared between the Linux and macOS install paths. Invokes the flow CLI we
 # just installed by absolute path (not bare `flow`) since $dest may not be on
 # this shell's PATH yet. A failed download warns and does not abort an
-# otherwise-successful install — the user can always retry manually.
+# otherwise-successful install — the user can always retry manually. Each
+# model is gated on a disk-space preflight (check_disk_space above) for the
+# same reason: fail early and clearly rather than filling the disk mid-
+# extraction and leaving a half-written staging dir.
 download_models() {
   local dest="$1"
   case "$INSTALL_MODELS" in
     none) return 0 ;;
     asr)
-      log "downloading ASR model (parakeet-v3, ~456MB download / ~640MB on disk)"
-      "$dest/flow" models download parakeet-v3 \
-        || warn "model download failed for parakeet-v3 — retry with: $dest/flow models download parakeet-v3"
+      if check_disk_space "$REQUIRED_BYTES_PARAKEET" "parakeet-v3"; then
+        log "downloading ASR model (parakeet-v3, ~456MB download / ~640MB on disk)"
+        "$dest/flow" models download parakeet-v3 \
+          || warn "model download failed for parakeet-v3 — retry with: $dest/flow models download parakeet-v3"
+      fi
       ;;
     all)
-      log "downloading ASR model (parakeet-v3, ~456MB download / ~640MB on disk)"
-      "$dest/flow" models download parakeet-v3 \
-        || warn "model download failed for parakeet-v3 — retry with: $dest/flow models download parakeet-v3"
-      log "downloading cleanup model (cleanup, ~1.1GB)"
-      "$dest/flow" models download cleanup \
-        || warn "model download failed for cleanup — retry with: $dest/flow models download cleanup"
+      if check_disk_space "$REQUIRED_BYTES_PARAKEET" "parakeet-v3"; then
+        log "downloading ASR model (parakeet-v3, ~456MB download / ~640MB on disk)"
+        "$dest/flow" models download parakeet-v3 \
+          || warn "model download failed for parakeet-v3 — retry with: $dest/flow models download parakeet-v3"
+      fi
+      if check_disk_space "$REQUIRED_BYTES_CLEANUP" "cleanup"; then
+        log "downloading cleanup model (cleanup, ~1.1GB)"
+        "$dest/flow" models download cleanup \
+          || warn "model download failed for cleanup — retry with: $dest/flow models download cleanup"
+      fi
       ;;
   esac
 }
@@ -416,14 +490,20 @@ cp -R "$CLI_SRC_DIR/mcp/dist" "$MCP_DEST"
 cp "$CLI_SRC_DIR/mcp/README-snippet.md" "$HOME/.vzt-flow/mcp-README.md" 2>/dev/null || true
 
 MCP_ENTRY="$MCP_DEST/index.js"
-if [ -f "$MCP_ENTRY" ] && command -v claude >/dev/null 2>&1; then
+if [ "$HAVE_NODE" != "1" ]; then
+  warn "node not found — the flow CLI and app are installed and fully usable, but the MCP server needs node (>=${NODE_MIN_MAJOR}) to run. Skipping MCP registration."
+elif [ -f "$MCP_ENTRY" ] && command -v claude >/dev/null 2>&1; then
   log "registering vzt-flow with claude mcp"
   claude mcp remove vzt-flow --scope user >/dev/null 2>&1 || true
-  claude mcp add vzt-flow --scope user -- node "$MCP_ENTRY" \
-    || warn "failed to register MCP server via 'claude mcp add' — you can retry manually:\n  claude mcp add vzt-flow --scope user -- node \"$MCP_ENTRY\""
+  if claude mcp add vzt-flow --scope user -- node "$MCP_ENTRY"; then
+    MCP_STATUS="MCP server: registered with claude mcp (node $(node -v 2>/dev/null))"
+  else
+    warn "failed to register MCP server via 'claude mcp add' — you can retry manually:\n  claude mcp add vzt-flow --scope user -- node \"$MCP_ENTRY\""
+  fi
 else
   [ -f "$MCP_ENTRY" ] || warn "MCP entry file not found at $MCP_ENTRY — skipping claude mcp registration"
   command -v claude >/dev/null 2>&1 || log "claude CLI not found — skipping MCP registration (install later with: claude mcp add vzt-flow --scope user -- node \"$MCP_ENTRY\")"
+  MCP_STATUS="MCP server: skipped — claude CLI not found or entry missing (install later with: claude mcp add vzt-flow --scope user -- node \"$MCP_ENTRY\")"
 fi
 
 # --- launch + next steps -----------------------------------------------------
@@ -445,5 +525,7 @@ Privacy & Security):
 
 CLI:  flow --help
 MCP:  claude mcp list   (should show "vzt-flow")
+
+$MCP_STATUS
 EOF
 print_models_next_steps "$CLI_DEST_DIR"

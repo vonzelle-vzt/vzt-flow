@@ -17,7 +17,7 @@ const server = new McpServer({ name: "vzt-flow", version: "0.1.0" });
 
 const NO_DAEMON_NO_CLI = (detail: string) =>
   `vzt-flow is not reachable: no daemon is running (start the VZT Flow desktop app) and the standalone ` +
-  `\`flow\` CLI could not be run either (${detail}). Set FLOW_BIN to the \`flow\` binary path if it isn't ` +
+  `\`flow\` CLI could not be run either (${detail}). Set VZT_FLOW_BIN to the \`flow\` binary path if it isn't ` +
   `on PATH.`;
 
 server.registerTool(

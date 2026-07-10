@@ -7,7 +7,7 @@
 [![License: MIT](https://img.shields.io/github/license/vonzelle-vzt/vzt-flow)](LICENSE)
 ![macOS](https://img.shields.io/badge/macOS-Apple%20Silicon%20%2B%20Intel-black?logo=apple)
 ![Windows](https://img.shields.io/badge/Windows-x64%20experimental-blue?logo=windows)
-![Linux](https://img.shields.io/badge/Linux-x64%20experimental%20(X11%20full%2C%20Wayland%20degraded)-orange?logo=linux)
+![Linux](https://img.shields.io/badge/Linux-x64%20unsupported%2C%20community--maintained-red?logo=linux)
 
 Hold a key, talk, and the transcript lands wherever your cursor is — no
 subscription, no word limits, and nothing but the model *downloads* ever
@@ -397,17 +397,21 @@ is attempted in CI as an allowed-to-fail job — see
 [docs/USAGE-Windows.md#hardware-requirements](docs/USAGE-Windows.md#hardware-requirements)
 for current status.
 
-### Linux (experimental)
+### Linux (unsupported / community-maintained)
 
 > [!WARNING]
-> Compiles and is CI-tested (`.deb` + `.AppImage` on `ubuntu-latest`), but
-> **has never been run on real Linux hardware**. On **X11** it behaves like
-> the Windows build (hold-to-talk, auto-paste, tray, overlay). On **Wayland**
+> **Linux is unsupported and community-maintained** — it has never been run
+> on real Linux hardware, has no global hotkey under Wayland, and doesn't get
+> the same pre-release verification the macOS build does. The `.deb` /
+> `.AppImage` / CLI artifacts keep shipping every release (people have
+> installed them since v0.2.1) and nothing here is being deleted, but they're
+> provided as-is: use at your own risk. On **X11** it behaves like the
+> Windows build (hold-to-talk, auto-paste, tray, overlay). On **Wayland**
 > it's degraded: no global hotkey across native apps, clipboard-only paste
 > (with a "press Ctrl+V" notification), best-effort overlay — Wayland denies
 > clients global input grabs and cross-app synthetic input by design. Use the
 > tray's Start/Stop item + clipboard on Wayland. Default hotkey is
-> **Ctrl+Shift+Space**.
+> **Ctrl+Shift+Space**. Full caveats: [docs/USAGE-Linux.md](docs/USAGE-Linux.md).
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/vonzelle-vzt/vzt-flow/main/scripts/install.sh | bash
@@ -427,7 +431,7 @@ source steps: [docs/USAGE-Linux.md](docs/USAGE-Linux.md).
 | macOS Intel (`x86_64-apple-darwin`) | Built in CI, CPU-only inference | Never run on real Intel hardware; effective floor is macOS **13.3**, not the 12.0 in `tauri.conf.json` — see [USAGE-macOS.md](docs/USAGE-macOS.md#hardware-requirements) |
 | Windows x64 (`x86_64-pc-windows-msvc`) | Built in CI, experimental | Never run on real Windows hardware; daemon control socket now works over a named pipe (CI-unit-tested); still no per-app profiles/cleanup LLM |
 | Windows Arm (`aarch64-pc-windows-msvc`) | Attempted in CI, allowed to fail | Status depends on upstream (`ort`, WebView2-on-Arm) support this week — check the latest `build` workflow run |
-| Linux x64 (`x86_64-unknown-linux-gnu`) | Built + CI-tested, experimental | Never run on real Linux hardware. `.deb` + `.AppImage` in CI. **X11**: hotkey/paste/tray/overlay all work as designed. **Wayland**: degraded — no global hotkey across native apps, clipboard-only paste, best-effort overlay (Wayland denies clients global input grabs). No cleanup LLM / profiles / meeting mode (as Windows). See [USAGE-Linux.md](docs/USAGE-Linux.md) |
+| Linux x64 (`x86_64-unknown-linux-gnu`) | **Unsupported, community-maintained** | Never run on real Linux hardware; not part of the supported release surface — `.deb` + `.AppImage` keep shipping from CI (built + unit-tested on every push), provided as-is. **X11**: hotkey/paste/tray/overlay all work as designed. **Wayland**: no global hotkey across native apps (no fix planned), clipboard-only paste, best-effort overlay (Wayland denies clients global input grabs). No cleanup LLM / profiles / meeting mode (as Windows). See [USAGE-Linux.md](docs/USAGE-Linux.md) |
 
 None of the non-"tested" rows are claimed to work beyond "compiles and
 packages in CI" — see each platform's usage doc for what's actually been

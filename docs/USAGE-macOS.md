@@ -663,9 +663,10 @@ claude mcp add vzt-flow --scope user -- node "$(pwd)/dist/index.js"
 
 This registers four tools (`mcp/src/index.ts`), backed by the daemon socket
 when the desktop app is running, falling back to the standalone `flow` CLI
-otherwise (set `FLOW_BIN` if the binary isn't discoverable — the fallback
-resolver checks `FLOW_BIN`, then `~/vzt-flow/target/release/flow`, then bare
-`flow` on PATH):
+otherwise (set `VZT_FLOW_BIN` if the binary isn't discoverable — the resolver
+checks `VZT_FLOW_BIN`, then the deprecated `FLOW_BIN` alias, then the installed
+locations `/usr/local/bin/flow` and `~/.local/bin/flow`, then the dev-tree
+`~/vzt-flow/target/release/flow`, then bare `flow` on PATH):
 
 | Tool | Args | Behavior |
 |---|---|---|
