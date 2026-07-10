@@ -6,7 +6,7 @@ versioning](https://semver.org/). Numbers quoted below were measured on this
 repo's dev hardware (M5 MacBook Air) unless noted — see `README.md` /
 `docs/PRD.md` for the full methodology.
 
-## [Unreleased]
+## [0.3.1] — 2026-07-10
 
 ### Fixed
 
@@ -34,6 +34,17 @@ repo's dev hardware (M5 MacBook Air) unless noted — see `README.md` /
   a re-run or upgrade told users to re-download 456 MB they already had.
 
 ### Added
+
+- **Signed and notarized with a Developer ID certificate.** Every previous
+  release was ad-hoc signed, which cost users twice: a browser-downloaded `.dmg`
+  or a Homebrew cask needed a right-click → Open to get past Gatekeeper, and
+  because TCC pins Accessibility and Input Monitoring to the exact binary hash,
+  every upgrade silently killed the hotkey. Both are gone. Notarization uses an
+  App Store Connect API key rather than an Apple ID and an app-specific
+  password.
+- **New app icon.** The menu-bar tray icon is unchanged — it is a macOS template
+  image, which macOS renders as a flat silhouette, so the full-colour artwork
+  cannot be used there.
 
 - **`scripts/setup-signing.sh`** turns the Developer ID setup into one command.
   It reads the signing identity and Team ID out of your exported `.p12`,
