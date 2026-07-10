@@ -1,0 +1,183 @@
+name: installer
+
+# scripts/install.sh is served straight from `main` via raw.githubusercontent
+# to everyone who runs the one-liner. There is no release gate in front of it:
+# the moment a commit lands here, the next stranger to install runs it. It was
+# also excluded from `build.yml` (paths-ignore: scripts/**), so until this
+# workflow existed it shipped with no syntax check at all.
+#
+# So this does not merely lint. It installs the latest release on a clean
+# runner exactly the way a user would, and asserts the results.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "scripts/**"
+      - ".github/workflows/installer.yml"
+  pull_request:
+    paths:
+      - "scripts/**"
+      - ".github/workflows/installer.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: installer-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Globbed, not hardcoded: a new script under scripts/ must be linted the
+      # day it lands, not the day someone remembers to add it here.
+      - name: shellcheck
+        run: shellcheck -S warning scripts/*.sh
+
+      - name: bash -n
+        run: |
+          for f in scripts/*.sh; do
+            bash -n "$f" || { echo "::error file=$f::syntax error"; exit 1; }
+            echo "ok $f"
+          done
+
+      # install.ps1 has no runner that executes it end-to-end (the Windows
+      # release ships the app + CLI but nobody has run the installer on real
+      # hardware), so at minimum prove it parses.
+      - name: PowerShell parse check
+        shell: pwsh
+        run: |
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path scripts/install.ps1).Path, [ref]$null, [ref]$errors) | Out-Null
+          if ($errors -and $errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Host "::error::$($_.Message)" }
+            exit 1
+          }
+          Write-Host "install.ps1 parses cleanly"
+
+  macos:
+    runs-on: macos-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # INSTALL_MODELS=none keeps this under a minute; the model download is a
+      # plain curl of a Hugging Face tarball and is not what breaks installs.
+      - name: Fresh install
+        run: INSTALL_YES=1 NO_LAUNCH=1 INSTALL_MODELS=none bash scripts/install.sh
+
+      - name: A fresh install must leave a usable system
+        run: |
+          test -d "/Applications/VZT Flow.app" \
+            || { echo "::error::the app was not installed to /Applications"; exit 1; }
+          FLOW="$(command -v flow || echo "$HOME/.local/bin/flow")"
+          test -x "$FLOW" || { echo "::error::the flow CLI was not installed"; exit 1; }
+          "$FLOW" --version
+          # doctor must not crash on a machine with no models and no daemon.
+          "$FLOW" doctor || { echo "::error::flow doctor failed on a clean install"; exit 1; }
+          test -f "$HOME/.vzt-flow/mcp/index.js" \
+            || { echo "::error::the MCP server was not installed"; exit 1; }
+
+      # The grant reset is destructive (it makes macOS re-prompt), so it must
+      # fire ONLY when the code identity actually changed. Reinstalling the
+      # same release must be a no-op. This is the vacuity check for the test
+      # below it: if the reset fired unconditionally, both would "pass".
+      - name: Reinstalling the same build must NOT reset grants
+        run: |
+          before="$(codesign -dv --verbose=4 "/Applications/VZT Flow.app" 2>&1 | awk -F= '/^CDHash=/{print $2}')"
+          INSTALL_YES=1 NO_LAUNCH=1 INSTALL_MODELS=none bash scripts/install.sh 2>&1 | tee reinstall.log
+          after="$(codesign -dv --verbose=4 "/Applications/VZT Flow.app" 2>&1 | awk -F= '/^CDHash=/{print $2}')"
+          [ "$before" = "$after" ] \
+            || { echo "::error::cdhash changed across an identical reinstall"; exit 1; }
+          if grep -q "clearing the two grants" reinstall.log; then
+            echo "::error::an identical reinstall reset the user's permissions"; exit 1
+          fi
+          if grep -q "UPGRADE:" reinstall.log; then
+            echo "::error::an identical reinstall told the user to re-grant"; exit 1
+          fi
+          echo "identical reinstall left grants alone"
+
+      # Now force the real upgrade condition: mutate the bundle and re-sign it
+      # ad-hoc so its cdhash differs, exactly as a new release would. The
+      # installer must notice and clear the two cdhash-pinned grants.
+      - name: An upgrade MUST reset the two pinned grants
+        run: |
+          echo "cache-buster" > "/Applications/VZT Flow.app/Contents/Resources/.ci-upgrade-marker"
+          codesign -f -s - "/Applications/VZT Flow.app"
+          stale="$(codesign -dv --verbose=4 "/Applications/VZT Flow.app" 2>&1 | awk -F= '/^CDHash=/{print $2}')"
+
+          INSTALL_YES=1 NO_LAUNCH=1 INSTALL_MODELS=none bash scripts/install.sh 2>&1 | tee upgrade.log
+          fresh="$(codesign -dv --verbose=4 "/Applications/VZT Flow.app" 2>&1 | awk -F= '/^CDHash=/{print $2}')"
+
+          [ "$stale" != "$fresh" ] || { echo "::error::test is vacuous — cdhash did not change"; exit 1; }
+          grep -q "clearing the two grants" upgrade.log \
+            || { echo "::error::an upgrade did NOT clear the stale Accessibility/Input Monitoring grants — the hotkey would be silently dead"; exit 1; }
+          grep -q "UPGRADE:" upgrade.log \
+            || { echo "::error::an upgrade did not warn the user to re-grant"; exit 1; }
+          echo "upgrade cleared the stale grants and warned the user"
+
+      # Homebrew owns /Applications/VZT Flow.app. NO_APP=1 is what lets a cask
+      # user add the CLI without the installer deleting the cask's bundle.
+      - name: NO_APP=1 must not touch /Applications
+        run: |
+          before_hash="$(codesign -dv --verbose=4 "/Applications/VZT Flow.app" 2>&1 | awk -F= '/^CDHash=/{print $2}')"
+          before_mtime="$(stat -f %m "/Applications/VZT Flow.app")"
+          # Delete the CLI wherever it landed, so re-installing it is a real
+          # assertion rather than a leftover binary answering `flow --version`.
+          rm -f /usr/local/bin/flow "$HOME/.local/bin/flow" 2>/dev/null || true
+          if command -v flow >/dev/null; then
+            echo "::error::could not remove the CLI; the re-install assertion below would be vacuous"; exit 1
+          fi
+
+          NO_APP=1 INSTALL_YES=1 INSTALL_MODELS=none bash scripts/install.sh 2>&1 | tee noapp.log
+
+          after_hash="$(codesign -dv --verbose=4 "/Applications/VZT Flow.app" 2>&1 | awk -F= '/^CDHash=/{print $2}')"
+          after_mtime="$(stat -f %m "/Applications/VZT Flow.app")"
+          [ "$before_hash" = "$after_hash" ] || { echo "::error::NO_APP=1 replaced the app bundle"; exit 1; }
+          [ "$before_mtime" = "$after_mtime" ] || { echo "::error::NO_APP=1 modified the app bundle"; exit 1; }
+          if grep -q "clearing the two grants" noapp.log; then
+            echo "::error::NO_APP=1 reset the user's permissions"; exit 1
+          fi
+          # ...but it must still deliver the CLI, which is the whole point.
+          FLOW="$(command -v flow || echo "$HOME/.local/bin/flow")"
+          "$FLOW" --version || { echo "::error::NO_APP=1 did not install the flow CLI"; exit 1; }
+          echo "NO_APP=1 installed the CLI and left the app untouched"
+
+      # INSTALL_MODELS=none must report what is on disk, not echo the flag.
+      - name: The model status message must read the disk
+        run: |
+          FAKE="$RUNNER_TEMP/model-root"
+          mkdir -p "$FAKE/models/parakeet-v3" "$FAKE/models/cleanup"
+
+          VZT_FLOW_CONFIG_DIR="$FAKE" NO_APP=1 INSTALL_YES=1 INSTALL_MODELS=none \
+            bash scripts/install.sh 2>&1 | tee present.log
+          grep -q "already present" present.log \
+            || { echo "::error::models on disk were reported as missing"; exit 1; }
+
+          VZT_FLOW_CONFIG_DIR="$RUNNER_TEMP/empty-root" NO_APP=1 INSTALL_YES=1 INSTALL_MODELS=none \
+            bash scripts/install.sh 2>&1 | tee absent.log
+          grep -q "not downloaded yet" absent.log \
+            || { echo "::error::missing models were not reported as missing"; exit 1; }
+          echo "model status reflects the disk in both directions"
+
+  linux:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fresh install (.deb path)
+        run: INSTALL_YES=1 NO_LAUNCH=1 INSTALL_MODELS=none bash scripts/install.sh
+
+      - name: A fresh install must leave a usable CLI
+        run: |
+          FLOW="$(command -v flow || echo "$HOME/.local/bin/flow")"
+          test -x "$FLOW" || { echo "::error::the flow CLI was not installed"; exit 1; }
+          "$FLOW" --version
+          "$FLOW" doctor || { echo "::error::flow doctor failed on a clean install"; exit 1; }

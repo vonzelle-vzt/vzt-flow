@@ -27,6 +27,17 @@ repo's dev hardware (M5 MacBook Air) unless noted — see `README.md` /
 
 ### Added
 
+- **CI for the installer** (`.github/workflows/installer.yml`). `scripts/**` was
+  excluded from `build.yml` via `paths-ignore`, so `scripts/install.sh` — which
+  every one-liner user fetches straight from `main`, with no release gate in
+  front of it — shipped with no syntax check at all. A typo would have broken
+  every new install the moment it was pushed. The new workflow lints
+  (`shellcheck`, `bash -n`, and a PowerShell parse of `install.ps1`) and then
+  actually installs the latest release on clean macOS and Linux runners,
+  asserting that a fresh install leaves a working app, CLI and MCP server; that
+  reinstalling the same build does **not** reset the user's permissions; that a
+  changed code identity **does**; and that `NO_APP=1` installs the CLI without
+  touching `/Applications`. The two grant tests check each other for vacuity.
 - **`NO_APP=1`** installs only the `flow` CLI, MCP server and models, skipping
   the `.dmg` download and leaving `/Applications` untouched. This is now the
   supported way to add the CLI alongside a Homebrew cask install. Previously the

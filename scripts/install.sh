@@ -131,13 +131,11 @@ fi
 # than writing a registration that fails with an opaque spawn error later.
 NODE_MIN_MAJOR=18
 HAVE_NODE=0
-NODE_VERSION_OK=1
 MCP_STATUS="MCP server: skipped — node not found (need node >=${NODE_MIN_MAJOR}); install node then run: claude mcp add vzt-flow --scope user -- node \"\$HOME/.vzt-flow/mcp/index.js\""
 if command -v node >/dev/null 2>&1; then
   HAVE_NODE=1
   NODE_MAJOR="$(node -e 'process.stdout.write(String(process.versions.node.split(".")[0]))' 2>/dev/null || printf '0')"
   if [ -n "$NODE_MAJOR" ] && [ "$NODE_MAJOR" -lt "$NODE_MIN_MAJOR" ] 2>/dev/null; then
-    NODE_VERSION_OK=0
     warn "node $(node -v 2>/dev/null) found, but the MCP server's @modelcontextprotocol/sdk dependency requires node >=${NODE_MIN_MAJOR} — MCP tools may fail at runtime. Upgrade node (https://nodejs.org), then run: claude mcp add vzt-flow --scope user -- node \"\$HOME/.vzt-flow/mcp/index.js\""
   fi
 fi
