@@ -327,9 +327,8 @@ Downloads the latest GitHub Release, installs `VZT Flow.app` to
 model, registers the MCP server with `claude mcp add` if the `claude` CLI is
 present, and launches the app. Nothing here needs `sudo`.
 
-Because `curl | bash` never sets the quarantine attribute, the app opens on a
-normal double-click. A `.dmg` you downloaded in a browser, or a Homebrew cask,
-*is* quarantined and needs a one-time right-click → Open (see
+The app is Developer ID signed and notarized, so it opens on a normal
+double-click no matter how it reached your disk (see
 [Gatekeeper](#gatekeeper-and-code-signing)).
 
 Four environment variables change what it does:
@@ -376,18 +375,17 @@ a receipt for a bundle it no longer wrote, and `brew upgrade` managing a file it
 didn't install. `NO_APP=1` skips the `.dmg` entirely and installs only the CLI,
 MCP server, and models.
 
-Note that `brew upgrade` hits the
-[grant-reset problem](#upgrading-macos-will-drop-two-of-your-grants) with no
-warning, because the cask can't run the code-identity check the one-liner does.
-After any cask upgrade, run the two `tccutil reset` commands yourself.
+Upgrading a cask installed at **v0.3.0 or earlier** needs a one-time re-grant;
+see [Upgrading](#upgrading). From v0.3.1 on, cask upgrades keep your
+permissions like any other install path.
 
 ### Manual: download from Releases
 
 Grab the `.dmg` (macOS), `.msi`/`-setup.exe` (Windows), or `.deb`/`.AppImage`
 (Linux) from the [Releases page](https://github.com/vonzelle-vzt/vzt-flow/releases).
 
-A browser-downloaded `.dmg` is quarantined, so the first launch needs a
-right-click → **Open** rather than a double-click — see
+Since v0.3.1 the `.dmg` is Developer ID signed and notarized, so it opens on a
+double-click even though a browser download quarantines it — see
 [Gatekeeper](#gatekeeper-and-code-signing). You get the app only; add the CLI
 and MCP server with `NO_APP=1 curl … | bash` as above.
 
@@ -439,27 +437,27 @@ app** and you have to reopen it. And once a grant lands, the app re-arms its
 event tap within about two seconds on its own — you do not need to relaunch it
 to pick up a late grant.
 
-### Upgrading: macOS will drop two of your grants
+### Upgrading
 
-> [!IMPORTANT]
-> Every release re-breaks Accessibility and Input Monitoring, and it does so
-> **silently**. Read this before you conclude a new version is broken.
+**From v0.3.1 onward your permissions survive upgrades.** macOS ties Accessibility
+and Input Monitoring to a *code requirement*; for a Developer ID signature that
+requirement names the team, which is stable across releases, so the grants keep
+matching. Nothing to do.
 
-VZT Flow is ad-hoc signed (no Apple Developer ID — see
-[Gatekeeper](#gatekeeper-and-code-signing)). macOS ties those two grants to a
-*code requirement* that pins the exact binary hash, and that hash changes with
-every build. After an upgrade the old grant rows survive, still displaying a
-ticked checkbox in System Settings, but they no longer describe the app you just
-installed. macOS matches, sees a different binary, and denies. The hotkey does
-nothing, with no dialog and no log line.
+**Upgrading from v0.3.0 or earlier costs you one last re-grant.** Those releases
+were ad-hoc signed, and macOS pinned the grants to the exact binary hash, which
+changed on every build. Your existing rows still show a ticked checkbox in System
+Settings while describing a binary that no longer exists — so macOS denies, and
+the hotkey does nothing, with no dialog and no log line.
 
-**Un-ticking and re-ticking the checkbox does not fix it** — that toggles the
-stale row. You have to delete the row so macOS asks again from scratch.
+**Un-ticking and re-ticking the checkbox does not fix that** — it toggles the
+stale row. The row has to be deleted so macOS asks again from scratch.
 
-The one-liner installer now does this for you: it compares the code hash before
-and after, and when it changed, it clears exactly those two grants and prints a
-banner telling you to re-grant. If you upgrade some other way — Homebrew, a
-manual `.dmg`, `cargo tauri build` — do it yourself:
+The one-liner installer handles it: it compares the app's code hash before and
+after, and when the identity changed *and the app is not Developer-ID-signed on
+both sides*, it clears exactly those two grants and prints a banner telling you
+to re-grant. If you upgrade some other way — Homebrew, a manual `.dmg`,
+`cargo tauri build` — do it yourself:
 
 ```bash
 tccutil reset Accessibility  com.vzt.flow
@@ -468,15 +466,11 @@ open -a "/Applications/VZT Flow.app"
 ```
 
 Then press the hotkey once and allow Input Monitoring; dictate once and allow
-Accessibility. In practice the microphone grant survives an upgrade — and if it
-doesn't, macOS simply asks again, because the bundle carries a microphone
-purpose string. (Builds before v0.2.1 did not, and macOS terminated them on the
-spot the first time they opened the mic. If an old build "force quits when I try
-to talk," that is why, and upgrading fixes it.)
-
-Developer ID signing plus notarization is what retires this permanently, by
-giving the app a stable identity across releases. The CI workflow for it is
-already written and dormant, waiting on an Apple Developer account.
+Accessibility. In practice the microphone grant survives — and if it doesn't,
+macOS simply asks again, because the bundle carries a microphone purpose string.
+(Builds before v0.2.1 did not, and macOS terminated them on the spot the first
+time they opened the mic. If an old build "force quits when I try to talk," that
+is why, and upgrading fixes it.)
 
 ### Troubleshooting: I hold the hotkey and nothing happens
 
@@ -535,19 +529,34 @@ want the `clean` or `polish` modes; without it those fall back to raw output.
 
 ### Gatekeeper and code signing
 
-Releases are **ad-hoc signed**, not signed with an Apple Developer ID and not
-notarized. The bundle is properly sealed and passes
-`codesign --verify --deep --strict`, but Apple has never seen it.
+Since **v0.3.1**, releases are signed with an Apple **Developer ID** certificate
+and **notarized** by Apple, with the notarization ticket stapled to both the app
+and the `.dmg`. They run the hardened runtime.
 
-What that means in practice depends entirely on how the app reached your disk.
-`curl | bash` never sets the `com.apple.quarantine` attribute, so the app opens
-on a plain double-click. Anything that *does* set it — a browser download, a
-Homebrew cask — makes Gatekeeper refuse the first launch; right-click (or
-Control-click) the app and choose **Open**, confirm once, and you're done
-forever.
+You can therefore open the app by double-clicking it, however it reached your
+disk — browser download, Homebrew cask, or `curl | bash`. No right-click → Open,
+no "Apple cannot check it for malicious software," and because the ticket is
+stapled rather than fetched, the first launch works offline.
 
-It also means the [upgrade grant reset](#upgrading-macos-will-drop-two-of-your-grants)
-above, on every release. Both problems have the same fix, and it costs $99/yr.
+Verify it yourself:
+
+```bash
+codesign -dv --verbose=4 "/Applications/VZT Flow.app" 2>&1 | grep Authority
+#   Authority=Developer ID Application: Neil Brown (LKHKU5BW73)
+#   Authority=Developer ID Certification Authority
+#   Authority=Apple Root CA
+xcrun stapler validate "/Applications/VZT Flow.app"
+spctl -a -vv "/Applications/VZT Flow.app"
+```
+
+Every release is blocked unless CI can prove all of this on the artifact you
+download — Developer ID authority, hardened runtime, the microphone entitlement,
+`spctl` acceptance, and a stapled ticket.
+
+**Releases up to and including v0.3.0 were ad-hoc signed**, which is why they
+needed a right-click → Open from a quarantined download, and why they lost two
+permission grants on every upgrade. Local `cargo tauri build` output is still
+ad-hoc — see [the rebuild gotcha](#building-from-source-the-rebuild-gotcha).
 
 ### Building from source: the rebuild gotcha
 

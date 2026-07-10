@@ -51,18 +51,12 @@ what they're getting:
 | macOS Apple Silicon | Supported, tested | `scripts/install.sh` | app + CLI + MCP |
 | macOS Intel | CI-built, CPU-only inference, never run on real Intel hardware | `scripts/install.sh` | app + CLI + MCP |
 | Linux x86_64 | Experimental; CI-built, never run on real Linux hardware. X11 full, Wayland degraded. No cleanup LLM, no meeting mode | `scripts/install.sh` | app + CLI + MCP |
-| Windows x64 | Experimental; CI-built, never run on real Windows hardware. No cleanup LLM, no per-app profiles | `scripts/install.ps1` | **app only** |
-<!-- TODO(windows-packaging): flip this row to "app + CLI + MCP" once install.ps1 lands CLI+MCP packaging. -->
+| Windows x64 | Experimental; CI-built, never run on real Windows hardware. No cleanup LLM, no per-app profiles | `scripts/install.ps1` | app + CLI + MCP |
 
-**Windows is the app only.** `install.ps1` does not package the `flow` CLI or
-the MCP server — that packaging doesn't exist yet. Steps 2 and 4 below assume a
-`flow` binary and therefore do not apply on Windows; the app's own tray still
-works, and the CLI can be built from source
-([docs/USAGE-Windows.md](docs/USAGE-Windows.md)). Don't promise your human an
-MCP `listen` tool on Windows.
-<!-- TODO(windows-packaging): once install.ps1 ships the flow CLI + MCP server,
-     rewrite this callout — Steps 2 and 4 will apply on Windows too, and the
-     MCP `listen` tool will exist there. -->
+**Windows ships the CLI and MCP server as of v0.3.0.** `install.ps1` installs
+`flow.exe`, adds it to the user PATH, registers the MCP server, and can download
+the model, so Steps 2 and 4 apply there too. It remains untested on real Windows
+hardware — say so rather than promising it works.
 
 Anything else (Windows on Arm, 32-bit, BSD): stop and say so. Don't improvise a
 build from source unless asked.
@@ -153,10 +147,8 @@ with a receipt for a bundle it no longer wrote.
 
 ## 2. Download the models
 
-**Windows: skip to Step 3.** There is no `flow` binary to run.
-<!-- TODO(windows-packaging): once install.ps1 ships the flow CLI, this step
-     applies on Windows too — drop the skip notice and add the .exe form of
-     the commands below. -->
+**Windows:** `install.ps1` already downloads the model unless you passed
+`-InstallModels none`. To do it by hand, use `flow.exe` in place of `flow` below.
 
 Parakeet (speech-to-text) is **required**; nothing transcribes without it. The
 cleanup LLM is **optional** — it powers `clean`/`polish` modes, and `raw`/`code`
@@ -224,11 +216,9 @@ to make. On **Windows** there are none of these.
 
 ## 4. Verify — and don't skip this
 
-**Windows: skip this step** — no `flow` binary. Verify by launching the app and
-asking your human whether the tray icon appears and Ctrl+Shift+Space records.
-<!-- TODO(windows-packaging): once install.ps1 ships the flow CLI, this step
-     applies on Windows too — drop the skip notice and use the .exe form of
-     `flow doctor` / `flow transcribe`. -->
+**Windows:** this step applies — use `flow.exe doctor` / `flow.exe transcribe`.
+The hotkey is Ctrl+Shift+Space there, and it has never been tested on real
+Windows hardware, so ask your human to confirm rather than asserting it works.
 
 `flow doctor` is the oracle. It reports every piece of state this install
 touches, so read its output rather than assuming:
@@ -318,7 +308,7 @@ Don't claim the hotkey works. You have no way to know.
 | `flow: command not found` | CLI went to `~/.local/bin`, not on PATH | Call it by absolute path; suggest the `export PATH=` line, don't edit their profile unprompted |
 | `Parakeet v3 model: MISSING` | Step 2 skipped or interrupted | Re-run `flow models download parakeet-v3` — idempotent |
 | Hotkey does nothing, app is running | Input Monitoring / Accessibility not granted | Step 3, then **quit and relaunch** the app |
-| Hotkey stopped working right after a rebuild | Every unsigned `cargo tauri build` mints a new code signature and macOS silently revokes the old one's grants | Remove **and re-add** VZT Flow in both panes. See [the rebuild gotcha](docs/USAGE-macOS.md#the-rebuild-drops-permissions-gotcha) |
+| Hotkey stopped working right after a rebuild, or after upgrading from v0.3.0 or earlier | Those builds were ad-hoc signed; macOS pinned the grants to the old binary's hash, so they no longer match. The checkbox still looks ticked. | `tccutil reset Accessibility com.vzt.flow` and `tccutil reset ListenEvent com.vzt.flow`, then re-grant. Released builds from v0.3.1 on are Developer ID signed and keep their grants across upgrades. |
 | `clean`/`polish` produce raw text | Cleanup model missing, or generation missed the 2500 ms deadline | `flow models download cleanup`; the raw-on-deadline fallback is by design |
 | MCP tools absent in Claude Code | Registered after the session started | Restart `claude`; check `claude mcp list` |
 | Transcript on clipboard, "paste may have failed" | Secure or unreadable focused field | Press Cmd+V. Expected in password fields and some Electron apps |
