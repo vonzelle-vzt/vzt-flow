@@ -462,11 +462,18 @@ DEST_APP="/Applications/$(basename "$SRC_APP")"
 # the stale row. Clearing the rows makes macOS prompt again from scratch.
 # Only Accessibility/ListenEvent are worth clearing; leave the microphone grant
 # alone — in practice it survives, and if it doesn't macOS just re-prompts,
-# because the bundle carries a purpose string. Requires no sudo. Dev-ID signing
-# + notarization would make the requirement stable and retire all of this.
+# because the bundle carries a purpose string. Requires no sudo.
+#
+# This applies to AD-HOC builds only. A Developer ID signature gives TCC a
+# stable requirement (team + bundle id) instead of a cdhash, so grants survive
+# an upgrade on their own — and clearing them would then be pure vandalism,
+# making the user re-grant on every release for no reason. So: reset only when
+# the identity is not Developer-ID-signed on both sides of the upgrade.
 APP_CDHASH() { codesign -dv --verbose=4 "$1" 2>&1 | awk -F= '/^CDHash=/{print tolower($2); exit}'; }
+APP_IS_DEVID() { codesign -dv --verbose=4 "$1" 2>&1 | grep -q "Authority=Developer ID Application"; }
 
 OLD_CDHASH=""
+OLD_DEVID=0
 if [ -d "$DEST_APP" ]; then
   if [ "$INSTALL_YES" != "1" ]; then
     read -r -p "‘$DEST_APP’ already exists — overwrite? [y/N] " reply
@@ -476,6 +483,7 @@ if [ -d "$DEST_APP" ]; then
     esac
   fi
   OLD_CDHASH="$(APP_CDHASH "$DEST_APP")"
+  APP_IS_DEVID "$DEST_APP" && OLD_DEVID=1 || OLD_DEVID=0
   log "removing existing $DEST_APP"
   rm -rf "$DEST_APP"
 fi
@@ -485,7 +493,12 @@ cp -R "$SRC_APP" "$DEST_APP"
 
 if [ -n "$OLD_CDHASH" ]; then
   NEW_CDHASH="$(APP_CDHASH "$DEST_APP")"
-  if [ -n "$NEW_CDHASH" ] && [ "$OLD_CDHASH" != "$NEW_CDHASH" ]; then
+  NEW_DEVID=0
+  APP_IS_DEVID "$DEST_APP" && NEW_DEVID=1 || NEW_DEVID=0
+
+  if [ "$OLD_DEVID" = "1" ] && [ "$NEW_DEVID" = "1" ]; then
+    log "Developer ID signed on both sides — TCC pins by team, not cdhash; grants survive"
+  elif [ -n "$NEW_CDHASH" ] && [ "$OLD_CDHASH" != "$NEW_CDHASH" ]; then
     BUNDLE_ID="$(defaults read "$DEST_APP/Contents/Info.plist" CFBundleIdentifier 2>/dev/null || echo com.vzt.flow)"
     log "code identity changed since the previous install — clearing the two grants that pin to it"
     for svc in Accessibility ListenEvent; do

@@ -10,6 +10,14 @@ repo's dev hardware (M5 MacBook Air) unless noted — see `README.md` /
 
 ### Fixed
 
+- **The grant reset would have misfired once the app is signed.** A Developer ID
+  signature gives TCC a stable requirement (team + bundle id) rather than a
+  cdhash, so Accessibility and Input Monitoring survive an upgrade on their own.
+  The installer now skips the reset when the app is Developer-ID-signed on both
+  sides of the upgrade, and still performs it for ad-hoc builds, for the release
+  where signing first lands (whose old grants are cdhash-pinned and genuinely
+  stale), and for a downgrade back to ad-hoc.
+
 - **An upgrade left the hotkey silently dead.** macOS pins the Accessibility and
   Input Monitoring grants to a code requirement containing the exact binary
   hash, which changes on every ad-hoc signed release. After an upgrade the old
@@ -26,6 +34,13 @@ repo's dev hardware (M5 MacBook Air) unless noted — see `README.md` /
   a re-run or upgrade told users to re-download 456 MB they already had.
 
 ### Added
+
+- **`scripts/setup-signing.sh`** turns the Developer ID setup into one command.
+  It reads the signing identity and Team ID out of your exported `.p12`,
+  base64-encodes the certificate, and writes the six secrets `release.yml`
+  reads. It refuses a certificate that is not a `Developer ID Application`, and
+  refuses a normal Apple ID password where an app-specific one is required —
+  both of which otherwise fail deep inside a CI run with an opaque error.
 
 - **CI for the installer** (`.github/workflows/installer.yml`). `scripts/**` was
   excluded from `build.yml` via `paths-ignore`, so `scripts/install.sh` — which
