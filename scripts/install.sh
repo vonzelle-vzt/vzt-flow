@@ -469,8 +469,21 @@ DEST_APP="/Applications/$(basename "$SRC_APP")"
 # an upgrade on their own — and clearing them would then be pure vandalism,
 # making the user re-grant on every release for no reason. So: reset only when
 # the identity is not Developer-ID-signed on both sides of the upgrade.
-APP_CDHASH() { codesign -dv --verbose=4 "$1" 2>&1 | awk -F= '/^CDHash=/{print tolower($2); exit}'; }
-APP_IS_DEVID() { codesign -dv --verbose=4 "$1" 2>&1 | grep -q "Authority=Developer ID Application"; }
+# Read codesign's output into a variable before matching it. Piping it into a
+# consumer that exits early (`awk ... exit`, `grep -q`) closes the pipe, codesign
+# takes SIGPIPE, and under `set -o pipefail` the pipeline reports 141 — so the
+# surrounding `VAR=$(...)` fails and `set -e` kills the installer mid-run, after
+# the app has been replaced but before the CLI and MCP server are installed. It
+# is a race: whether codesign has finished writing when the consumer exits. CI
+# never lost it; a real machine did, every time.
+APP_CDHASH() {
+  local out; out="$(codesign -dv --verbose=4 "$1" 2>&1 || true)"
+  printf '%s' "$out" | awk -F= '/^CDHash=/{print tolower($2); exit}'
+}
+APP_IS_DEVID() {
+  local out; out="$(codesign -dv --verbose=4 "$1" 2>&1 || true)"
+  printf '%s' "$out" | grep -q "Authority=Developer ID Application"
+}
 
 OLD_CDHASH=""
 OLD_DEVID=0

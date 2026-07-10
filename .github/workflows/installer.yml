@@ -42,6 +42,20 @@ jobs:
             echo "ok $f"
           done
 
+      # `cmd | grep -q` and `cmd | awk '...exit'` under `set -o pipefail` are a
+      # race: the consumer exits, the producer takes SIGPIPE, the pipeline
+      # reports 141, and a surrounding `VAR=$(...)` kills the script under
+      # `set -e`. It cost us a half-finished install on a real machine while CI
+      # sailed through, because whether the producer has finished writing is a
+      # matter of timing. The race cannot be tested for; the pattern can.
+      - name: no early-exit consumer piped from a slow producer
+        run: |
+          if grep -nE '(codesign|security|hdiutil|xcrun)[^|]*\|[[:space:]]*(grep -q|awk )' scripts/*.sh; then
+            echo "::error::pipe into an early-exiting consumer under 'set -o pipefail' — capture the output in a variable first (see APP_CDHASH in install.sh)"
+            exit 1
+          fi
+          echo "ok: no SIGPIPE-prone pipelines"
+
       # install.ps1 has no runner that executes it end-to-end (the Windows
       # release ships the app + CLI but nobody has run the installer on real
       # hardware), so at minimum prove it parses.
