@@ -112,10 +112,95 @@ fn spawn_hotkey_monitor(
         eprintln!(
             "[vzt-flow] hotkey monitor failed to install a CGEventTap — this almost always means \
              Input Monitoring permission hasn't been granted (System Settings > Privacy & Security \
-             > Input Monitoring). The tray's manual Start/Stop item still works."
+             > Input Monitoring). The tray's manual Start/Stop item still works; the re-arm driver \
+             will arm the tap automatically the moment the grant lands (no restart)."
         );
     }
     active
+}
+
+/// How often the macOS late-grant re-arm driver polls Input Monitoring access
+/// while the hotkey tap is unarmed. Matched to the Settings permission poll
+/// (2s) so the dot flips green within a tick of the user granting. While
+/// permission is denied each tick is a single non-prompting `IOHIDCheckAccess`
+/// call (microseconds) on an otherwise-sleeping thread — `CGEventTapCreate` is
+/// only ever attempted once the grant lands.
+#[cfg(target_os = "macos")]
+const REARM_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// macOS-only late-grant recovery. The `CGEventTap` is only spawned once, at
+/// launch (see [`spawn`]). A brand-new user who launches, is told to grant
+/// Input Monitoring, and grants it would otherwise be stuck with a dead hotkey
+/// until they quit and relaunch — the exact "installed but not working" gap
+/// this closes. Spawned only when the launch-time tap install failed.
+///
+/// It polls the grant on [`REARM_POLL_INTERVAL`] and, the instant it reads
+/// `Granted`, arms the tap in place. Safety of re-arming rests entirely on
+/// [`flow_core::hotkey::rearm_tick`]/`should_attempt_arm`: `spawn_monitor` is
+/// **not idempotent** (a success parks an unkillable `CFRunLoop` thread holding
+/// the tap), so we attempt an arm only while unarmed AND granted, and `return`
+/// the instant one succeeds — `spawn_monitor` is thus called at most once from
+/// here, on the grant transition. A *failed* `spawn_monitor` returns
+/// immediately without leaking, so the rare granted-but-failed case retries
+/// safely on the next tick.
+#[cfg(target_os = "macos")]
+fn spawn_hotkey_rearm_driver(
+    app: AppHandle,
+    is_recording: Arc<AtomicBool>,
+    tx: Sender<HotkeyEvent>,
+) {
+    std::thread::Builder::new()
+        .name("vzt-flow-hotkey-rearm".into())
+        .spawn(move || loop {
+            std::thread::sleep(REARM_POLL_INTERVAL);
+            let state = app.state::<AppState>();
+            let active = state.hotkey_monitor_active.load(Ordering::Relaxed);
+            let armed = flow_core::hotkey::rearm_tick(
+                active,
+                permissions::input_monitoring_access,
+                || {
+                    // Arm with the *current* configured keycode: a Settings
+                    // change made while unarmed only persisted to config (there
+                    // was no live handle to update), so read it fresh rather
+                    // than reuse the stale launch-time value.
+                    let keycode = state.config.lock().unwrap().hotkey_keycode;
+                    match flow_core::hotkey::spawn_monitor(
+                        keycode,
+                        is_recording.clone(),
+                        tx.clone(),
+                    ) {
+                        Ok(handle) => {
+                            // Publish the handle first so a concurrent
+                            // `set_config` keycode change lands on it, then
+                            // reconcile against config once more to close the
+                            // read-keycode / publish-handle race (if it changed
+                            // during the brief spawn, apply the latest).
+                            *state.hotkey_keycode_handle.lock().unwrap() = Some(handle.clone());
+                            handle.store(
+                                state.config.lock().unwrap().hotkey_keycode,
+                                Ordering::Relaxed,
+                            );
+                            state.hotkey_monitor_active.store(true, Ordering::Relaxed);
+                            // Settings polls `get_permission_status`, so its dot
+                            // flips green on its own; refresh the tray too.
+                            crate::tray::refresh_menu(&app);
+                            eprintln!(
+                                "[vzt-flow] Input Monitoring granted — hotkey tap armed without a restart"
+                            );
+                            true
+                        }
+                        Err(()) => false,
+                    }
+                },
+            );
+            if armed {
+                // Tap is up and self-sustaining (its own in-callback re-enable
+                // + 5s watchdog). Nothing left to poll for; end the driver so a
+                // second `spawn_monitor` can never happen.
+                return;
+            }
+        })
+        .expect("failed to spawn hotkey re-arm driver thread");
 }
 
 /// Windows and Linux (X11) hold-to-talk binding: Ctrl+Shift+Space via
@@ -266,9 +351,16 @@ pub fn spawn(
     *app.state::<AppState>().cleanup_cmd_tx.lock().unwrap() = Some(cleanup_cmd_tx);
 
     // --- hotkey monitor ---
+    // Keep a sender clone (`hotkey_tx`) past the install so the macOS re-arm
+    // driver can feed a freshly-armed tap; on a first-try success (or non-
+    // macOS) the clone is just dropped.
     let (hotkey_tx, hotkey_rx) = mpsc::channel::<HotkeyEvent>();
-    let hotkey_active =
-        spawn_hotkey_monitor(&app, config.hotkey_keycode, is_recording.clone(), hotkey_tx);
+    let hotkey_active = spawn_hotkey_monitor(
+        &app,
+        config.hotkey_keycode,
+        is_recording.clone(),
+        hotkey_tx.clone(),
+    );
     {
         let tx = unified_tx.clone();
         std::thread::spawn(move || {
@@ -285,6 +377,20 @@ pub fn spawn(
     app.state::<AppState>()
         .hotkey_monitor_active
         .store(hotkey_active, Ordering::Relaxed);
+
+    // macOS late-grant recovery: if the tap didn't come up (Input Monitoring
+    // ungranted at launch, the fresh-install case), poll for the grant and arm
+    // the tap the instant it lands — no restart. See `spawn_hotkey_rearm_driver`.
+    #[cfg(target_os = "macos")]
+    {
+        if hotkey_active {
+            drop(hotkey_tx);
+        } else {
+            spawn_hotkey_rearm_driver(app.clone(), is_recording.clone(), hotkey_tx);
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    drop(hotkey_tx);
 
     // --- coordinator thread ---
     {

@@ -3,8 +3,10 @@ const { invoke } = window.__TAURI__.core;
 const dotMic = document.getElementById("dot-mic");
 const dotAx = document.getElementById("dot-ax");
 const dotHotkey = document.getElementById("dot-hotkey");
+const hotkeyHint = document.getElementById("hotkey-hint");
 const btnMic = document.getElementById("btn-mic");
 const btnAx = document.getElementById("btn-ax");
+const btnHotkey = document.getElementById("btn-hotkey");
 const hotkeySelect = document.getElementById("hotkey-select");
 const holdThreshold = document.getElementById("hold-threshold");
 const launchAtLogin = document.getElementById("launch-at-login");
@@ -30,7 +32,18 @@ async function refreshPermissions() {
     const status = await invoke("get_permission_status");
     setDot(dotMic, status.microphone_reachable);
     setDot(dotAx, status.accessibility_trusted);
+    // Green exactly when the tap is armed. The re-arm driver flips this live
+    // after a late grant, so no "restart after granting" note is needed. Show
+    // a transient hint for the brief window where the grant has landed but the
+    // tap hasn't armed yet, so a granted user isn't left staring at a red dot.
     setDot(dotHotkey, status.hotkey_monitor_active);
+    if (status.hotkey_monitor_active) {
+      hotkeyHint.textContent = "";
+    } else if (status.input_monitoring_trusted) {
+      hotkeyHint.textContent = "granted — arming…";
+    } else {
+      hotkeyHint.textContent = "";
+    }
   } catch (e) {
     console.error("permission status failed", e);
   }
@@ -220,6 +233,19 @@ btnMic.addEventListener("click", async () => {
 
 btnAx.addEventListener("click", async () => {
   await invoke("open_accessibility_settings");
+});
+
+btnHotkey.addEventListener("click", async () => {
+  // Fire the native Input Monitoring prompt first (a one-click grant on first
+  // run; a no-op once already decided), then open the pane as the fallback for
+  // users who dismissed or previously denied it. The re-arm driver picks up the
+  // grant within ~2s and the dot flips green with no restart.
+  try {
+    await invoke("request_input_monitoring");
+  } catch (e) {
+    console.error("request input monitoring failed", e);
+  }
+  await invoke("open_input_monitoring_settings");
 });
 
 hotkeySelect.addEventListener("change", saveConfig);

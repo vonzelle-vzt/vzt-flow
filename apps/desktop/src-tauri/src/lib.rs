@@ -39,6 +39,8 @@ pub fn run() {
             commands::set_config,
             commands::get_permission_status,
             commands::open_accessibility_settings,
+            commands::open_input_monitoring_settings,
+            commands::request_input_monitoring,
             commands::get_last_transcript,
             commands::copy_last_transcript,
             commands::get_history,

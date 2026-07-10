@@ -35,11 +35,16 @@ pub struct PermissionStatus {
     pub microphone_reachable: bool,
     pub accessibility_trusted: bool,
     pub secure_input_active: bool,
-    /// Whether the CGEventTap for the hold-to-talk key installed. `false`
-    /// almost always means Input Monitoring permission is missing — a
-    /// permission `AXIsProcessTrustedWithOptions` can't detect directly, so
-    /// we surface it as "did the tap come up" instead.
+    /// Whether the CGEventTap for the hold-to-talk key is currently armed.
+    /// Now a *live* reading, not a launch-time snapshot: the macOS re-arm
+    /// driver flips it true the moment a late Input Monitoring grant lets the
+    /// tap install (see `coordinator::spawn_hotkey_rearm_driver`). The Settings
+    /// dot is green exactly when this is true.
     pub hotkey_monitor_active: bool,
+    /// Whether Input Monitoring is *granted* (`IOHIDCheckAccess`). Lets the UI
+    /// tell "granted but the tap hasn't armed yet" (a brief transient) apart
+    /// from "denied — open Settings". `true` off macOS (no such gate).
+    pub input_monitoring_trusted: bool,
 }
 
 #[tauri::command]
@@ -69,12 +74,29 @@ pub fn get_permission_status(state: State<AppState>) -> PermissionStatus {
         accessibility_trusted: permissions::accessibility_trusted(),
         secure_input_active: permissions::secure_input_enabled(),
         hotkey_monitor_active: state.hotkey_monitor_active.load(Ordering::Relaxed),
+        input_monitoring_trusted: permissions::input_monitoring_trusted(),
     }
 }
 
 #[tauri::command]
 pub fn open_accessibility_settings() {
     permissions::open_accessibility_settings();
+}
+
+/// Opens System Settings to the Input Monitoring pane (the permission the
+/// global hold-to-talk tap needs). Wired to the Setup row's "Open Settings"
+/// button.
+#[tauri::command]
+pub fn open_input_monitoring_settings() {
+    permissions::open_input_monitoring_settings();
+}
+
+/// Triggers the native Input Monitoring permission prompt (first run only;
+/// macOS won't re-prompt afterwards). Mirrors how `probe_microphone` doubles
+/// as the mic-prompt trigger. Returns whether access is granted.
+#[tauri::command]
+pub fn request_input_monitoring() -> bool {
+    permissions::request_input_monitoring()
 }
 
 #[tauri::command]

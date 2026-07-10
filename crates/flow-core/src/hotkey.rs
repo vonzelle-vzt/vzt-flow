@@ -105,6 +105,147 @@ pub fn hotkey_keycode_is_hold_capable(keycode: u16) -> bool {
     HOLD_CAPABLE_HOTKEY_KEYCODES.contains(&keycode)
 }
 
+/// Whether the late-grant re-arm driver should attempt to install a
+/// `CGEventTap` on this tick. True **only** when the tap is not already armed
+/// *and* Input Monitoring reads `Granted`.
+///
+/// This single predicate is what makes re-arming safe. [`spawn_monitor`] is
+/// **not idempotent**: a *successful* call parks a thread on an infinite
+/// `CFRunLoop` holding the tap, with no shutdown handle, so calling it twice
+/// after a success leaks a thread + tap + mach port forever. Gating on
+/// `!active` structurally guarantees we never re-call after a success — the
+/// sole unsafe direction. Gating on `Granted` (never `Unknown`, never
+/// `Denied`) means a permanently-denied machine never calls `CGEventTapCreate`
+/// at all; only the cheap non-prompting `IOHIDCheckAccess` poll runs.
+pub fn should_attempt_arm(active: bool, access: crate::permissions::InputMonitoringAccess) -> bool {
+    !active && matches!(access, crate::permissions::InputMonitoringAccess::Granted)
+}
+
+/// One iteration of the late-grant re-arm driver's control loop, factored pure
+/// so the "never spawn after a success, never spawn while denied" invariants
+/// are unit-testable without a real `CGEventTap`. Side effects are injected:
+/// `check_access` reads the current Input Monitoring grant, `try_arm` attempts
+/// the (non-idempotent) tap install and returns whether it came up. Returns the
+/// tap's armed state after this tick.
+///
+///  - already armed         → returns `true`, `try_arm` is never called;
+///  - unarmed + not Granted  → returns `false`, `try_arm` is never called
+///    (so a denied grant only ever pays for the cheap access poll);
+///  - unarmed + Granted      → calls `try_arm` exactly once; its result is the
+///    new armed state (a failed arm returns `false` and is safely retried next
+///    tick — a failed [`spawn_monitor`] returns immediately without leaking).
+pub fn rearm_tick(
+    active: bool,
+    check_access: impl FnOnce() -> crate::permissions::InputMonitoringAccess,
+    try_arm: impl FnOnce() -> bool,
+) -> bool {
+    if active {
+        return true;
+    }
+    if !should_attempt_arm(active, check_access()) {
+        return false;
+    }
+    try_arm()
+}
+
+#[cfg(test)]
+mod rearm_tests {
+    use super::{rearm_tick, should_attempt_arm};
+    use crate::permissions::InputMonitoringAccess::{Denied, Granted, Unknown};
+    use std::cell::Cell;
+
+    #[test]
+    fn attempt_only_when_unarmed_and_granted() {
+        assert!(should_attempt_arm(false, Granted));
+        // Already armed: never re-attempt (re-calling spawn_monitor leaks).
+        assert!(!should_attempt_arm(true, Granted));
+        assert!(!should_attempt_arm(false, Denied));
+        // Unknown must NOT be treated as granted.
+        assert!(!should_attempt_arm(false, Unknown));
+        assert!(!should_attempt_arm(true, Denied));
+    }
+
+    #[test]
+    fn first_success_arms_then_never_spawns_again() {
+        // Simulate the real driver loop: read armed state, tick, store result.
+        let spawn_calls = Cell::new(0);
+        let mut active = false;
+        for _ in 0..10 {
+            active = rearm_tick(
+                active,
+                || Granted,
+                || {
+                    spawn_calls.set(spawn_calls.get() + 1);
+                    true // tap came up
+                },
+            );
+        }
+        assert_eq!(
+            spawn_calls.get(),
+            1,
+            "spawn_monitor must be called exactly once and never after a success"
+        );
+        assert!(active);
+    }
+
+    #[test]
+    fn denied_never_calls_spawn_monitor() {
+        let spawn_calls = Cell::new(0);
+        let mut active = false;
+        for _ in 0..100 {
+            active = rearm_tick(
+                active,
+                || Denied,
+                || {
+                    spawn_calls.set(spawn_calls.get() + 1);
+                    true
+                },
+            );
+        }
+        assert_eq!(spawn_calls.get(), 0, "denied => IOHIDCheckAccess only, never CGEventTapCreate");
+        assert!(!active);
+    }
+
+    #[test]
+    fn repeated_failure_retries_without_arming_or_panic() {
+        // Granted, but the tap keeps failing to install (try_arm → false).
+        let spawn_calls = Cell::new(0);
+        let mut active = false;
+        for _ in 0..5 {
+            active = rearm_tick(
+                active,
+                || Granted,
+                || {
+                    spawn_calls.set(spawn_calls.get() + 1);
+                    false // tap failed to come up
+                },
+            );
+        }
+        assert_eq!(spawn_calls.get(), 5, "granted-but-failing retries each tick");
+        assert!(!active, "a failed arm must never flip the armed state");
+    }
+
+    #[test]
+    fn arms_once_on_the_grant_transition() {
+        // Denied/Unknown for a while, then the user grants.
+        let accesses = [Denied, Denied, Unknown, Granted, Granted];
+        let spawn_calls = Cell::new(0);
+        let mut active = false;
+        for a in accesses {
+            active = rearm_tick(
+                active,
+                || a,
+                || {
+                    spawn_calls.set(spawn_calls.get() + 1);
+                    true
+                },
+            );
+        }
+        assert_eq!(spawn_calls.get(), 1, "spawn fires once, on the Granted transition");
+        assert!(active);
+    }
+}
+
 /// macOS hold-to-talk monitoring via a `CGEventTap`. Gated out on every
 /// other platform — see the module docs above for why this can't be
 /// `tauri-plugin-global-shortcut` for a modifier-only binding, and see
