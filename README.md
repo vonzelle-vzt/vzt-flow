@@ -72,6 +72,20 @@ else in the docs links back here rather than restating it.
 Right Option — see [Windows](#windows-experimental) /
 [Linux](#linux-unsupported--community-maintained) below.)
 
+**To change the key: Settings → Hotkey.** Nine modifiers are offered — Right
+Option (default), Right Shift, Right Control, Right Command, Fn, and the four
+left-side equivalents, which are labelled as conflicting with typing for good
+reason. You can also set `hotkey_keycode` in `~/.config/vzt-flow/config.toml`.
+
+Only *modifier* keys are valid: a letter key auto-repeats `keyDown` while held,
+which destroys the press/release edges the hold-vs-tap logic reads. Caps Lock is
+excluded on purpose — its flag reports the latched state, not the physical key,
+so binding it would start recording and leave Caps Lock on. And because macOS
+reports modifier flags without telling you which side they came from, a binding
+on one Shift can be "held open" by the other one; that is why the left-side keys
+carry a warning. On **Windows and Linux the hotkey is fixed** at
+Ctrl+Shift+Space and `hotkey_keycode` is ignored.
+
 - **Esc** cancels either mode outright — nothing is transcribed or pasted.
 - The tap only **arms** hands-free if no other key was pressed during it.
   Right Option is macOS's special-character modifier (Option+e = ´,
