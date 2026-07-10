@@ -37,9 +37,52 @@ jobs:
       - name: Install Tauri CLI
         run: cargo install tauri-cli --version "^2" --locked
 
-      - name: tauri build (aarch64, ad-hoc signed — not notarized in CI)
+      # Signing turns on ONLY when the secrets exist. tauri-bundler signs when it
+      # sees APPLE_CERTIFICATE + APPLE_CERTIFICATE_PASSWORD (sign.rs:19-40 imports
+      # the .p12 into a temp keychain) and notarizes when it also sees APPLE_ID +
+      # APPLE_PASSWORD + APPLE_TEAM_ID (sign.rs:99-104). APPLE_SIGNING_IDENTITY
+      # REPLACES tauri.conf.json's `signingIdentity` (cli rust.rs:1467), which is
+      # why the config can keep "-" as the unsigned fallback: the bundler's
+      # keychain() rejects a cert whose identity doesn't contain the configured
+      # one, so "-" must not reach it when a real cert is present.
+      #
+      # Hardened Runtime is REQUIRED for notarization and rides along with the
+      # certificate — never on its own. Under it the mic needs
+      # com.apple.security.device.audio-input, or the app is denied audio and we
+      # reintroduce v0.2.1's "force-quits when I try to talk" by another route.
+      # Without secrets we build exactly the ad-hoc, unhardened bundle that
+      # v0.2.1 shipped and that is known to work.
+      - name: Decide signing mode
+        id: signing
+        env:
+          CERT: ${{ secrets.APPLE_CERTIFICATE }}
+        run: |
+          if [ -n "$CERT" ]; then
+            echo "signed=true" >> "$GITHUB_OUTPUT"
+            echo "overlay={\"bundle\":{\"macOS\":{\"hardenedRuntime\":true,\"entitlements\":\"entitlements.plist\"}}}" >> "$GITHUB_OUTPUT"
+            echo "::notice::Developer ID secrets present — signing + notarizing, hardened runtime ON"
+          else
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            echo "overlay=" >> "$GITHUB_OUTPUT"
+            echo "::warning::No APPLE_CERTIFICATE secret — building ad-hoc + unnotarized. A browser-downloaded dmg will show 'Apple could not verify', and macOS drops Accessibility/Input Monitoring grants on every upgrade because the ad-hoc cdhash churns."
+          fi
+
+      - name: tauri build (aarch64)
         working-directory: apps/desktop
-        run: cargo tauri build --target aarch64-apple-darwin
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          OVERLAY='${{ steps.signing.outputs.overlay }}'
+          if [ -n "$OVERLAY" ]; then
+            cargo tauri build --target aarch64-apple-darwin --config "$OVERLAY"
+          else
+            cargo tauri build --target aarch64-apple-darwin
+          fi
 
       - name: Build flow CLI (release)
         run: cargo build --release --target aarch64-apple-darwin -p flow-cli
@@ -120,6 +163,24 @@ jobs:
           MINOS=$(/usr/libexec/PlistBuddy -c "Print :LSMinimumSystemVersion" "$APP/Contents/Info.plist" 2>/dev/null || echo "")
           [ "$MINOS" = "13.0" ] \
             || { echo "::error::aarch64 LSMinimumSystemVersion is '$MINOS', expected 13.0 — ScreenCaptureKit is hard-linked and needs 13.0+; a lower floor lets older Macs install an app that dyld-aborts at launch"; exit 1; }
+
+          # When we sign for real, prove it. An unsigned or unstapled build that
+          # slips through looks identical to a good one until a user downloads it.
+          if [ "${{ steps.signing.outputs.signed }}" = "true" ]; then
+            codesign -dv --verbose=4 "$APP" 2>&1 | grep -q "Authority=Developer ID Application" \
+              || { echo "::error::signing was enabled but the shipped app is not Developer ID signed"; exit 1; }
+            codesign -dv --verbose=2 "$APP" 2>&1 | grep -q "flags=.*runtime" \
+              || { echo "::error::Developer ID build is missing the hardened runtime flag — notarization will reject it"; exit 1; }
+            codesign -d --entitlements - --xml "$APP" 2>/dev/null | grep -q "com.apple.security.device.audio-input" \
+              || { echo "::error::hardened runtime without com.apple.security.device.audio-input — the app will be denied the microphone"; exit 1; }
+            spctl -a -vv "$APP" 2>&1 | grep -q "accepted" \
+              || { echo "::error::Gatekeeper rejects the signed app (spctl)"; exit 1; }
+            xcrun stapler validate "$DMG" \
+              || { echo "::error::notarization ticket is not stapled to the dmg — users on a fresh Mac will still see a Gatekeeper prompt"; exit 1; }
+            echo "signed OK: Developer ID, hardened runtime, audio-input entitlement, spctl accepted, ticket stapled"
+          else
+            echo "::warning::unsigned (ad-hoc) build — see 'Decide signing mode'"
+          fi
 
           echo "bundle OK (verified inside shipped dmg): mic purpose string present, resources sealed, signature verifies, minimumSystemVersion=$MINOS"
 
@@ -233,7 +294,20 @@ jobs:
       #     tauri.conf.json) covers it and the dmg it cuts already has both.
       # RUSTFLAGS and --config are scoped to this step only — arm64
       # statically links ort and has no frameworks entry to add.
-      - name: tauri build (x86_64, ad-hoc signed with onnxruntime bundled + rpath — cross-compiled)
+      # Same gate as the aarch64 job — see the comment there. Signing and hardened
+      # runtime arrive together, only when the certificate secret exists.
+      - name: Decide signing mode
+        id: signing
+        env:
+          CERT: ${{ secrets.APPLE_CERTIFICATE }}
+        run: |
+          if [ -n "$CERT" ]; then
+            echo "signed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: tauri build (x86_64, onnxruntime bundled + rpath — cross-compiled)
         working-directory: apps/desktop
         env:
           # An env RUSTFLAGS *replaces* .cargo/config.toml's `rustflags`, it
@@ -245,6 +319,13 @@ jobs:
           # /usr/lib/swift. Dropping it would trade the onnxruntime dyld abort
           # for a libswift_Concurrency one. Carry BOTH rpaths.
           RUSTFLAGS: "-C link-arg=-Wl,-rpath,/usr/lib/swift -C link-arg=-Wl,-rpath,@executable_path/../Frameworks"
+          SIGNED: ${{ steps.signing.outputs.signed }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           # `--config` DEEP-merges into tauri.conf.json ("merge with the default
           # configuration file", per `tauri build --help`), so signingIdentity and
@@ -258,8 +339,19 @@ jobs:
           # is the correct Apple Silicon floor (ScreenCaptureKit is hard-linked, and
           # its audio capture is 13.0+). That key is not arch-aware, hence the
           # per-target override here.
-          cargo tauri build --target x86_64-apple-darwin \
-            --config "{\"bundle\":{\"macOS\":{\"frameworks\":[\"${ORT_DYLIB}\"],\"minimumSystemVersion\":\"13.3\"}}}"
+          #
+          # Composed with jq so the signing keys MERGE into this overlay rather
+          # than a second --config replacing it. hardenedRuntime + entitlements
+          # only appear when a certificate exists (see "Decide signing mode").
+          OVERLAY=$(jq -nc --arg dylib "$ORT_DYLIB" --arg signed "$SIGNED" '
+            { bundle: { macOS: (
+                { frameworks: [$dylib], minimumSystemVersion: "13.3" }
+                + (if $signed == "true"
+                   then { hardenedRuntime: true, entitlements: "entitlements.plist" }
+                   else {} end)
+            ) } }')
+          echo "config overlay: $OVERLAY"
+          cargo tauri build --target x86_64-apple-darwin --config "$OVERLAY"
 
       - name: Build flow CLI (release)
         run: cargo build --release --target x86_64-apple-darwin -p flow-cli
@@ -331,6 +423,24 @@ jobs:
           MINOS=$(/usr/libexec/PlistBuddy -c "Print :LSMinimumSystemVersion" "$APP/Contents/Info.plist" 2>/dev/null || echo "")
           [ "$MINOS" = "13.3" ] \
             || { echo "::error::x86_64 LSMinimumSystemVersion is '$MINOS', expected 13.3 — the bundled onnxruntime dylib is minos 13.3 and dyld will refuse to load it below that. Did the --config minimumSystemVersion overlay get dropped?"; exit 1; }
+
+          if [ "${{ steps.signing.outputs.signed }}" = "true" ]; then
+            codesign -dv --verbose=4 "$APP" 2>&1 | grep -q "Authority=Developer ID Application" \
+              || { echo "::error::signing was enabled but the shipped Intel app is not Developer ID signed"; exit 1; }
+            codesign -d --entitlements - --xml "$APP" 2>/dev/null | grep -q "com.apple.security.device.audio-input" \
+              || { echo "::error::hardened runtime without com.apple.security.device.audio-input — the app will be denied the microphone"; exit 1; }
+            # Hardened runtime enables library validation, which rejects a dylib not
+            # signed by the host's Team ID. The bundled onnxruntime is signed by the
+            # bundler with our identity, so it should validate — but assert the
+            # escape hatch is present until an Intel Mac has actually launched it.
+            codesign -d --entitlements - --xml "$APP" 2>/dev/null | grep -q "com.apple.security.cs.disable-library-validation" \
+              || echo "::warning::Intel hardened build has no disable-library-validation entitlement; if the bundled libonnxruntime fails to load, that is why"
+            spctl -a -vv "$APP" 2>&1 | grep -q "accepted" \
+              || { echo "::error::Gatekeeper rejects the signed Intel app (spctl)"; exit 1; }
+            xcrun stapler validate "$DMG" \
+              || { echo "::error::notarization ticket is not stapled to the Intel dmg"; exit 1; }
+            echo "signed OK (Intel): Developer ID, audio-input entitlement, spctl accepted, ticket stapled"
+          fi
 
           echo "bundle OK (verified inside shipped dmg): mic purpose string present, resources sealed, signature verifies, onnxruntime dylib + rpath present, minimumSystemVersion=$MINOS"
 

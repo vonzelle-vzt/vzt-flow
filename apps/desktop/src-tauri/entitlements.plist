@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Entitlements for the Hardened Runtime. Referenced by
+  `bundle.macOS.entitlements` in tauri.conf.json.
+
+  Hardened Runtime is mandatory for notarization, and it is NOT free: it
+  re-imposes restrictions that an unhardened ad-hoc build never had. Each key
+  below exists because something breaks without it.
+
+  com.apple.security.device.audio-input
+    Under Hardened Runtime the microphone is gated by this entitlement in
+    addition to NSMicrophoneUsageDescription. Without it the app is denied the
+    mic — reintroducing, by a different mechanism, exactly the "force-quits when
+    I try to talk" bug that v0.2.1 fixed by adding the purpose string. This is
+    the single most load-bearing line in this file.
+
+  com.apple.security.cs.disable-library-validation
+    Hardened Runtime turns on library validation, which refuses to load a dylib
+    unless it is signed by the same Team ID as the host binary (or is an Apple
+    platform binary). The Intel build bundles Microsoft's libonnxruntime into
+    Contents/Frameworks; the tauri bundler signs it with our identity, so under a
+    real Developer ID this would validate. But an AD-HOC signature carries no
+    Team ID, so an ad-hoc hardened build cannot validate its own bundled dylib.
+    Rather than have the Intel build work only when signed with a certificate we
+    do not yet own, disable library validation. Revisit once Developer ID
+    signing lands and the Intel dmg has actually been launched on Intel hardware:
+    if it loads with this removed, remove it.
+
+  NOT included, deliberately:
+    com.apple.security.cs.allow-jit / allow-unsigned-executable-memory —
+    llama.cpp's Metal path compiles shaders through the out-of-process Metal
+    compiler service, not in-process JIT, and ONNX Runtime's CoreML EP does the
+    same. Neither should need executable-memory entitlements. If a hardened
+    build ever crashes inside llama.cpp or ORT with EXC_BAD_ACCESS on first
+    inference, this is the first thing to try — but do not add it speculatively;
+    each entitlement widens the attack surface of a local-first app.
+
+  There is no entitlement for Accessibility or Input Monitoring. Those are TCC
+  services granted from System Settings, not code-signing capabilities.
+-->
+<plist version="1.0">
+  <dict>
+    <key>com.apple.security.device.audio-input</key>
+    <true/>
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+  </dict>
+</plist>
