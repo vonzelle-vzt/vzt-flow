@@ -15,6 +15,12 @@ dirs = "5"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 indicatif = "0.17"
 sha2 = "0.10"
+# Pure-Rust tar + gzip extraction for the Parakeet model archive, replacing a
+# shell-out to the `tar` binary (not guaranteed on PATH, notably on Windows).
+# `flate2` is already in the tree transitively (via arboard→image); pinned here
+# as a direct dep. Both default to pure-Rust backends — no C toolchain needed.
+tar = "0.4"
+flate2 = "1"
 anyhow = "1"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
