@@ -299,6 +299,24 @@ app still works — its Settings window has a Download button for the speech mod
 also run the installer with `NO_APP=1`, which adds those without touching the
 app you already installed.
 
+### The whole thing, in three steps
+
+1. **Install.** Paste the one-liner below into a terminal. It downloads the app,
+   the `flow` CLI, the MCP server and the speech model, then launches the app.
+2. **Say yes to three permissions.** macOS asks for Microphone, Accessibility and
+   Input Monitoring the first time each is needed. Nobody can grant these for you
+   — not an installer, not `sudo`, not an AI agent. It has to be you, clicking.
+   [What each one does.](#the-three-permissions)
+3. **Hold Right Option, talk, let go.** The transcript appears at your cursor.
+
+There is no account, no licence key, and nothing to configure. The app is a
+**menu-bar icon** — no Dock icon and no main window, so if you're hunting for it
+after install, look in the top-right of your screen, not the Dock.
+
+The app is signed with an Apple Developer ID and notarized, so it opens by
+double-clicking like any other Mac app — see
+[Gatekeeper](#gatekeeper-and-code-signing).
+
 ### Let Claude do it
 
 Paste this into [Claude Code](https://claude.com/claude-code) and it installs
@@ -534,9 +552,16 @@ and **notarized** by Apple, with the notarization ticket stapled to both the app
 and the `.dmg`. They run the hardened runtime.
 
 You can therefore open the app by double-clicking it, however it reached your
-disk — browser download, Homebrew cask, or `curl | bash`. No right-click → Open,
-no "Apple cannot check it for malicious software," and because the ticket is
-stapled rather than fetched, the first launch works offline.
+disk — browser download, Homebrew cask, or `curl | bash`. There is no
+right-click → Open, no "Apple cannot check it for malicious software," and no
+trip to Privacy & Security. Because the ticket is *stapled* rather than fetched
+from Apple on demand, the first launch also works offline.
+
+One dialog does remain, and it is the ordinary one every downloaded Mac app
+shows: if the `.dmg` came from a browser or Homebrew, macOS quarantines it, and
+the first launch asks *"VZT Flow is an app downloaded from the Internet. Are you
+sure you want to open it?"* Click **Open**, once, and never again. `curl | bash`
+sets no quarantine attribute, so that path shows nothing at all.
 
 Verify it yourself:
 
