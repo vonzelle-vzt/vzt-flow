@@ -114,12 +114,12 @@
       <span><span id="dot-mic" class="status-dot bad"></span>Microphone</span>
       <button id="btn-mic">Check</button>
     </div>
-    <div class="row">
+    <div class="row" id="ax-row">
       <span><span id="dot-ax" class="status-dot bad"></span>Accessibility (for pasting)</span>
       <button id="btn-ax">Open Settings</button>
     </div>
     <div class="row">
-      <span><span id="dot-hotkey" class="status-dot bad"></span>Global hotkey (Input Monitoring) <span id="hotkey-hint" style="opacity:0.6;font-size:11px;"></span></span>
+      <span><span id="dot-hotkey" class="status-dot bad"></span><span id="hotkey-row-label">Global hotkey (Input Monitoring)</span> <span id="hotkey-hint" style="opacity:0.6;font-size:11px;"></span></span>
       <button id="btn-hotkey">Open Settings</button>
     </div>
     <div class="row">
@@ -142,7 +142,7 @@
 
   <h2>Hotkey</h2>
   <div class="card">
-    <div class="row">
+    <div class="row" id="hotkey-picker-row">
       <span>Hold-to-talk key</span>
       <select id="hotkey-select">
         <optgroup label="Right side (recommended)">
@@ -162,10 +162,19 @@
         </optgroup>
       </select>
     </div>
-    <div class="row" style="border-top:none;">
+    <div class="row" id="hotkey-fixed-row" style="display:none;">
+      <span>Hold-to-talk key</span>
+      <span style="font-weight:600;">Ctrl+Shift+Space</span>
+    </div>
+    <div class="row" id="hotkey-picker-note" style="border-top:none;">
       <span style="opacity:0.6;font-size:11px;">Left-side modifiers are the ones ordinary shortcuts use (Cmd+C,
         Shift+click) — holding one to talk collides with typing. The accidental-press guard discards the false
         start, but the binding will feel twitchy. Right Option is the default because it's the least-used modifier.</span>
+    </div>
+    <div class="row" id="hotkey-fixed-note" style="border-top:none; display:none;">
+      <span style="opacity:0.6;font-size:11px;">The hotkey is fixed on this platform — hold it to talk, or tap it
+        for hands-free. (Bare modifier keys can't be registered as global shortcuts here, so the macOS-style
+        key picker doesn't apply.)</span>
     </div>
     <div class="row">
       <span>Hold threshold (ms)</span>

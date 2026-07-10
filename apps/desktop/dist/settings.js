@@ -1,5 +1,13 @@
 const { invoke } = window.__TAURI__.core;
 
+// The configurable hold-to-talk key drives macOS's CGEventTap monitor only;
+// Windows/Linux register the fixed Ctrl+Shift+Space global shortcut and
+// ignore `hotkey_keycode` entirely — so showing the macOS key picker there
+// lets users "change" a setting that does nothing (a real Windows user hit
+// exactly this, 2026-07-10). The webview UA is the platform source of truth
+// here: WKWebView says "Macintosh", WebView2 says "Windows".
+const IS_MAC = navigator.userAgent.includes("Mac");
+
 const dotMic = document.getElementById("dot-mic");
 const dotAx = document.getElementById("dot-ax");
 const dotHotkey = document.getElementById("dot-hotkey");
@@ -102,7 +110,13 @@ async function refreshModelStatus() {
     const active = s.phase === "downloading" || s.phase === "verifying" || s.phase === "extracting";
 
     updateModelButton(btnModel, dotModel, s.parakeet_present, active, "parakeet");
-    updateModelButton(btnCleanup, dotCleanup, s.cleanup_present, active, "cleanup");
+    if (IS_MAC) {
+      updateModelButton(btnCleanup, dotCleanup, s.cleanup_present, active, "cleanup");
+    } else {
+      // Off-macOS the button is pinned to "macOS only"/disabled at init;
+      // only keep the presence dot honest here.
+      setDot(dotCleanup, s.cleanup_present);
+    }
 
     const text = phaseText(s);
     if (text) {
@@ -149,8 +163,13 @@ async function loadConfig() {
 
 async function saveConfig() {
   const config = await invoke("get_config");
-  config.hotkey_keycode = Number(hotkeySelect.value);
-  config.hotkey_label = hotkeySelect.options[hotkeySelect.selectedIndex].text;
+  // Off-macOS the picker is hidden and the keycode is meaningless — leave
+  // the stored value untouched so a config shared with a Mac (or a future
+  // configurable-shortcut Windows build) isn't clobbered by a stale select.
+  if (IS_MAC) {
+    config.hotkey_keycode = Number(hotkeySelect.value);
+    config.hotkey_label = hotkeySelect.options[hotkeySelect.selectedIndex].text;
+  }
   config.hold_threshold_ms = Number(holdThreshold.value);
   config.launch_at_login = launchAtLogin.checked;
   await invoke("set_config", { config });
@@ -255,6 +274,24 @@ launchAtLogin.addEventListener("change", saveConfig);
 btnCopy.addEventListener("click", async () => {
   await invoke("copy_last_transcript");
 });
+
+if (!IS_MAC) {
+  // Swap the macOS key picker for the fixed-shortcut row.
+  document.getElementById("hotkey-picker-row").style.display = "none";
+  document.getElementById("hotkey-picker-note").style.display = "none";
+  document.getElementById("hotkey-fixed-row").style.display = "";
+  document.getElementById("hotkey-fixed-note").style.display = "";
+  // The Accessibility and Input Monitoring grants are macOS TCC concepts;
+  // the hotkey status dot itself is still meaningful (green = the global
+  // shortcut registered), but there is no OS settings pane to open.
+  document.getElementById("ax-row").style.display = "none";
+  document.getElementById("hotkey-row-label").textContent = "Global hotkey (Ctrl+Shift+Space)";
+  btnHotkey.style.display = "none";
+  // The cleanup LLM never loads off-macOS — don't offer a 1.1 GB download
+  // that would sit unused (see docs/USAGE-Windows.md).
+  btnCleanup.textContent = "macOS only";
+  btnCleanup.disabled = true;
+}
 
 loadConfig();
 loadTranscript();

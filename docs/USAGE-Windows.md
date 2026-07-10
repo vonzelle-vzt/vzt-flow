@@ -66,12 +66,16 @@ dictating (2026-07-10).
 
 Things that behave differently from the macOS guide — worth reading once:
 
-- **The hotkey cannot be changed on Windows.** The hotkey picker in the
-  Settings window configures the macOS `hotkey_keycode` only; on Windows
-  the app always registers the fixed **Ctrl+Shift+Space** global shortcut,
-  and changing the setting does nothing (a real user hit exactly this on
-  2026-07-10 — set it to "Fn", then pressed Fn and nothing happened;
-  Ctrl+Shift+Space still worked the whole time).
+- **The hotkey cannot be changed on Windows.** The app always registers the
+  fixed **Ctrl+Shift+Space** global shortcut; the configurable
+  `hotkey_keycode` drives macOS's key monitor only. On v0.3.1 the Settings
+  window still shows the macOS key picker, and changing it does nothing (a
+  real user hit exactly this on 2026-07-10 — set it to "Fn", then pressed
+  Fn and nothing happened; Ctrl+Shift+Space still worked the whole time).
+  Fixed on `main`: the Settings window now shows the fixed shortcut on
+  Windows/Linux instead of the picker (which stays macOS-only), and also
+  hides the macOS-only Accessibility/Input Monitoring permission rows and
+  disables the inert cleanup-model download.
 - **No Escape-to-cancel.** Use the tray icon's **Start/Stop dictation**
   item to end or abandon a recording early, or `flow cancel` from a
   terminal. (Registering a global Escape shortcut would swallow Escape
