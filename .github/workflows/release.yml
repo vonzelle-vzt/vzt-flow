@@ -28,6 +28,35 @@ jobs:
           npm ci --prefix mcp
           npm run build --prefix mcp
 
+      # apple-metal 0.8.8 (pulled in by screencapturekit) compiles a Swift bridge
+      # that references MTLSamplerReductionMode, a symbol that exists only in the
+      # macOS 26 SDK. GitHub's macOS runners ship several Xcodes and `xcode-select`
+      # may default to an older one, so this build was a coin flip: it passed only
+      # while rust-cache still held a prebuilt apple-metal, and died with
+      # "cannot find 'MTLSamplerReductionMode' in scope" on the first cache miss
+      # (the same shape as the OpenSSL bug in this workflow — latent, masked by
+      # caching, surfaced by the first cache miss).
+      # Pin the newest installed Xcode and fail loudly if its SDK is too old.
+      - name: Select newest Xcode (apple-metal needs the macOS 26 SDK)
+        run: |
+          set -euo pipefail
+          # `[ -n "$XC" ] && sudo ...` would EXIT here under `set -e` when the glob
+          # matches nothing (the failed test is the last command of the && list).
+          XC=$(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | tail -1 || true)
+          if [ -n "$XC" ]; then
+            sudo xcode-select -s "$XC"
+          else
+            echo "no /Applications/Xcode_*.app found; using the default toolchain"
+          fi
+          xcodebuild -version
+          SDK=$(xcrun --show-sdk-version)
+          echo "selected macOS SDK: $SDK"
+          MAJOR=${SDK%%.*}
+          if [ "$MAJOR" -lt 26 ]; then
+            echo "::error::macOS SDK $MAJOR is too old for apple-metal 0.8.8 (needs MTLSamplerReductionMode from the macOS 26 SDK). Xcodes present: $(ls -d /Applications/Xcode*.app 2>/dev/null | tr '\n' ' ')"
+            exit 1
+          fi
+
       - name: OpenSSL headers for llama.cpp vendored httplib (macOS 26 runners)
         run: |
           brew list openssl@3 >/dev/null 2>&1 || brew install openssl@3
@@ -267,6 +296,35 @@ jobs:
           DYLIB=$(find /tmp/ort-x64/lib -name 'libonnxruntime.*.dylib' | head -n1)
           [ -n "$DYLIB" ] || { echo "::error::libonnxruntime dylib not found under /tmp/ort-x64/lib after extracting the release tarball"; exit 1; }
           echo "ORT_DYLIB=$DYLIB" >> "$GITHUB_ENV"
+
+      # apple-metal 0.8.8 (pulled in by screencapturekit) compiles a Swift bridge
+      # that references MTLSamplerReductionMode, a symbol that exists only in the
+      # macOS 26 SDK. GitHub's macOS runners ship several Xcodes and `xcode-select`
+      # may default to an older one, so this build was a coin flip: it passed only
+      # while rust-cache still held a prebuilt apple-metal, and died with
+      # "cannot find 'MTLSamplerReductionMode' in scope" on the first cache miss
+      # (the same shape as the OpenSSL bug in this workflow — latent, masked by
+      # caching, surfaced by the first cache miss).
+      # Pin the newest installed Xcode and fail loudly if its SDK is too old.
+      - name: Select newest Xcode (apple-metal needs the macOS 26 SDK)
+        run: |
+          set -euo pipefail
+          # `[ -n "$XC" ] && sudo ...` would EXIT here under `set -e` when the glob
+          # matches nothing (the failed test is the last command of the && list).
+          XC=$(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | tail -1 || true)
+          if [ -n "$XC" ]; then
+            sudo xcode-select -s "$XC"
+          else
+            echo "no /Applications/Xcode_*.app found; using the default toolchain"
+          fi
+          xcodebuild -version
+          SDK=$(xcrun --show-sdk-version)
+          echo "selected macOS SDK: $SDK"
+          MAJOR=${SDK%%.*}
+          if [ "$MAJOR" -lt 26 ]; then
+            echo "::error::macOS SDK $MAJOR is too old for apple-metal 0.8.8 (needs MTLSamplerReductionMode from the macOS 26 SDK). Xcodes present: $(ls -d /Applications/Xcode*.app 2>/dev/null | tr '\n' ' ')"
+            exit 1
+          fi
 
       - name: OpenSSL headers for llama.cpp vendored httplib (macOS 26 runners)
         run: |
