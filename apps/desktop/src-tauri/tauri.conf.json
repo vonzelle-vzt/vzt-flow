@@ -26,7 +26,7 @@
       "icons/icon.ico"
     ],
     "macOS": {
-      "minimumSystemVersion": "12.0",
+      "minimumSystemVersion": "13.0",
       "signingIdentity": "-",
       "hardenedRuntime": false
     }

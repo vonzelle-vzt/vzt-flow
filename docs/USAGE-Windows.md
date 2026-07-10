@@ -58,7 +58,32 @@ Run either the `.msi` or the `.exe` to install. Since the CI build is
 flag it as an unrecognized publisher; you'll need to click through an
 "install anyway" prompt.
 
-### Option B: build from source
+### Option B: one-line installer (tagged releases only)
+
+```powershell
+iwr https://raw.githubusercontent.com/vonzelle-vzt/vzt-flow/main/scripts/install.ps1 -UseBasicParsing | iex
+```
+
+Downloads the latest **tagged** GitHub Release's `.msi`/`.exe` (see
+`.github/workflows/release.yml`'s `windows` job — distinct from the
+per-push `build.yml` artifact in Option A above) and runs it, then also
+downloads and installs the `flow` CLI + MCP server from that same release's
+`vzt-flow-cli-windows-x86_64.tar.gz` asset: `flow.exe` lands in
+`%LOCALAPPDATA%\Programs\vzt-flow\bin` (added to your User PATH — restart
+your terminal to pick it up) and the MCP server in
+`%APPDATA%\vzt-flow\mcp`, registered with `claude mcp add` if the `claude`
+CLI is on PATH. By default it also downloads the Parakeet ASR model
+(`-InstallModels asr`) so the install is usable end to end; pass
+`-InstallModels none` to skip. Windows on Arm is skipped for the CLI/MCP
+step (that tarball is x86_64-only today — see release.yml) and falls back
+to the manual build-from-source path below.
+
+`scripts/install.ps1` itself is not exercised by CI (there is no Windows
+runner running this script) and, like the rest of this build, is
+**unverified on real Windows hardware** — see the warning banner at the top
+of this doc.
+
+### Option C: build from source
 
 ```powershell
 git clone https://github.com/vonzelle-vzt/vzt-flow.git

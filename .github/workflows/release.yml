@@ -113,7 +113,15 @@ jobs:
           codesign --verify --deep --strict "$APP" \
             || { echo "::error::shipped dmg's bundle signature does not verify"; exit 1; }
 
-          echo "bundle OK (verified inside shipped dmg): mic purpose string present, resources sealed, signature verifies"
+          # ScreenCaptureKit is HARD-linked (LC_LOAD_DYLIB, not weak) and its audio
+          # capture is macOS 13.0+. Shipping a lower LSMinimumSystemVersion lets an
+          # older Mac install the app and then dyld-abort at launch — no dialog, just
+          # a bouncing icon. Same failure class as the Intel onnxruntime dyld abort.
+          MINOS=$(/usr/libexec/PlistBuddy -c "Print :LSMinimumSystemVersion" "$APP/Contents/Info.plist" 2>/dev/null || echo "")
+          [ "$MINOS" = "13.0" ] \
+            || { echo "::error::aarch64 LSMinimumSystemVersion is '$MINOS', expected 13.0 — ScreenCaptureKit is hard-linked and needs 13.0+; a lower floor lets older Macs install an app that dyld-aborts at launch"; exit 1; }
+
+          echo "bundle OK (verified inside shipped dmg): mic purpose string present, resources sealed, signature verifies, minimumSystemVersion=$MINOS"
 
       - name: Prune MCP node_modules to production deps
         # dist/index.js imports @modelcontextprotocol/sdk and zod at
@@ -238,8 +246,20 @@ jobs:
           # for a libswift_Concurrency one. Carry BOTH rpaths.
           RUSTFLAGS: "-C link-arg=-Wl,-rpath,/usr/lib/swift -C link-arg=-Wl,-rpath,@executable_path/../Frameworks"
         run: |
+          # `--config` DEEP-merges into tauri.conf.json ("merge with the default
+          # configuration file", per `tauri build --help`), so signingIdentity and
+          # hardenedRuntime from the file survive this overlay. Empirical proof:
+          # v0.2.1's Intel dmg passed the seal + signature guard while this overlay
+          # was already active. Do not restate those keys here.
+          #
+          # minimumSystemVersion is overridden to 13.3 for INTEL ONLY. The bundled
+          # onnxruntime-osx-x86_64-1.22.0 dylib has LC_BUILD_VERSION minos 13.3, so
+          # dyld refuses to load it below that. tauri.conf.json carries 13.0, which
+          # is the correct Apple Silicon floor (ScreenCaptureKit is hard-linked, and
+          # its audio capture is 13.0+). That key is not arch-aware, hence the
+          # per-target override here.
           cargo tauri build --target x86_64-apple-darwin \
-            --config "{\"bundle\":{\"macOS\":{\"frameworks\":[\"${ORT_DYLIB}\"]}}}"
+            --config "{\"bundle\":{\"macOS\":{\"frameworks\":[\"${ORT_DYLIB}\"],\"minimumSystemVersion\":\"13.3\"}}}"
 
       - name: Build flow CLI (release)
         run: cargo build --release --target x86_64-apple-darwin -p flow-cli
@@ -303,7 +323,16 @@ jobs:
           grep -q "/usr/lib/swift" <<<"$RPATHS" \
             || { echo "::error::shipped dmg's binary lost its /usr/lib/swift LC_RPATH — dyld will fail on libswift_Concurrency.dylib. Did an env RUSTFLAGS clobber .cargo/config.toml?"; exit 1; }
 
-          echo "bundle OK (verified inside shipped dmg): mic purpose string present, resources sealed, signature verifies, onnxruntime dylib + rpath present"
+          # Intel's real floor is 13.3, not the 13.0 in tauri.conf.json: the bundled
+          # onnxruntime dylib above has LC_BUILD_VERSION minos 13.3, so dyld refuses
+          # to load it on anything older. The build step's --config overlay sets this;
+          # if the overlay is ever dropped the app silently ships a 13.0 floor and
+          # dyld-aborts on 13.0-13.2.
+          MINOS=$(/usr/libexec/PlistBuddy -c "Print :LSMinimumSystemVersion" "$APP/Contents/Info.plist" 2>/dev/null || echo "")
+          [ "$MINOS" = "13.3" ] \
+            || { echo "::error::x86_64 LSMinimumSystemVersion is '$MINOS', expected 13.3 — the bundled onnxruntime dylib is minos 13.3 and dyld will refuse to load it below that. Did the --config minimumSystemVersion overlay get dropped?"; exit 1; }
+
+          echo "bundle OK (verified inside shipped dmg): mic purpose string present, resources sealed, signature verifies, onnxruntime dylib + rpath present, minimumSystemVersion=$MINOS"
 
       - name: Prune MCP node_modules to production deps
         working-directory: mcp
@@ -390,6 +419,64 @@ jobs:
         with:
           name: vzt-flow-windows-x64-installers
           path: ci-artifacts/*
+          if-no-files-found: error
+
+      # Windows needs none of the macos-x64 job's ORT_STRATEGY=system dance —
+      # `ort` ships prebuilt binaries for x86_64-pc-windows-msvc, so this job
+      # has no env: block and builds the CLI the same simple shape as the
+      # `linux` job (build, smoke-test, prune, tar). Without this, Windows
+      # ships only the .msi/.exe desktop app: no flow.exe, no MCP server, and
+      # since only the CLI can download the Parakeet ASR model, a Windows
+      # user has no path to a working install short of building from source.
+      - name: Build flow CLI (release)
+        run: cargo build --release --target x86_64-pc-windows-msvc -p flow-cli
+
+      - name: Verify CLI binary runs (smoke check)
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$(./target/x86_64-pc-windows-msvc/release/flow.exe --version)"
+          echo "flow.exe --version: $OUT"
+          echo "$OUT" | grep -q "^flow " \
+            || { echo "::error::flow.exe --version did not print the expected 'flow <version>' output — binary may not link/run on Windows"; exit 1; }
+
+      - name: Prune MCP node_modules to production deps
+        # See the macos/linux jobs' identical step: dist/index.js imports
+        # @modelcontextprotocol/sdk and zod at runtime, so the release
+        # tarball needs node_modules alongside dist/.
+        working-directory: mcp
+        run: npm prune --omit=dev
+
+      - name: Package CLI tarball (flow.exe + mcp/dist + mcp/node_modules)
+        # GitHub's windows-latest runners ship bsdtar and bash (Git for
+        # Windows), so this mirrors the linux job's heredoc + tar shape
+        # exactly instead of reimplementing it in PowerShell/Compress-Archive
+        # (which doesn't produce .tar.gz anyway).
+        shell: bash
+        run: |
+          STAGE=$(mktemp -d)/vzt-flow-cli-windows-x86_64
+          mkdir -p "$STAGE/bin" "$STAGE/mcp"
+          cp target/x86_64-pc-windows-msvc/release/flow.exe "$STAGE/bin/flow.exe"
+          cp -R mcp/dist "$STAGE/mcp/dist"
+          cp -R mcp/node_modules "$STAGE/mcp/node_modules"
+          cp mcp/package.json "$STAGE/mcp/package.json"
+          cat > "$STAGE/mcp/README-snippet.md" <<'EOF'
+          # VZT Flow MCP server (Windows build)
+
+          Register with Claude Code:
+
+              claude mcp add vzt-flow --scope user -- node <path-to>/mcp/dist/index.js
+
+          The `flow` CLI must be on your PATH (or set VZT_FLOW_BIN) for the
+          MCP server's listen/transcribe tools to work. node_modules/ is
+          bundled alongside dist/ — dist/index.js needs it at runtime.
+          EOF
+          tar -C "$(dirname "$STAGE")" -czf vzt-flow-cli-windows-x86_64.tar.gz "$(basename "$STAGE")"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vzt-flow-cli-windows-x86_64
+          path: vzt-flow-cli-windows-x86_64.tar.gz
           if-no-files-found: error
 
   # Attempt only — see build.yml's windows-arm64 job for the rationale.
