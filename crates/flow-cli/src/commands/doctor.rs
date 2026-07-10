@@ -2,7 +2,9 @@ use std::time::Duration;
 
 use anyhow::Result;
 use flow_core::audio::default_input_device_info;
+#[cfg(target_os = "macos")]
 use flow_core::config::Config;
+#[cfg(target_os = "macos")]
 use flow_core::hotkey::{
     hotkey_keycode_is_hold_capable, hotkey_keycode_is_supported, supported_hotkey_keycodes,
 };
@@ -65,6 +67,15 @@ pub fn run() -> Result<()> {
         Err(e) => println!("Cleanup model: error checking status ({e})"),
     }
 
+    // The configurable `hotkey_keycode` is a macOS CGEvent keycode driving the
+    // CGEventTap monitor; on Windows/Linux the hotkey is the fixed
+    // Ctrl+Shift+Space global shortcut registered by the desktop app
+    // (tauri-plugin-global-shortcut), so reporting the config keycode there
+    // would describe a key that does nothing (real-hardware finding,
+    // 2026-07-10: doctor printed "Right Option (keycode 61)" on Windows).
+    #[cfg(not(target_os = "macos"))]
+    println!("Hotkey: Ctrl+Shift+Space (fixed global shortcut on this platform; hold or tap)");
+    #[cfg(target_os = "macos")]
     match Config::load() {
         Ok(cfg) => {
             let kc = cfg.hotkey_keycode;
@@ -98,6 +109,30 @@ pub fn run() -> Result<()> {
         Err(e) => println!("Hotkey: error loading config ({e})"),
     }
 
+    // Windows: the daemon transport is a named pipe, not a socket file —
+    // there is nothing on disk for the Unix arm's `path.exists()` gate to
+    // find, so it printed "not present" even with a live daemon answering on
+    // the pipe (real-hardware finding, 2026-07-10). Connect-test the pipe
+    // directly; named pipes also have no stale-file state to report.
+    #[cfg(windows)]
+    {
+        let pipe = format!(r"\\.\pipe\{}", flow_core::ipc::windows::PIPE_NAME);
+        let probe = std::path::Path::new(&pipe); // arg is unused by the Windows transport
+        if transport::is_alive(probe) {
+            println!("Daemon pipe: PRESENT and alive ({pipe})");
+            match transport::call(probe, &Request::Status, Some(Duration::from_secs(5))) {
+                Ok(resp) if resp.ok => {
+                    println!("Daemon version: {}", resp.version.as_deref().unwrap_or("unknown"));
+                    println!("Daemon state: {}", resp.state.as_deref().unwrap_or("unknown"));
+                }
+                Ok(resp) => println!("Daemon status query failed: {}", resp.error.as_deref().unwrap_or("?")),
+                Err(e) => println!("Daemon status query failed: {e}"),
+            }
+        } else {
+            println!("Daemon pipe: not present ({pipe})");
+        }
+    }
+    #[cfg(not(windows))]
     match flow_core::ipc::socket_path() {
         Ok(path) => {
             if !path.exists() {

@@ -660,16 +660,21 @@ this build works around.
 ### Windows (experimental)
 
 > [!WARNING]
-> Compiles and is CI-built on every push, but **has never been run on real
-> Windows hardware**. The Windows installers are **unsigned** — there is no
-> code signing in CI — so SmartScreen will show "Windows protected your PC" on
-> first run. Choose **More info → Run anyway**. The Apple Developer ID signing
-> described under [Gatekeeper](#gatekeeper-and-code-signing) covers the macOS
-> `.dmg` only; it does nothing for Windows. The daemon control socket now works over a Windows
-> named pipe (`\\.\pipe\vzt-flow-daemon`) — CI-unit-tested, but the full
-> desktop-app-as-daemon round trip is unverified on real hardware. Still no
-> per-app profiles, no `clean`/`polish` cleanup LLM yet, Ctrl+V paste with no
-> secure-field detection. Default hotkey is **Ctrl+Shift+Space**.
+> Experimental, but now **run once on real Windows hardware (2026-07-10)**:
+> install, model download, transcription (RTF 0.131x on CPU ONNX), the
+> Ctrl+Shift+Space hotkey, hands-free auto-stop, and the full
+> desktop-app-as-daemon round trip over the named pipe
+> (`\\.\pipe\vzt-flow-daemon`) — including the MCP server — all verified
+> working. **v0.3.1's auto-paste is broken** (transcript lands on the
+> clipboard only; fixed on `main`). The Windows installers are **unsigned** —
+> there is no code signing in CI — so a browser-downloaded installer may hit
+> SmartScreen's "Windows protected your PC" on first run: choose **More info →
+> Run anyway**. (The Apple Developer ID signing described under
+> [Gatekeeper](#gatekeeper-and-code-signing) covers the macOS `.dmg` only.)
+> Still no per-app profiles, no `clean`/`polish` cleanup LLM yet, Ctrl+V paste
+> with no secure-field detection. Default hotkey is **Ctrl+Shift+Space**.
+> Details:
+> [docs/USAGE-Windows.md](docs/USAGE-Windows.md#first-real-hardware-test-results-2026-07-10).
 
 ```powershell
 cargo build --release -p flow-cli
@@ -718,7 +723,7 @@ source steps: [docs/USAGE-Linux.md](docs/USAGE-Linux.md).
 |---|---|---|
 | macOS Apple Silicon (`aarch64-apple-darwin`) | **Supported, tested** | Primary dev platform (M5 MacBook Air); Metal cleanup + CoreML ASR |
 | macOS Intel (`x86_64-apple-darwin`) | Built in CI, CPU-only inference | Never run on real Intel hardware; effective floor is macOS **13.3**, not the 12.0 in `tauri.conf.json` — see [USAGE-macOS.md](docs/USAGE-macOS.md#hardware-requirements) |
-| Windows x64 (`x86_64-pc-windows-msvc`) | Built in CI, experimental | Never run on real Windows hardware; daemon control socket now works over a named pipe (CI-unit-tested); still no per-app profiles/cleanup LLM |
+| Windows x64 (`x86_64-pc-windows-msvc`) | Built in CI, experimental — **run once on real hardware (2026-07-10)** | Install/ASR/hotkey/daemon-over-named-pipe/MCP all verified on a real Windows 11 machine; v0.3.1 auto-paste broken (fixed on `main`); still no per-app profiles/cleanup LLM |
 | Windows Arm (`aarch64-pc-windows-msvc`) | Attempted in CI, allowed to fail | Status depends on upstream (`ort`, WebView2-on-Arm) support this week — check the latest `build` workflow run |
 | Linux x64 (`x86_64-unknown-linux-gnu`) | **Unsupported, community-maintained** | Never run on real Linux hardware; not part of the supported release surface — `.deb` + `.AppImage` keep shipping from CI (built + unit-tested on every push), provided as-is. **X11**: hotkey/paste/tray/overlay all work as designed. **Wayland**: no global hotkey across native apps (no fix planned), clipboard-only paste, best-effort overlay (Wayland denies clients global input grabs). No cleanup LLM / profiles / meeting mode (as Windows). See [USAGE-Linux.md](docs/USAGE-Linux.md) |
 

@@ -197,11 +197,21 @@ fn can_synthesize_paste() -> bool {
 fn simulate_paste() -> Result<()> {
     let mut enigo = Enigo::new(&Settings::default()).context("failed to init enigo")?;
     let modifier = paste_modifier();
+    // Windows: `Key::Unicode('v')` is delivered as a KEYEVENTF_UNICODE /
+    // VK_PACKET character event, which target apps do not map onto the
+    // Ctrl+V paste accelerator — verified on real Windows hardware
+    // (2026-07-10): enigo reported success while Notepad received nothing,
+    // and the identical Ctrl+V via a raw VK_V (0x56) SendInput pasted fine.
+    // Send the real virtual key instead.
+    #[cfg(target_os = "windows")]
+    let v_key = Key::Other(0x56); // VK_V
+    #[cfg(not(target_os = "windows"))]
+    let v_key = Key::Unicode('v');
     enigo
         .key(modifier, Direction::Press)
         .context("failed to press paste modifier")?;
     enigo
-        .key(Key::Unicode('v'), Direction::Click)
+        .key(v_key, Direction::Click)
         .context("failed to click V")?;
     enigo
         .key(modifier, Direction::Release)

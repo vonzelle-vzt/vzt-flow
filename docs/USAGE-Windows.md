@@ -1,14 +1,38 @@
 # VZT Flow — Windows Usage Guide
 
 > [!WARNING]
-> **Status: EXPERIMENTAL.** The Windows build compiles and is built by CI
-> (`.github/workflows/build.yml`'s `windows` job runs `cargo test --release
-> --workspace` and `cargo tauri build` on `windows-latest` for every push/PR
-> to `main`), but **it has never been run on real Windows hardware** —
-> all development happens on macOS. Everything below is either verified
-> directly against the code (marked as such) or an honest "this is what the
-> code does, untested in practice" statement. If you try it, please report
-> back — see [Help us test](#help-us-test) at the bottom.
+> **Status: EXPERIMENTAL, first real-hardware run 2026-07-10.** The Windows
+> build compiles and is built by CI (`.github/workflows/build.yml`'s
+> `windows` job runs `cargo test --release --workspace` and `cargo tauri
+> build` on `windows-latest` for every push/PR to `main`), and the v0.3.1
+> release has now been exercised once on real Windows hardware (Windows 11
+> Pro, x64) — see [First real-hardware test
+> results](#first-real-hardware-test-results-2026-07-10) below for exactly
+> what worked and what didn't (headline: everything up to and including the
+> daemon worked; the **auto-paste silently did nothing** — fixed on `main`
+> after that run). Everything else below is either verified directly against
+> the code (marked as such) or an honest "this is what the code does,
+> untested in practice" statement. If you try it, please report back — see
+> [Help us test](#help-us-test) at the bottom.
+
+## First real-hardware test results (2026-07-10)
+
+One full pass of the v0.3.1 release artifacts on a real Windows 11 Pro x64
+machine (Ryzen 7 7735HS). What was observed:
+
+| Area | Result |
+|---|---|
+| NSIS installer (`VZT.Flow_0.3.1_x64-setup.exe`, silent `/S`) | **Works.** Per-user install to `%LOCALAPPDATA%\VZT Flow\`, exit 0. (Downloaded via `gh`, so no mark-of-the-web — the SmartScreen question is still open for browser downloads.) |
+| CLI tarball layout | **Matches `install.ps1`'s expectations** (`bin\flow.exe`, `mcp\dist`, `mcp\node_modules`, `mcp\package.json`). |
+| `flow doctor` | Runs; found the mic (AMD Audio Device), ffmpeg, `%APPDATA%\vzt-flow` config root. Two display bugs found and fixed on `main`: it printed the macOS "Right Option (keycode 61)" hotkey and gated the daemon check on a `daemon.sock` file that never exists on Windows (reporting "not present" against a live daemon). |
+| `flow models download parakeet-v3` | **Works** (456 MB → `%APPDATA%\vzt-flow\models\parakeet-v3`). |
+| `flow transcribe` (8.09 s TTS wav) | **Works, verbatim transcript.** 1.06 s wall, **RTF 0.131x** on plain CPU ONNX, model load 3.02 s. |
+| Desktop app + named-pipe daemon | **Works end to end** — first time observed outside CI. App runs from the tray, `\\.\pipe\vzt-flow-daemon` exists, `flow status`/`toggle`/`cancel`/`listen` all reach it. The `set_recv_timeout` blocking-read degradation (CLAUDE.md gotcha g) fires on real hardware too — it is the *normal* Windows path, not a CI quirk. |
+| Ctrl+Shift+Space global hotkey | **Registers and fires** (verified with a synthetic tap → daemon state went `recording`; also verified by a human hold-to-talk). |
+| Hands-free record → silence auto-stop → transcribe | **Works** through the daemon (13.9 s speaker-played clip picked up by the laptop mic, verbatim transcript). |
+| MCP server (`transcribe_file` over stdio JSON-RPC) | **Works** against the daemon. |
+| Clipboard save → set → restore | **Works** (original clipboard restored after dictation). |
+| **Auto-paste (enigo Ctrl+V)** | **BROKEN in v0.3.1 — silently does nothing.** `paste_text` reports `Pasted`, but the focused app (Notepad, verified foreground, non-elevated) receives no input, while an identical raw `SendInput` VK_V Ctrl+V from another process pastes fine. Root cause: enigo's `Key::Unicode('v')` is delivered as a `KEYEVENTF_UNICODE`/`VK_PACKET` character event, which apps don't map onto the Ctrl+V accelerator. **Fixed on `main`** (`insert.rs` now sends `Key::Other(0x56)` — VK_V — on Windows); v0.3.1 users get the transcript on the clipboard and must paste manually. |
 
 ## Hardware requirements
 
@@ -78,10 +102,17 @@ CLI is on PATH. By default it also downloads the Parakeet ASR model
 step (that tarball is x86_64-only today — see release.yml) and falls back
 to the manual build-from-source path below.
 
+For unattended/agent-driven installs, pass `-Silent` (or set
+`$env:INSTALL_SILENT=1`) to run the NSIS installer with `/S` instead of the
+interactive wizard — nothing can click through the wizard in a scripted run.
+The silent per-user install path was verified working on real Windows 11
+(2026-07-10).
+
 `scripts/install.ps1` itself is not exercised by CI (there is no Windows
-runner running this script) and, like the rest of this build, is
-**unverified on real Windows hardware** — see the warning banner at the top
-of this doc.
+runner running this script); its individual steps (silent NSIS install, CLI
+tarball layout, MCP `claude mcp add` registration, model download) were each
+exercised once on real Windows hardware on 2026-07-10 — see the test-results
+table at the top of this doc.
 
 ### Option C: build from source
 
@@ -261,12 +292,14 @@ guide unchanged):
 
 ## Known limitations
 
-- Daemon control socket (named pipe) is CI-compiled and CI-unit-tested but
-  **not yet exercised end to end on real Windows hardware** — the
-  desktop-app-as-daemon + `flow status`/`toggle`/`listen` + MCP round trip
-  through an actually-running app has not been observed outside CI's
-  in-process pipe tests. See [Differences vs.
-  macOS](#differences-vs-macos) above for exactly what is/isn't proven.
+- ~~Daemon control socket (named pipe) not yet exercised end to end on real
+  Windows hardware~~ — **verified working 2026-07-10** (see [First
+  real-hardware test results](#first-real-hardware-test-results-2026-07-10)):
+  desktop-app-as-daemon + `flow status`/`toggle`/`cancel`/`listen` + the MCP
+  server's daemon path all round-trip through a really-running app.
+- **v0.3.1's auto-paste is broken** (silently leaves the transcript on the
+  clipboard only — paste manually with Ctrl+V). Fixed on `main`; see the
+  test-results table above.
 - No per-app profiles → one mode/tone for everything (edit `profiles.toml`'s
   `[default]`).
 - No `clean`/`polish` LLM rewrite — only `raw` and `code` modes do anything
@@ -275,9 +308,9 @@ guide unchanged):
 - No secure-field paste protection.
 - Elevated-window paste can silently fail (transcript still lands on the
   clipboard).
-- Never tested on real Windows hardware — hold/tap timing, permission
-  prompts (SmartScreen/Defender on the unsigned installer), and general
-  stability are unverified.
+- Tested on real Windows hardware exactly once (2026-07-10, one machine) —
+  the SmartScreen/Defender prompt on a browser-downloaded unsigned installer
+  and long-term stability remain unverified.
 
 ## Help us test
 

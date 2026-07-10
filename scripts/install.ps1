@@ -18,6 +18,11 @@
 #
 # Env / params:
 #   -InstallYes          never prompt
+#   -Silent /            run the NSIS installer with /S (no wizard UI) —
+#   $env:INSTALL_SILENT   required when an agent/script runs this end to end,
+#                        since nothing can click through the wizard for you.
+#                        Verified working on real Windows 11 (2026-07-10):
+#                        per-user install, exit 0, no elevation needed.
 #   $env:GITHUB_TOKEN     optional; only needed as a fallback if `gh` isn't
 #                        installed and unauthenticated GitHub API requests
 #                        are rate-limited (60/hr per IP), or for a private fork
@@ -37,8 +42,11 @@
 
 param(
     [switch]$InstallYes,
+    [switch]$Silent,
     [string]$InstallModels = "asr"
 )
+
+if (-not $Silent -and $env:INSTALL_SILENT) { $Silent = $true }
 
 if (-not $PSBoundParameters.ContainsKey('InstallModels') -and $env:INSTALL_MODELS) {
     $InstallModels = $env:INSTALL_MODELS
@@ -161,8 +169,13 @@ if (-not $Setup) {
     throw "download succeeded but no *-setup.exe found in $WorkDir"
 }
 
-Write-Host "==> running $($Setup.Name)"
-Start-Process -FilePath $Setup.FullName -Wait
+Write-Host "==> running $($Setup.Name)$(if ($Silent) { ' (silent, /S)' })"
+if ($Silent) {
+    $proc = Start-Process -FilePath $Setup.FullName -ArgumentList "/S" -Wait -PassThru
+    if ($proc.ExitCode -ne 0) { throw "silent install failed (installer exit code $($proc.ExitCode))" }
+} else {
+    Start-Process -FilePath $Setup.FullName -Wait
+}
 
 # --- flow CLI + MCP server install ------------------------------------------
 # Only the CLI can download the Parakeet ASR model, so without this block a

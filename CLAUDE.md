@@ -86,15 +86,16 @@ perl -e 'alarm 30; exec @ARGV' -- <command> <args...>
 ```
 
 **(g) `interprocess` named-pipe `set_recv_timeout` is unsupported on Windows
-CI runners.** The Windows daemon transport (`crates/flow-core/src/ipc.rs`,
-`pub mod windows`) opens a named pipe at `\\.\pipe\vzt-flow-daemon`. GitHub's
-windows-2025 runners reject `set_recv_timeout` on named-pipe *client* streams
-("failed to set read timeout"), which broke `flow status`/`toggle`/`listen`
-at the first daemon call and hung/failed the `ipc::windows_tests`. The fix is
-a **blocking-read degradation**: log and continue if `set_recv_timeout`
-errors — callers already gate on `is_alive` first, so an unanswerable pipe is
-caught before the read rather than by a timeout. Don't turn that into a hard
-error, and don't assume a recv-timeout is available on any named-pipe stream.
+— everywhere, not just CI.** The Windows daemon transport
+(`crates/flow-core/src/ipc.rs`, `pub mod windows`) opens a named pipe at
+`\\.\pipe\vzt-flow-daemon`. `set_recv_timeout` on named-pipe *client* streams
+fails ("named pipes do not support I/O timeouts") on GitHub's windows-2025
+runners **and on real Windows 11 hardware (verified 2026-07-10)** — the
+blocking-read degradation is the *normal* Windows path, not a CI quirk. The
+fix is: log and continue if `set_recv_timeout` errors — callers already gate
+on `is_alive` first, so an unanswerable pipe is caught before the read rather
+than by a timeout. Don't turn that into a hard error, and don't assume a
+recv-timeout is available on any named-pipe stream.
 
 ## Verification norms
 
