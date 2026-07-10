@@ -64,15 +64,22 @@ jobs:
           npm ci --prefix apps/desktop
           npm ci --prefix mcp
           npm run build --prefix mcp
-      - name: cargo test --release (workspace)
-        run: cargo test --release --workspace
-
+      # MUST precede any cargo invocation that can compile llama-cpp-sys-2 —
+      # its build script compiles llama.cpp's vendored cpp-httplib, which
+      # needs openssl/err.h. This step used to sit *after* `cargo test`, and
+      # got away with it only while rust-cache had the build script's output
+      # cached: a cancelled run saves no cache, so the next run compiled cold
+      # and died with "fatal error: 'openssl/err.h' file not found".
       - name: OpenSSL headers for llama.cpp vendored httplib (macOS 26 runners)
         run: |
           brew list openssl@3 >/dev/null 2>&1 || brew install openssl@3
           echo "OPENSSL_ROOT_DIR=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
           echo "CPATH=$(brew --prefix openssl@3)/include" >> "$GITHUB_ENV"
           echo "LIBRARY_PATH=$(brew --prefix openssl@3)/lib" >> "$GITHUB_ENV"
+
+      - name: cargo test --release (workspace)
+        run: cargo test --release --workspace
+
       - name: Install Tauri CLI
         run: cargo install tauri-cli --version "^2" --locked
 
