@@ -103,6 +103,7 @@ The flags exist for you specifically:
 | `INSTALL_YES=1` | Skips the "overwrite existing app?" prompt. Without it the installer blocks on `read` and your shell call hangs. |
 | `NO_LAUNCH=1` | Doesn't `open` the app. Launch it in Step 3, once, at the moment the user is looking at the screen to answer permission dialogs. |
 | `INSTALL_MODELS=none\|asr\|all` | Model download. Left at `none` here on purpose — see Step 2. |
+| `NO_APP=1` | Installs only the CLI, MCP server and models; never touches `/Applications`. Use it when the app came from Homebrew, and only then. |
 | `GITHUB_TOKEN` | Only if unauthenticated GitHub API calls are rate-limited (60/hr per IP). Not normally needed; the repo is public. |
 
 The installer auto-registers the MCP server with **Claude Code only**, if the
@@ -143,9 +144,10 @@ server: skipped — node not found" in the installer's summary, install node
 from the table above.
 
 **Already installed via Homebrew?** `brew install --cask vonzelle-vzt/vzt/vzt-flow`
-installs the `.app` only. Running the script afterward is the supported path —
-it detects the brew-installed app and won't overwrite it — and is how you get
-the CLI and MCP server.
+installs the `.app` only. Run the script afterward with **`NO_APP=1`** to add the
+CLI and MCP server. That flag is not optional here: without it the script
+`rm -rf`s `/Applications/VZT Flow.app` and installs its own copy, leaving `brew`
+with a receipt for a bundle it no longer wrote.
 
 ---
 

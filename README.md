@@ -60,7 +60,7 @@ else in the docs links back here rather than restating it.
 
 (Windows/Linux use **Ctrl+Shift+Space** for the same two gestures instead of
 Right Option — see [Windows](#windows-experimental) /
-[Linux](#linux-experimental) below.)
+[Linux](#linux-unsupported--community-maintained) below.)
 
 - **Esc** cancels either mode outright — nothing is transcribed or pasted.
 - The tap only **arms** hands-free if no other key was pressed during it.
@@ -277,6 +277,28 @@ runtime) is doing real work here, not just a marketing line.
 
 ## Install
 
+**macOS 13.0 (Ventura) or newer** on Apple Silicon; **13.3 or newer** on Intel,
+because the bundled onnxruntime dylib refuses to load below that. You need
+about 700 MB of disk for the app plus the speech model, and roughly 4 GB of RAM
+free while dictating (the model unloads after 5 minutes idle, back down to
+~105 MB).
+
+The install paths are not equivalent. Only the one-liner leaves you with a
+system that works the moment it finishes:
+
+| | App | `flow` CLI | MCP server | Speech model | Launches app |
+|---|---|---|---|---|---|
+| **One-liner** (recommended) | yes | yes | yes, if `claude` is on PATH | yes, downloaded | yes |
+| **Homebrew cask** | yes | no | no | no — download it from Settings | no |
+| **Manual `.dmg`** | yes | no | no | no — download it from Settings | no |
+| **Build from source** | yes | yes | manual | manual | no |
+
+With Homebrew or a manual `.dmg` you get the menu-bar app and nothing else. The
+app still works — its Settings window has a Download button for the speech model
+— but there's no `flow` command and no voice input for Claude Code until you
+also run the installer with `NO_APP=1`, which adds those without touching the
+app you already installed.
+
 ### Let Claude do it
 
 Paste this into [Claude Code](https://claude.com/claude-code) and it installs
@@ -300,8 +322,29 @@ curl -fsSL https://raw.githubusercontent.com/vonzelle-vzt/vzt-flow/main/scripts/
 ```
 
 Downloads the latest GitHub Release, installs `VZT Flow.app` to
-`/Applications`, the `flow` CLI to a PATH directory, and registers the MCP
-server with `claude mcp add` if the `claude` CLI is present.
+`/Applications`, the `flow` CLI to a PATH directory (`/usr/local/bin`, or
+`~/.local/bin` if that isn't writable), fetches the 456 MB Parakeet speech
+model, registers the MCP server with `claude mcp add` if the `claude` CLI is
+present, and launches the app. Nothing here needs `sudo`.
+
+Because `curl | bash` never sets the quarantine attribute, the app opens on a
+normal double-click. A `.dmg` you downloaded in a browser, or a Homebrew cask,
+*is* quarantined and needs a one-time right-click → Open (see
+[Gatekeeper](#gatekeeper-and-code-signing)).
+
+Four environment variables change what it does:
+
+| Variable | Default | Effect |
+|---|---|---|
+| `INSTALL_MODELS` | `asr` | `none` skips model downloads; `asr` fetches Parakeet (456 MB); `all` adds the Qwen3 cleanup model (~1.1 GB) |
+| `INSTALL_YES` | `0` | `1` overwrites an existing install without asking. **Required when a script or agent runs the installer** — otherwise the overwrite prompt blocks forever on a non-interactive stdin |
+| `NO_LAUNCH` | `0` | `1` installs without launching the app |
+| `NO_APP` | `0` | `1` installs **only** the CLI, MCP server and models, leaving `/Applications` alone. Use this alongside a Homebrew cask install |
+
+```bash
+# everything, including the optional cleanup LLM, no prompts
+INSTALL_YES=1 INSTALL_MODELS=all curl -fsSL https://raw.githubusercontent.com/vonzelle-vzt/vzt-flow/main/scripts/install.sh | bash
+```
 
 ### macOS: Homebrew
 
@@ -314,15 +357,39 @@ Installs `VZT Flow.app` from the
 (Apple Silicon or Intel `.dmg` auto-selected by arch). Some Homebrew versions
 refuse to install a cask from a third-party tap that isn't marked trusted —
 if `brew install --cask` errors on that, run `brew trust --cask
-vonzelle-vzt/vzt/vzt-flow` first, then re-run the install. The cask installs
-the menu-bar app only; run the one-liner above afterward for the `flow` CLI +
-MCP server (it detects the brew-installed app and won't overwrite it). See
-`brew info --cask vzt-flow` for the first-run permission/model-download notes.
+vonzelle-vzt/vzt/vzt-flow` first, then re-run the install.
+
+The cask installs the **menu-bar app only** — no `flow` CLI, no MCP server, no
+speech model, and it does not launch the app. Open it from `/Applications` and
+use the Download button in its Settings window to fetch the model.
+
+For the CLI and MCP server alongside a cask install, run the installer with
+`NO_APP=1`:
+
+```bash
+NO_APP=1 curl -fsSL https://raw.githubusercontent.com/vonzelle-vzt/vzt-flow/main/scripts/install.sh | bash
+```
+
+That flag matters. Without it the installer **replaces** `/Applications/VZT
+Flow.app` — it does not detect or defer to Homebrew — which leaves `brew` with
+a receipt for a bundle it no longer wrote, and `brew upgrade` managing a file it
+didn't install. `NO_APP=1` skips the `.dmg` entirely and installs only the CLI,
+MCP server, and models.
+
+Note that `brew upgrade` hits the
+[grant-reset problem](#upgrading-macos-will-drop-two-of-your-grants) with no
+warning, because the cask can't run the code-identity check the one-liner does.
+After any cask upgrade, run the two `tccutil reset` commands yourself.
 
 ### Manual: download from Releases
 
 Grab the `.dmg` (macOS), `.msi`/`-setup.exe` (Windows), or `.deb`/`.AppImage`
 (Linux) from the [Releases page](https://github.com/vonzelle-vzt/vzt-flow/releases).
+
+A browser-downloaded `.dmg` is quarantined, so the first launch needs a
+right-click → **Open** rather than a double-click — see
+[Gatekeeper](#gatekeeper-and-code-signing). You get the app only; add the CLI
+and MCP server with `NO_APP=1 curl … | bash` as above.
 
 ### Build from source
 
@@ -337,10 +404,121 @@ cd apps/desktop && npm install && cargo install tauri-cli --version "^2" && carg
 
 Full prerequisites and platform notes: [docs/USAGE-macOS.md](docs/USAGE-macOS.md#install).
 
-### First run: model downloads
+### First run
+
+The installer launches the app for you. It appears as a menu-bar icon — there
+is no dock icon and no main window. On first launch only, it opens its Settings
+window so you can see what's still missing; after that it never nags again.
+
+That window has a live permission panel. It re-checks every two seconds, so you
+can leave it open, grant things in System Settings, and watch each row go green
+without restarting anything.
+
+**Then hold Right Option, say a sentence, and let go.** The text lands wherever
+your cursor is. That is the whole product.
+
+If you installed via Homebrew or a manual `.dmg`, the speech model isn't on disk
+yet. The Settings window has a Download button for it, or run
+`flow models download parakeet-v3` if you have the CLI. If you press the hotkey
+without it, the overlay tells you so rather than failing silently.
+
+### The three permissions
+
+macOS gates every part of this behind a separate grant, and it will not let any
+installer, script, `sudo` command, or AI agent grant them for you. It has to be
+you, clicking. What each one buys, and how it fails without it:
+
+| Permission | Without it |
+|---|---|
+| **Microphone** | No audio is captured. macOS prompts the first time you dictate. |
+| **Input Monitoring** | The hotkey never fires. Holding Right Option does **nothing** — no overlay, no error. |
+| **Accessibility** | Audio records and transcribes fine, but the text never pastes. You'll find it in `flow history` and nowhere else. |
+
+Two behaviors worth knowing. When you toggle Input Monitoring, **macOS quits the
+app** and you have to reopen it. And once a grant lands, the app re-arms its
+event tap within about two seconds on its own — you do not need to relaunch it
+to pick up a late grant.
+
+### Upgrading: macOS will drop two of your grants
+
+> [!IMPORTANT]
+> Every release re-breaks Accessibility and Input Monitoring, and it does so
+> **silently**. Read this before you conclude a new version is broken.
+
+VZT Flow is ad-hoc signed (no Apple Developer ID — see
+[Gatekeeper](#gatekeeper-and-code-signing)). macOS ties those two grants to a
+*code requirement* that pins the exact binary hash, and that hash changes with
+every build. After an upgrade the old grant rows survive, still displaying a
+ticked checkbox in System Settings, but they no longer describe the app you just
+installed. macOS matches, sees a different binary, and denies. The hotkey does
+nothing, with no dialog and no log line.
+
+**Un-ticking and re-ticking the checkbox does not fix it** — that toggles the
+stale row. You have to delete the row so macOS asks again from scratch.
+
+The one-liner installer now does this for you: it compares the code hash before
+and after, and when it changed, it clears exactly those two grants and prints a
+banner telling you to re-grant. If you upgrade some other way — Homebrew, a
+manual `.dmg`, `cargo tauri build` — do it yourself:
+
+```bash
+tccutil reset Accessibility  com.vzt.flow
+tccutil reset ListenEvent    com.vzt.flow   # ListenEvent == Input Monitoring
+open -a "/Applications/VZT Flow.app"
+```
+
+Then press the hotkey once and allow Input Monitoring; dictate once and allow
+Accessibility. In practice the microphone grant survives an upgrade — and if it
+doesn't, macOS simply asks again, because the bundle carries a microphone
+purpose string. (Builds before v0.2.1 did not, and macOS terminated them on the
+spot the first time they opened the mic. If an old build "force quits when I try
+to talk," that is why, and upgrading fixes it.)
+
+Developer ID signing plus notarization is what retires this permanently, by
+giving the app a stable identity across releases. The CI workflow for it is
+already written and dormant, waiting on an Apple Developer account.
+
+### Troubleshooting: I hold the hotkey and nothing happens
+
+Work down this list — it's ordered by how often each one is the answer.
+
+**1. Is the tap even armed?** Hold the hotkey while watching:
+
+```bash
+flow status        # state: idle → recording → transcribing → idle
+```
+
+If `state` never leaves `idle`, the keypress isn't reaching the app: that's
+**Input Monitoring**. If you just upgraded, it's the stale-grant problem above.
+
+**2. Does it record but nothing appears?** If `state` cycles correctly and
+`flow history` shows your words, the pipeline is healthy and only the paste
+failed: that's **Accessibility**.
+
+**3. Does the overlay say the speech model is missing?** Run
+`flow models download parakeet-v3`.
+
+**4. Is the app actually running?** It has no dock icon. Check the menu bar, or:
+
+```bash
+pgrep -f vzt-flow-desktop || open -a "/Applications/VZT Flow.app"
+```
+
+**5. Still stuck?** `flow doctor` prints the model, daemon, hotkey binding, and
+MCP registration state in one shot. Include its output in a bug report.
+
+Two traps that look like bugs but aren't. Holding a *different* Option key than
+the one you bound does nothing, and `CGEventFlags` cannot tell left from right —
+so if you bind Right Shift and happen to be holding Left Shift, releasing your
+bound key emits no release event and recording keeps running. And a keyboard
+shortcut bound to your hotkey in another app can swallow the keypress before it
+reaches the tap.
+
+### Models
 
 Models are **not** bundled with the app — they download separately and live
-under `~/.config/vzt-flow/models/`:
+under `~/.config/vzt-flow/models/`. The one-liner fetches Parakeet by default;
+everything else fetches nothing until you ask.
 
 | Model | Purpose | Size |
 |---|---|---|
@@ -352,13 +530,34 @@ flow models download            # parakeet-v3 (the default)
 flow models download cleanup    # optional — needed for clean/polish modes
 ```
 
-Then grant **Microphone**, **Accessibility**, and **Input Monitoring** in
-System Settings → Privacy & Security — see
-[docs/USAGE-macOS.md#permissions](docs/USAGE-macOS.md#permissions) for exact
-steps and **the unsigned-rebuild gotcha**: every `cargo tauri build` mints a
-new code signature, and macOS silently revokes Input Monitoring/Accessibility
-grants for the previous one. If the hotkey stops working right after a
-rebuild, that's almost always why.
+Raw dictation works with Parakeet alone. The cleanup model only matters if you
+want the `clean` or `polish` modes; without it those fall back to raw output.
+
+### Gatekeeper and code signing
+
+Releases are **ad-hoc signed**, not signed with an Apple Developer ID and not
+notarized. The bundle is properly sealed and passes
+`codesign --verify --deep --strict`, but Apple has never seen it.
+
+What that means in practice depends entirely on how the app reached your disk.
+`curl | bash` never sets the `com.apple.quarantine` attribute, so the app opens
+on a plain double-click. Anything that *does* set it — a browser download, a
+Homebrew cask — makes Gatekeeper refuse the first launch; right-click (or
+Control-click) the app and choose **Open**, confirm once, and you're done
+forever.
+
+It also means the [upgrade grant reset](#upgrading-macos-will-drop-two-of-your-grants)
+above, on every release. Both problems have the same fix, and it costs $99/yr.
+
+### Building from source: the rebuild gotcha
+
+Every `cargo tauri build` mints a new ad-hoc signature, so macOS silently
+revokes the previous build's Input Monitoring and Accessibility grants — the
+same mechanism as an upgrade, hit far more often. If the hotkey dies right after
+a rebuild, that is almost always why; run the two `tccutil reset` commands
+above. See
+[docs/USAGE-macOS.md#permissions](docs/USAGE-macOS.md#permissions) for the full
+remove/re-add procedure.
 
 ### Intel Mac
 

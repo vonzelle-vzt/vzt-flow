@@ -40,6 +40,7 @@ REPO="vonzelle-vzt/vzt-flow"
 APP_NAME="VZT Flow.app"
 INSTALL_YES="${INSTALL_YES:-0}"
 NO_LAUNCH="${NO_LAUNCH:-0}"
+NO_APP="${NO_APP:-0}"
 INSTALL_MODELS="${INSTALL_MODELS:-asr}"
 
 log() { printf '==> %s\n' "$1"; }
@@ -374,11 +375,23 @@ download_models() {
 # single-quoted) so it works regardless of heredoc quoting.
 print_models_next_steps() {
   local dest="$1"
+  # INSTALL_MODELS=none skips the *download*, it says nothing about what is
+  # already on disk — an upgrade or a re-run almost always has the models
+  # already. Reporting "not downloaded yet" unconditionally sends a working
+  # user off to re-fetch 456MB for nothing, so look before speaking.
+  local model_root="${VZT_FLOW_CONFIG_DIR:-$HOME/.config/vzt-flow}/models"
   case "$INSTALL_MODELS" in
     none)
-      printf '\nModels: not downloaded yet — run:\n'
-      printf '  %s/flow models download parakeet-v3   (required for ASR)\n' "$dest"
-      printf '  %s/flow models download cleanup        (optional, for clean/polish modes)\n' "$dest"
+      if [ -d "$model_root/parakeet-v3" ] && [ -d "$model_root/cleanup" ]; then
+        printf '\nModels: parakeet-v3 + cleanup already present — ready to use.\n'
+      elif [ -d "$model_root/parakeet-v3" ]; then
+        printf '\nModels: parakeet-v3 already present — ready to use. For clean/polish modes, run:\n'
+        printf '  %s/flow models download cleanup\n' "$dest"
+      else
+        printf '\nModels: not downloaded yet — run:\n'
+        printf '  %s/flow models download parakeet-v3   (required for ASR)\n' "$dest"
+        printf '  %s/flow models download cleanup        (optional, for clean/polish modes)\n' "$dest"
+      fi
       ;;
     asr)
       printf '\nModels: parakeet-v3 downloaded (INSTALL_MODELS=asr). For clean/polish modes, run:\n'
@@ -400,16 +413,29 @@ fi
 # --- download release assets ----------------------------------------------
 
 log "fetching latest release assets for ${REPO} (arch: $ARCH)"
-# Two .dmg assets ship per release (aarch64 + x86_64) — fetch the one
-# matching this machine's arch specifically, not a bare "*.dmg" glob, or
-# we'd risk grabbing the wrong one when both are present in $WORKDIR.
-fetch_asset "$DMG_PATTERN"
+# NO_APP=1 installs only the CLI, MCP server and models. This is the supported
+# path for Homebrew users: the cask owns /Applications/VZT Flow.app, and this
+# script would otherwise `rm -rf` it out from under brew's receipt, leaving
+# `brew upgrade` managing a bundle it no longer wrote. Skip the dmg entirely
+# rather than downloading ~15-25MB we will not use.
+if [ "$NO_APP" != "1" ]; then
+  # Two .dmg assets ship per release (aarch64 + x86_64) — fetch the one
+  # matching this machine's arch specifically, not a bare "*.dmg" glob, or
+  # we'd risk grabbing the wrong one when both are present in $WORKDIR.
+  fetch_asset "$DMG_PATTERN"
+fi
 fetch_asset "$CLI_PATTERN"
+
+TARBALL_PATH="$WORKDIR/$CLI_PATTERN"
+[ -f "$TARBALL_PATH" ] || die "download succeeded but CLI tarball not found in $WORKDIR"
+
+REGRANT_NEEDED=0
+if [ "$NO_APP" = "1" ]; then
+  log "NO_APP=1 — skipping the .app; installing CLI, MCP server and models only"
+else
 
 DMG_PATH="$(find "$WORKDIR" -maxdepth 1 -name '*.dmg' | head -n1)"
 [ -n "$DMG_PATH" ] || die "download succeeded but no .dmg found in $WORKDIR"
-TARBALL_PATH="$WORKDIR/$CLI_PATTERN"
-[ -f "$TARBALL_PATH" ] || die "download succeeded but CLI tarball not found in $WORKDIR"
 
 # --- install the .app -----------------------------------------------------
 
@@ -428,6 +454,21 @@ SRC_APP="$MOUNT_POINT/$APP_NAME"
 [ -d "$SRC_APP" ] || die "no .app bundle found on mounted dmg ($MOUNT_POINT)"
 
 DEST_APP="/Applications/$(basename "$SRC_APP")"
+
+# TCC pins Accessibility and Input Monitoring to a code requirement — for an
+# ad-hoc signed build that requirement is `cdhash H"..."`, which changes with
+# every release. After an upgrade the old grant rows survive and still read
+# "allowed" in System Settings, but they no longer match the new binary, so
+# macOS denies both and the hotkey is silently dead: no dialog, no error, the
+# key just does nothing. Toggling the checkbox does not fix it — it toggles
+# the stale row. Clearing the rows makes macOS prompt again from scratch.
+# Only Accessibility/ListenEvent are worth clearing; leave the microphone grant
+# alone — in practice it survives, and if it doesn't macOS just re-prompts,
+# because the bundle carries a purpose string. Requires no sudo. Dev-ID signing
+# + notarization would make the requirement stable and retire all of this.
+APP_CDHASH() { codesign -dv --verbose=4 "$1" 2>&1 | awk -F= '/^CDHash=/{print tolower($2); exit}'; }
+
+OLD_CDHASH=""
 if [ -d "$DEST_APP" ]; then
   if [ "$INSTALL_YES" != "1" ]; then
     read -r -p "‘$DEST_APP’ already exists — overwrite? [y/N] " reply
@@ -436,6 +477,7 @@ if [ -d "$DEST_APP" ]; then
       *) die "install aborted — existing app left in place" ;;
     esac
   fi
+  OLD_CDHASH="$(APP_CDHASH "$DEST_APP")"
   log "removing existing $DEST_APP"
   rm -rf "$DEST_APP"
 fi
@@ -443,8 +485,22 @@ fi
 log "installing $(basename "$SRC_APP") to /Applications"
 cp -R "$SRC_APP" "$DEST_APP"
 
+if [ -n "$OLD_CDHASH" ]; then
+  NEW_CDHASH="$(APP_CDHASH "$DEST_APP")"
+  if [ -n "$NEW_CDHASH" ] && [ "$OLD_CDHASH" != "$NEW_CDHASH" ]; then
+    BUNDLE_ID="$(defaults read "$DEST_APP/Contents/Info.plist" CFBundleIdentifier 2>/dev/null || echo com.vzt.flow)"
+    log "code identity changed since the previous install — clearing the two grants that pin to it"
+    for svc in Accessibility ListenEvent; do
+      tccutil reset "$svc" "$BUNDLE_ID" >/dev/null 2>&1 || true
+    done
+    REGRANT_NEEDED=1
+  fi
+fi
+
 unmount_dmg
 trap cleanup EXIT
+
+fi  # end NO_APP guard
 
 # --- install the flow CLI --------------------------------------------------
 
@@ -508,9 +564,33 @@ fi
 
 # --- launch + next steps -----------------------------------------------------
 
-if [ "$NO_LAUNCH" != "1" ]; then
+# `open -a` goes through LaunchServices, so the app gets its OWN TCC identity.
+# Never exec the binary from this shell instead: a process launched from a
+# terminal inherits the terminal as its TCC responsible process, so it borrows
+# the terminal's microphone grant and never registers its own. That is exactly
+# how the missing-purpose-string crash stayed invisible to the maintainer for
+# two releases while every real user hit it on first launch.
+if [ "$NO_APP" != "1" ] && [ "$NO_LAUNCH" != "1" ]; then
   log "launching VZT Flow"
   open -a "$DEST_APP" || warn "failed to launch $DEST_APP — open it manually from /Applications"
+fi
+
+if [ "$REGRANT_NEEDED" = "1" ]; then
+  cat <<EOF
+
++---------------------------------------------------------------------+
+| UPGRADE: you must re-grant 2 permissions before the hotkey works.    |
+|                                                                     |
+| This build has a new code signature, so the Accessibility and Input |
+| Monitoring grants you gave the old one no longer apply. They have   |
+| been cleared, so macOS will ask you again. Until you say yes, the   |
+| hotkey does nothing -- silently, with no error.                     |
+|                                                                     |
+| Press the hotkey once: macOS prompts for Input Monitoring. Allow it,|
+| reopen the app if macOS quits it, then dictate once and allow       |
+| Accessibility when asked. Your microphone grant is unaffected.      |
++---------------------------------------------------------------------+
+EOF
 fi
 
 cat <<EOF

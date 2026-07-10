@@ -6,6 +6,43 @@ versioning](https://semver.org/). Numbers quoted below were measured on this
 repo's dev hardware (M5 MacBook Air) unless noted — see `README.md` /
 `docs/PRD.md` for the full methodology.
 
+## [Unreleased]
+
+### Fixed
+
+- **An upgrade left the hotkey silently dead.** macOS pins the Accessibility and
+  Input Monitoring grants to a code requirement containing the exact binary
+  hash, which changes on every ad-hoc signed release. After an upgrade the old
+  grant rows survived, still showing a ticked checkbox in System Settings, while
+  macOS matched them against the new binary, saw a different hash, and denied.
+  The hotkey did nothing — no dialog, no error, no log line — and un-ticking and
+  re-ticking the box only toggled the stale row. `scripts/install.sh` now
+  compares the code hash before and after replacing the app and, when it
+  changed, clears exactly those two grants (`tccutil reset`, no `sudo`) so macOS
+  prompts again, and prints a banner explaining what to re-grant. The microphone
+  grant is left alone.
+- **`INSTALL_MODELS=none` claimed the models were missing when they weren't.**
+  The closing message was hardcoded to the flag rather than reading the disk, so
+  a re-run or upgrade told users to re-download 456 MB they already had.
+
+### Added
+
+- **`NO_APP=1`** installs only the `flow` CLI, MCP server and models, skipping
+  the `.dmg` download and leaving `/Applications` untouched. This is now the
+  supported way to add the CLI alongside a Homebrew cask install. Previously the
+  installer would `rm -rf` the cask-managed app and replace it, leaving `brew`
+  with a receipt for a bundle it no longer wrote — while the README, the cask
+  caveats, and `AGENT-INSTALL.md` all claimed it "detects the brew-installed app
+  and won't overwrite it." It never did. All three have been corrected.
+
+### Documentation
+
+- README gains an install-path comparison table (only the one-liner leaves a
+  working system), the installer's environment variables, what each of the three
+  macOS permissions buys and how it fails without it, the upgrade grant-reset
+  problem and its fix, a Gatekeeper/code-signing section, and a troubleshooting
+  ladder for "I hold the hotkey and nothing happens."
+
 ## [0.3.0] — 2026-07-09
 
 **The release where a stranger can actually install this.** Every prior version
