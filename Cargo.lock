@@ -1545,7 +1545,7 @@ dependencies = [
 
 [[package]]
 name = "flow-cli"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -1556,7 +1556,7 @@ dependencies = [
 
 [[package]]
 name = "flow-core"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "arboard",
@@ -5763,7 +5763,7 @@ dependencies = [
 
 [[package]]
 name = "vzt-flow-desktop"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "arboard",

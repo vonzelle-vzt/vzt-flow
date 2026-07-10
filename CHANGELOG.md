@@ -6,6 +6,39 @@ versioning](https://semver.org/). Numbers quoted below were measured on this
 repo's dev hardware (M5 MacBook Air) unless noted — see `README.md` /
 `docs/PRD.md` for the full methodology.
 
+## [0.3.2] — 2026-07-10
+
+**Windows works, for real.** The Windows build had never been run on Windows.
+Now it has — install, model download, transcription (RTF 0.131x on CPU ONNX),
+the Ctrl+Shift+Space hotkey, hands-free auto-stop, the desktop-app-as-daemon
+round trip over the named pipe, the MCP server, and a human dictating by voice.
+That run found one bug, and it was a bad one.
+
+### Fixed
+
+- **Windows auto-paste silently did nothing.** `enigo`'s `Key::Unicode('v')` is
+  delivered as a `KEYEVENTF_UNICODE` / `VK_PACKET` character event, which target
+  applications do not map onto the Ctrl+V paste accelerator. enigo reported
+  success; Notepad received nothing. Your transcript still reached the clipboard,
+  so the failure looked like "the app pastes nothing" rather than an error. Send
+  the real virtual key (`VK_V`, `0x56`) instead. Verified on the same hardware
+  that found it.
+- **The Settings window offered a hotkey picker on Windows that did nothing.**
+  The hotkey is hardcoded to Ctrl+Shift+Space there and `hotkey_keycode` is
+  ignored, so the picker was a dead control. Settings is now platform-aware.
+
+### Documentation
+
+- The Windows guide is rewritten around what a user does, now that the build is
+  verified rather than hypothetical, and the README says plainly that the
+  Windows installers are **unsigned** — SmartScreen will warn, and the Apple
+  Developer ID signing covers the macOS `.dmg` only.
+- `README` explains how to change the hotkey where the gestures are described,
+  including why only modifier keys are valid, why Caps Lock is excluded, and why
+  the left-side keys are labelled as conflicting.
+- `set_recv_timeout` on a Windows named pipe fails on **real hardware**, not
+  just CI runners. The blocking-read degradation is the normal Windows path.
+
 ## [0.3.1] — 2026-07-10
 
 ### Fixed
