@@ -169,6 +169,30 @@ jobs:
           echo "path=$DMG" >> "$GITHUB_OUTPUT"
           echo "name=$(basename "$DMG")" >> "$GITHUB_OUTPUT"
 
+      # tauri-bundler notarizes and staples the .app (app.rs:135-140), then
+      # packages the dmg around it — the dmg itself never receives a ticket.
+      # A stapled .app is enough once the dmg is open, but the dmg is the
+      # thing users download, and an unstapled one has to reach Apple's
+      # servers to be validated. Staple it so the first launch works offline
+      # and on a locked-down network.
+      - name: Notarize + staple the dmg (aarch64)
+        if: steps.signing.outputs.signed == 'true'
+        env:
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          DMG: ${{ steps.find_dmg.outputs.path }}
+        run: |
+          KEY="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY}.p8"
+          printf '%s' "$APPLE_API_KEY_P8" | base64 --decode > "$KEY"
+          chmod 600 "$KEY"
+          trap 'rm -f "$KEY"' EXIT
+          xcrun notarytool submit "$DMG" \
+            --key "$KEY" --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER" \
+            --wait --timeout 30m
+          xcrun stapler staple "$DMG"
+          xcrun stapler validate "$DMG"
+
       # Two regressions shipped to users before this guard existed, both
       # invisible on the maintainer's machine:
       #   1. No NSMicrophoneUsageDescription. macOS TCC *terminates* a process
@@ -498,6 +522,25 @@ jobs:
             exit 1
           fi
           echo "path=$DMG" >> "$GITHUB_OUTPUT"
+
+      # See the aarch64 job: the bundler staples the .app, never the dmg.
+      - name: Notarize + staple the dmg (x86_64)
+        if: steps.signing.outputs.signed == 'true'
+        env:
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          DMG: ${{ steps.find_dmg.outputs.path }}
+        run: |
+          KEY="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY}.p8"
+          printf '%s' "$APPLE_API_KEY_P8" | base64 --decode > "$KEY"
+          chmod 600 "$KEY"
+          trap 'rm -f "$KEY"' EXIT
+          xcrun notarytool submit "$DMG" \
+            --key "$KEY" --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER" \
+            --wait --timeout 30m
+          xcrun stapler staple "$DMG"
+          xcrun stapler validate "$DMG"
 
       # Same guard shape as the aarch64 job (mounts the shipped .dmg, not the
       # .app left behind in bundle/macos/) plus x64-specific checks that the
