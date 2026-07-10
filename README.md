@@ -661,7 +661,11 @@ this build works around.
 
 > [!WARNING]
 > Compiles and is CI-built on every push, but **has never been run on real
-> Windows hardware**. The daemon control socket now works over a Windows
+> Windows hardware**. The Windows installers are **unsigned** — there is no
+> code signing in CI — so SmartScreen will show "Windows protected your PC" on
+> first run. Choose **More info → Run anyway**. The Apple Developer ID signing
+> described under [Gatekeeper](#gatekeeper-and-code-signing) covers the macOS
+> `.dmg` only; it does nothing for Windows. The daemon control socket now works over a Windows
 > named pipe (`\\.\pipe\vzt-flow-daemon`) — CI-unit-tested, but the full
 > desktop-app-as-daemon round trip is unverified on real hardware. Still no
 > per-app profiles, no `clean`/`polish` cleanup LLM yet, Ctrl+V paste with no
