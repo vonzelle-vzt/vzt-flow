@@ -6,6 +6,85 @@ versioning](https://semver.org/). Numbers quoted below were measured on this
 repo's dev hardware (M5 MacBook Air) unless noted — see `README.md` /
 `docs/PRD.md` for the full methodology.
 
+## [0.3.0] — 2026-07-09
+
+**The release where a stranger can actually install this.** Every prior version
+worked reliably for exactly one person — the maintainer — whose machine already
+had the models, the permissions, and a dev build launched from a terminal. This
+one closes the gap.
+
+### The app sets itself up
+
+- **The app can download its own models.** It never could. `brew install --cask`
+  and a `.dmg` download both ship *no CLI*, and only the CLI could fetch models —
+  so those users could never transcribe a word. Settings now has a Download button
+  with a live percentage.
+- **Settings opens on first launch.** VZT Flow is a menu-bar app with no Dock
+  icon, so a fresh install previously looked like nothing had happened at all.
+- **Holding the key before the model exists tells you so.** Recording wasn't gated
+  on the model being present: you talked for thirty seconds, released, and got a
+  hard-coded "Transcription failed" while the real reason went to a stderr no GUI
+  user ever sees.
+- **Granting Input Monitoring now arms the hotkey within ~2 seconds.** Previously
+  the event tap was created once at startup, so granting the permission the app
+  had just asked for did nothing until you quit and relaunched — and only stderr
+  ever said so.
+- **The `curl | bash` one-liner installs the model.** It defaulted to skipping it,
+  so the documented install command produced a system that could not transcribe.
+
+### Windows
+
+- **`flow.exe` and the MCP server now ship.** Windows previously received the app
+  alone. Since only the CLI could download the speech model, there was no path to
+  a working install short of building from source. `install.ps1` now installs the
+  CLI, adds it to your PATH, registers the MCP server, and downloads the model.
+- Still experimental: no cleanup LLM, no per-app profiles, no Esc-to-cancel, no
+  secure-field detection, and it has never been run on real Windows hardware.
+
+### Fixed
+
+- **macOS 12 users installed an app that could never launch.** The bundle
+  advertised `LSMinimumSystemVersion 12.0` while hard-linking ScreenCaptureKit,
+  whose audio capture requires 13.0 — so it installed cleanly and then dyld-aborted
+  with no error, just a bouncing icon. The floor is now 13.0, and 13.3 on Intel
+  (the bundled ONNX Runtime dylib is `minos 13.3`).
+- **A flaky download bricked the install permanently.** The cleanup model was
+  written straight to its final path, a sha256 mismatch printed "proceeding
+  anyway", and the next run's existence check then skipped re-downloading that
+  corrupt 1.1GB file *forever*. Downloads now stage to a `.partial`, resume over
+  HTTP Range, verify sha256 before an atomic rename, and never promote a bad file.
+  A corrupt model already on disk is detected and re-downloaded.
+- **Setting `VZT_FLOW_BIN` did nothing.** The MCP server read `FLOW_BIN`, while
+  every script, README, and release note documented `VZT_FLOW_BIN`. Both work now;
+  the installed locations are probed before any dev-tree path.
+- Installers now check their dependencies instead of assuming them: Node (required
+  by the MCP server, previously unchecked — its absence produced a registration
+  that failed later with an opaque error) and free disk space before a download.
+
+### Added
+
+- **Rebindable hold-to-talk key** — nine modifiers instead of five. Left-side keys
+  are offered but flagged: they collide with ordinary shortcuts. Caps Lock is
+  excluded because its flag reflects the latched state, not the key being held.
+- **`flow doctor` reports your hotkey binding** and names the two ways it can be
+  wrong. An unsupported keycode in `config.toml` used to leave the hotkey silently
+  dead with no diagnostic.
+- **[`AGENT-INSTALL.md`](AGENT-INSTALL.md)** — hand it to Claude Code, Codex CLI,
+  or Gemini CLI and it installs and verifies everything.
+
+### Known limitations
+
+- Still ad-hoc signed, not notarized. A browser-downloaded `.dmg` shows the
+  bypassable "Apple could not verify" dialog (System Settings → Open Anyway), and
+  because the ad-hoc signature changes each release, **macOS drops your
+  Accessibility and Input Monitoring grants when you upgrade** — re-grant both.
+  The CI signing path is written and dormant, waiting on a Developer ID certificate.
+- Linux is **unsupported / community-maintained**. Artifacts still build, but
+  Wayland has no global hotkey and nothing has been run on real Linux hardware.
+- The three macOS permissions (Microphone, Accessibility, Input Monitoring) are
+  required by the OS for any app that records you and types into other apps. No
+  amount of signing removes them.
+
 ## [0.2.1] — 2026-07-09
 
 **If you installed 0.2.0, upgrade.** Its macOS packaging was broken in three
