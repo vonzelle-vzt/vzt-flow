@@ -6,7 +6,78 @@ versioning](https://semver.org/). Numbers quoted below were measured on this
 repo's dev hardware (M5 MacBook Air) unless noted — see `README.md` /
 `docs/PRD.md` for the full methodology.
 
+## [0.2.1] — 2026-07-09
+
+**If you installed 0.2.0, upgrade.** Its macOS packaging was broken in three
+ways that never showed up on the maintainer's machine, and between them they
+made the app unusable for essentially every new user. No dictation behavior
+changed in this release — it is packaging only.
+
+### Fixed
+
+- **The app force-quit the moment you talked** (Apple Silicon). The bundle
+  carried no `NSMicrophoneUsageDescription`, and macOS terminates a process
+  that opens a microphone stream without one — no dialog, no error, just a
+  kill. It never bit the maintainer because a binary launched from a Terminal
+  inherits Terminal as its TCC *responsible process*, and Terminal already
+  holds a microphone grant. Double-clicking the `.app` makes it its own
+  responsible process, and it died. You will now see a normal macOS
+  microphone prompt on first dictation.
+- **The app wouldn't open at all if you downloaded the `.dmg` in a browser**
+  (Apple Silicon). Only the Intel CI job ever ran `codesign`, so the arm64
+  bundle shipped with its resources unsealed. A quarantined copy — any
+  browser download, and Homebrew casks, which quarantine by default — failed
+  Gatekeeper with *"VZT Flow is damaged and can't be opened"*, the variant
+  with no "Open Anyway" escape hatch. The bundle is now ad-hoc signed during
+  bundling. (Installs via the `curl | bash` one-liner were unaffected: curl
+  never sets the quarantine attribute.)
+- **Every Intel Mac crashed at launch, on every launch.** `cargo tauri build`
+  cuts the `.app` and the `.dmg` in one invocation; the job then patched the
+  `.app` to bundle `libonnxruntime.dylib` — but the `.dmg` had already been
+  packaged from the unpatched one. The shipped Intel app was unsigned, had no
+  `Contents/Frameworks`, and needed a dylib via an rpath pointing nowhere, so
+  it aborted at dyld load. The dylib is now placed and signed by the bundler
+  before the `.dmg` is cut.
+
+### Added
+
+- **Rebindable hold-to-talk key.** Settings → Hotkey now offers all nine
+  hold-capable modifiers — Right Option (default), Right Shift, Right
+  Control, Right Command, Fn, and the four left-side modifiers — instead of
+  five. Left-side keys are flagged in the UI: they collide with ordinary
+  shortcuts (Cmd+C, Shift+click), which is why Right Option is the default.
+  Changes apply live, with no restart. Caps Lock is deliberately excluded —
+  its flag reflects the *latched* state, not physical key-down, so binding it
+  would toggle rather than hold.
+- **`flow doctor` now reports your hotkey binding** and names the two ways it
+  can be wrong: a keycode outside the supported set (the hotkey silently
+  never fires), or Caps Lock (toggle semantics). Previously an unsupported
+  `hotkey_keycode` in `config.toml` produced a dead hotkey with no diagnostic.
+- **[`AGENT-INSTALL.md`](AGENT-INSTALL.md)** — point Claude Code at it and it
+  installs the app, CLI, MCP server, and models, then verifies the result.
+  `scripts/install.sh` and `install.ps1` gained `INSTALL_MODELS=none|asr|all`
+  for unattended model downloads; the default `none` leaves the public
+  one-liner's behavior unchanged.
+
+### Known limitations
+
+- Still ad-hoc signed, not notarized. A browser-downloaded `.dmg` now shows
+  the *bypassable* "Apple could not verify…" dialog (System Settings →
+  Privacy & Security → Open Anyway) instead of the un-bypassable "damaged"
+  one. Removing it entirely requires a Developer ID certificate.
+- Because the signature is ad-hoc, its cdhash changes every release, so macOS
+  drops your Accessibility and Input Monitoring grants on upgrade. Re-grant
+  both after installing. Only Developer ID signing gives a stable identity
+  across updates.
+- The Intel build is still CI-built and has never been run on real Intel
+  hardware.
+
 ## [0.2.0] — 2026-07-09
+
+> [!WARNING]
+> Broken on macOS — see 0.2.1. The app force-quits on first dictation
+> (Apple Silicon), refuses to open from a browser-downloaded `.dmg`, and
+> never launches at all on Intel. Upgrade rather than installing this.
 
 The dictation core grows up (long holds no longer OOM and paste the instant
 you release), and the app leaves macOS: a full Linux build and a Windows
