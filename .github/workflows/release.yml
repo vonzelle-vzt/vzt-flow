@@ -101,6 +101,7 @@ jobs:
       - name: tauri build (aarch64)
         working-directory: apps/desktop
         env:
+          SIGNED: ${{ steps.signing.outputs.signed }}
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
@@ -108,6 +109,18 @@ jobs:
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
+          # A key declared in `env:` is exported even when the secret behind it
+          # does not exist — it arrives as "" rather than absent. tauri-bundler
+          # tests these with var_os() (sign.rs:20), for which set-but-empty is
+          # present, so it imports an empty .p12 and kills the bundle:
+          # "failed to run command security import". Unsetting them is what lets
+          # the unsigned path fall through to signingIdentity "-" in
+          # tauri.conf.json. Do not replace this with an `env:` expression —
+          # every form of it still exports the key.
+          if [ "$SIGNED" != "true" ]; then
+            unset APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY \
+                  APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID
+          fi
           OVERLAY='${{ steps.signing.outputs.overlay }}'
           if [ -n "$OVERLAY" ]; then
             cargo tauri build --target aarch64-apple-darwin --config "$OVERLAY"
@@ -402,6 +415,18 @@ jobs:
           # its audio capture is 13.0+). That key is not arch-aware, hence the
           # per-target override here.
           #
+          # A key declared in `env:` is exported even when the secret behind it
+          # does not exist — it arrives as "" rather than absent. tauri-bundler
+          # tests these with var_os() (sign.rs:20), for which set-but-empty is
+          # present, so it imports an empty .p12 and kills the bundle:
+          # "failed to run command security import". Unsetting them is what lets
+          # the unsigned path fall through to signingIdentity "-" in
+          # tauri.conf.json. Do not replace this with an `env:` expression —
+          # every form of it still exports the key.
+          if [ "$SIGNED" != "true" ]; then
+            unset APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY \
+                  APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID
+          fi
           # Composed with jq so the signing keys MERGE into this overlay rather
           # than a second --config replacing it. hardenedRuntime + entitlements
           # only appear when a certificate exists (see "Decide signing mode").
