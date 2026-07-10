@@ -28,7 +28,7 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Globbed, not hardcoded: a new script under scripts/ must be linted the
       # day it lands, not the day someone remembers to add it here.
@@ -63,7 +63,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       GITHUB_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # INSTALL_MODELS=none keeps this under a minute; the model download is a
       # plain curl of a Hugging Face tarball and is not what breaks installs.
@@ -170,7 +170,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       GITHUB_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Fresh install (.deb path)
         run: INSTALL_YES=1 NO_LAUNCH=1 INSTALL_MODELS=none bash scripts/install.sh
