@@ -10,10 +10,10 @@
 > results](#first-real-hardware-test-results-2026-07-10) for the full
 > matrix. One release-blocking bug was found in that run: **v0.3.1's
 > auto-paste silently does nothing** (your words still land on the
-> clipboard — press Ctrl+V). That is fixed on `main` — and the fix was
-> verified the same day on the same machine (a CI build of `main`
-> auto-pasted a dictation into a focused Notepad) — and will ship in the
-> next release. Everything below is either verified on real hardware
+> clipboard — press Ctrl+V). That is **fixed in v0.3.2**, and the fix was
+> verified the same day on the same machine: the v0.3.2 release build
+> auto-pasted a dictation into a focused Notepad. On v0.3.1, upgrade by
+> re-running the install one-liner. Everything below is either verified on real hardware
 > (marked as such) or verified directly against the code. If you try it,
 > please report back — see [Help us test](#help-us-test) at the bottom.
 
@@ -42,8 +42,7 @@ on the PATH of terminals started after the install).
 **3. Hold Ctrl+Shift+Space, say a sentence, let go.** The app lives in the
 system tray (bottom-right, near the clock) — there is no main window. On
 v0.3.1 you then press **Ctrl+V** to paste what you said (see the warning
-above); from the next release onward the text lands at your cursor by
-itself.
+above); from v0.3.2 onward the text lands at your cursor by itself.
 
 There is no account, no license key, and nothing that talks to the network
 after the model download. Sanity-check any time with:
@@ -72,7 +71,7 @@ Things that behave differently from the macOS guide — worth reading once:
   window still shows the macOS key picker, and changing it does nothing (a
   real user hit exactly this on 2026-07-10 — set it to "Fn", then pressed
   Fn and nothing happened; Ctrl+Shift+Space still worked the whole time).
-  Fixed on `main`: the Settings window now shows the fixed shortcut on
+  Fixed in v0.3.2: the Settings window now shows the fixed shortcut on
   Windows/Linux instead of the picker (which stays macOS-only), and also
   hides the macOS-only Accessibility/Input Monitoring permission rows and
   disables the inert cleanup-model download.
@@ -81,9 +80,13 @@ Things that behave differently from the macOS guide — worth reading once:
   terminal. (Registering a global Escape shortcut would swallow Escape
   system-wide for every app — not worth it.)
 - **Your transcript is always on the clipboard**, whether or not the
-  auto-paste lands. If text ever fails to appear (elevated/admin windows
-  can silently block synthetic input — see
-  [Differences vs. macOS](#differences-vs-macos)), just press Ctrl+V.
+  auto-paste lands. If text ever fails to appear, just press Ctrl+V. Two
+  known ways the auto-paste can no-op: elevated/admin windows silently
+  drop synthetic input (see
+  [Differences vs. macOS](#differences-vs-macos)), and a window that is
+  foreground **without a text caret anywhere in it** (observed on real
+  hardware with a freshly session-restored Notepad — the window had focus
+  but no tab had the caret, so the Ctrl+V went nowhere).
 - **`clean` and `polish` modes fall back to raw on Windows** — the local
   cleanup LLM is macOS-only today, so what you get is the raw Parakeet
   transcript plus your personal-dictionary corrections. `code` mode (the
@@ -127,7 +130,7 @@ full path: `& "$env:LOCALAPPDATA\Programs\vzt-flow\bin\flow.exe" doctor`.
 
 **3. It records and transcribes, but no text appears.**
 - On **v0.3.1** that's the known auto-paste bug — your words are on the
-  clipboard, press **Ctrl+V**. Fixed on `main`/next release.
+  clipboard, press **Ctrl+V**. Fixed in v0.3.2 — upgrade.
 - On newer builds: is the target window running elevated (as
   administrator)? Windows silently drops synthetic input into elevated
   windows (UIPI) — the transcript is still on the clipboard.
@@ -146,7 +149,7 @@ mark-of-the-web browser downloads get.
 **6. Still stuck?** `flow doctor` prints the model, mic, daemon, and MCP
 registration state in one shot — include its output in a bug report. (On
 v0.3.1, ignore its "Right Option" hotkey line and "Daemon socket: not
-present" line — both were display bugs on Windows, fixed on `main`.)
+present" line — both were display bugs on Windows, fixed in v0.3.2.)
 
 ## First real-hardware test results (2026-07-10)
 
@@ -157,7 +160,7 @@ machine (Ryzen 7 7735HS). What was observed:
 |---|---|
 | NSIS installer (`VZT.Flow_0.3.1_x64-setup.exe`, silent `/S`) | **Works.** Per-user install to `%LOCALAPPDATA%\VZT Flow\`, exit 0. (Downloaded via `gh`, so no mark-of-the-web — the SmartScreen question is still open for browser downloads.) |
 | CLI tarball layout | **Matches `install.ps1`'s expectations** (`bin\flow.exe`, `mcp\dist`, `mcp\node_modules`, `mcp\package.json`). |
-| `flow doctor` | Runs; found the mic (AMD Audio Device), ffmpeg, `%APPDATA%\vzt-flow` config root. Two display bugs found and fixed on `main`: it printed the macOS "Right Option (keycode 61)" hotkey and gated the daemon check on a `daemon.sock` file that never exists on Windows (reporting "not present" against a live daemon). |
+| `flow doctor` | Runs; found the mic (AMD Audio Device), ffmpeg, `%APPDATA%\vzt-flow` config root. Two display bugs found, fixed in v0.3.2: it printed the macOS "Right Option (keycode 61)" hotkey and gated the daemon check on a `daemon.sock` file that never exists on Windows (reporting "not present" against a live daemon). |
 | `flow models download parakeet-v3` | **Works** (456 MB → `%APPDATA%\vzt-flow\models\parakeet-v3`). |
 | `flow transcribe` (8.09 s TTS wav) | **Works, verbatim transcript.** 1.06 s wall, **RTF 0.131x** on plain CPU ONNX, model load 3.02 s. |
 | Desktop app + named-pipe daemon | **Works end to end** — first time observed outside CI. App runs from the tray, `\\.\pipe\vzt-flow-daemon` exists, `flow status`/`toggle`/`cancel`/`listen` all reach it. The `set_recv_timeout` blocking-read degradation (CLAUDE.md gotcha g) fires on real hardware too — it is the *normal* Windows path, not a CI quirk. |
@@ -165,7 +168,7 @@ machine (Ryzen 7 7735HS). What was observed:
 | Hands-free record → silence auto-stop → transcribe | **Works** through the daemon (13.9 s speaker-played clip picked up by the laptop mic, verbatim transcript). |
 | MCP server (`transcribe_file` over stdio JSON-RPC) | **Works** against the daemon. |
 | Clipboard save → set → restore | **Works** (original clipboard restored after dictation). |
-| **Auto-paste (enigo Ctrl+V)** | **BROKEN in v0.3.1 — silently does nothing.** `paste_text` reports `Pasted`, but the focused app (Notepad, verified foreground, non-elevated) receives no input, while an identical raw `SendInput` VK_V Ctrl+V from another process pastes fine. Root cause: enigo's `Key::Unicode('v')` is delivered as a `KEYEVENTF_UNICODE`/`VK_PACKET` character event, which apps don't map onto the Ctrl+V accelerator. **Fixed on `main`** (`insert.rs` now sends `Key::Other(0x56)` — VK_V — on Windows) **and the fix verified on the same machine the same day**: a CI build of `main` auto-pasted a full dictation into a focused Notepad. v0.3.1 users get the transcript on the clipboard and must paste manually. |
+| **Auto-paste (enigo Ctrl+V)** | **BROKEN in v0.3.1 — silently does nothing.** `paste_text` reports `Pasted`, but the focused app (Notepad, verified foreground, non-elevated) receives no input, while an identical raw `SendInput` VK_V Ctrl+V from another process pastes fine. Root cause: enigo's `Key::Unicode('v')` is delivered as a `KEYEVENTF_UNICODE`/`VK_PACKET` character event, which apps don't map onto the Ctrl+V accelerator. **Fixed in v0.3.2** (`insert.rs` now sends `Key::Other(0x56)` — VK_V — on Windows) **and verified on the same machine the same day**: both a CI build and the v0.3.2 release build auto-pasted a full dictation into a focused Notepad. v0.3.1 users get the transcript on the clipboard and must paste manually — upgrade. |
 
 ## Hardware requirements
 
@@ -435,8 +438,8 @@ guide unchanged):
   desktop-app-as-daemon + `flow status`/`toggle`/`cancel`/`listen` + the MCP
   server's daemon path all round-trip through a really-running app.
 - **v0.3.1's auto-paste is broken** (silently leaves the transcript on the
-  clipboard only — paste manually with Ctrl+V). Fixed on `main` and
-  re-verified on real hardware; see the test-results table above.
+  clipboard only — paste manually with Ctrl+V). Fixed in v0.3.2 and
+  verified on real hardware; see the test-results table above.
 - No per-app profiles → one mode/tone for everything (edit `profiles.toml`'s
   `[default]`).
 - No `clean`/`polish` LLM rewrite — only `raw` and `code` modes do anything
@@ -453,8 +456,8 @@ guide unchanged):
 
 The 2026-07-10 real-hardware pass answered most of the original open
 questions (hold/tap feels right: **yes**; daemon pipe works end to end:
-**yes**; paste into a normal app: **broken in v0.3.1, fixed on `main` and
-re-verified**). Still open — if you're running this on real Windows
+**yes**; paste into a normal app: **broken in v0.3.1, fixed in v0.3.2 and
+verified**). Still open — if you're running this on real Windows
 hardware, we'd like to know:
 
 - Does the unsigned installer's SmartScreen/Defender prompt block a

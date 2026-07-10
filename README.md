@@ -680,8 +680,8 @@ this build works around.
 > (`\\.\pipe\vzt-flow-daemon`), the MCP server, and a real human dictating
 > by voice — all working. One bug found in that run: **v0.3.1's auto-paste
 > silently does nothing** (your words still land on the clipboard — press
-> Ctrl+V); fixed on `main`, re-verified on the same machine, ships in the
-> next release. Still no per-app profiles and no `clean`/`polish` cleanup
+> Ctrl+V); **fixed in v0.3.2**, verified on the same machine — upgrade if
+> you're on v0.3.1. Still no per-app profiles and no `clean`/`polish` cleanup
 > LLM on Windows.
 
 **Install** — one PowerShell line, no admin needed (Windows 10 1803+/11,
@@ -742,7 +742,7 @@ source steps: [docs/USAGE-Linux.md](docs/USAGE-Linux.md).
 |---|---|---|
 | macOS Apple Silicon (`aarch64-apple-darwin`) | **Supported, tested** | Primary dev platform (M5 MacBook Air); Metal cleanup + CoreML ASR |
 | macOS Intel (`x86_64-apple-darwin`) | Built in CI, CPU-only inference | Never run on real Intel hardware; effective floor is macOS **13.3**, not the 12.0 in `tauri.conf.json` — see [USAGE-macOS.md](docs/USAGE-macOS.md#hardware-requirements) |
-| Windows x64 (`x86_64-pc-windows-msvc`) | Built in CI, experimental — **verified on real hardware (2026-07-10)** | Install/ASR/hotkey/daemon-over-named-pipe/MCP/human-dictation all verified on a real Windows 11 machine; v0.3.1 auto-paste broken (fixed on `main`, re-verified); still no per-app profiles/cleanup LLM |
+| Windows x64 (`x86_64-pc-windows-msvc`) | Built in CI, experimental — **verified on real hardware (2026-07-10)** | Install/ASR/hotkey/daemon-over-named-pipe/MCP/human-dictation all verified on a real Windows 11 machine; v0.3.1 auto-paste broken (fixed in v0.3.2, verified); still no per-app profiles/cleanup LLM |
 | Windows Arm (`aarch64-pc-windows-msvc`) | Attempted in CI, allowed to fail | Status depends on upstream (`ort`, WebView2-on-Arm) support this week — check the latest `build` workflow run |
 | Linux x64 (`x86_64-unknown-linux-gnu`) | **Unsupported, community-maintained** | Never run on real Linux hardware; not part of the supported release surface — `.deb` + `.AppImage` keep shipping from CI (built + unit-tested on every push), provided as-is. **X11**: hotkey/paste/tray/overlay all work as designed. **Wayland**: no global hotkey across native apps (no fix planned), clipboard-only paste, best-effort overlay (Wayland denies clients global input grabs). No cleanup LLM / profiles / meeting mode (as Windows). See [USAGE-Linux.md](docs/USAGE-Linux.md) |
 
