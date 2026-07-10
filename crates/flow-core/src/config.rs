@@ -133,6 +133,14 @@ pub struct Config {
     /// `true`.
     #[serde(default = "default_true")]
     pub rolling_transcription: bool,
+    /// First-run onboarding sentinel. `false` on a brand-new install (and on
+    /// any `config.toml` written before this field existed, via the struct's
+    /// `#[serde(default)]`); the desktop app opens the Settings/Setup window
+    /// once when it sees `false`, then flips this to `true` and persists so it
+    /// never auto-nags again. A pure data flag — flow-core itself never reads
+    /// it; only `apps/desktop`'s `.setup()` does.
+    #[serde(default)]
+    pub onboarded: bool,
 }
 
 /// Default for [`Config::rolling_transcription`] — a free fn so serde's
@@ -158,6 +166,7 @@ impl Default for Config {
             cleanup_enabled: true,
             meeting_auto: default_meeting_auto(),
             rolling_transcription: true,
+            onboarded: false,
         }
     }
 }
@@ -248,6 +257,43 @@ mod tests {
         let cfg: Config = toml::from_str(old).expect("old config must still parse");
         assert_eq!(cfg.meeting_auto, "ask");
         assert_eq!(cfg.meeting_auto_mode(), MeetingAuto::Ask);
+    }
+
+    /// A `config.toml` written before `onboarded` existed must still load and
+    /// default the flag to `false` (the additive-field contract). `false` is
+    /// the correct default: the desktop app flips it to `true` the first time
+    /// it opens Settings, so an upgrading user sees the Setup window at most
+    /// once, then never again.
+    #[test]
+    fn old_config_without_onboarded_loads_and_defaults_to_false() {
+        let old = r#"
+            hotkey_keycode = 61
+            hotkey_label = "Right Option"
+            hold_threshold_ms = 300
+            idle_unload_secs = 300
+            max_hold_secs = 600
+            max_handsfree_secs = 600
+            launch_at_login = false
+            cleanup_timeout_ms = 2500
+            cleanup_timeout_per_char_ms = 6
+            cleanup_timeout_max_ms = 20000
+            handsfree_silence_secs = 2.5
+            cleanup_enabled = true
+            meeting_auto = "ask"
+            rolling_transcription = true
+        "#;
+        let cfg: Config = toml::from_str(old).expect("old config must still parse");
+        assert!(!cfg.onboarded, "missing onboarded key must default to false");
+    }
+
+    #[test]
+    fn onboarded_round_trips() {
+        let mut cfg = Config::default();
+        assert!(!cfg.onboarded);
+        cfg.onboarded = true;
+        let raw = toml::to_string_pretty(&cfg).unwrap();
+        let back: Config = toml::from_str(&raw).unwrap();
+        assert!(back.onboarded, "onboarded must survive a save/load round-trip");
     }
 
     #[test]

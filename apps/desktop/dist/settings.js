@@ -13,6 +13,12 @@ const btnCopy = document.getElementById("btn-copy");
 const profilesPathEl = document.getElementById("profiles-path");
 const historyFilter = document.getElementById("history-filter");
 const historyList = document.getElementById("history-list");
+const dotModel = document.getElementById("dot-model");
+const dotCleanup = document.getElementById("dot-cleanup");
+const btnModel = document.getElementById("btn-model");
+const btnCleanup = document.getElementById("btn-cleanup");
+const modelProgressRow = document.getElementById("model-progress-row");
+const modelProgress = document.getElementById("model-progress");
 
 function setDot(el, ok) {
   el.classList.toggle("ok", ok);
@@ -27,6 +33,97 @@ async function refreshPermissions() {
     setDot(dotHotkey, status.hotkey_monitor_active);
   } catch (e) {
     console.error("permission status failed", e);
+  }
+}
+
+// The model status is polled slowly when idle and quickly while a download is
+// in flight, so the percentage updates smoothly without hammering the backend
+// (which stats the model dir on every call) the rest of the time.
+let modelPollTimer = null;
+let modelPollFast = false;
+
+function scheduleModelPoll(fast) {
+  if (modelPollTimer !== null && fast === modelPollFast) return;
+  if (modelPollTimer !== null) clearInterval(modelPollTimer);
+  modelPollFast = fast;
+  modelPollTimer = setInterval(refreshModelStatus, fast ? 600 : 2500);
+}
+
+function phaseText(s) {
+  switch (s.phase) {
+    case "downloading":
+      if (s.total > 0) {
+        const pct = Math.round((s.downloaded / s.total) * 100);
+        const mb = (s.downloaded / 1e6).toFixed(0);
+        const totalMb = (s.total / 1e6).toFixed(0);
+        return `Downloading… ${pct}% (${mb}/${totalMb} MB)`;
+      }
+      return "Downloading…";
+    case "verifying":
+      return "Verifying & installing…";
+    case "extracting":
+      return "Extracting…";
+    case "error":
+      return "Error: " + (s.error || "download failed");
+    default:
+      return "";
+  }
+}
+
+function updateModelButton(btn, dot, present, active, kind) {
+  setDot(dot, present);
+  if (present) {
+    btn.textContent = "Installed";
+    btn.disabled = true;
+  } else {
+    btn.textContent = "Download";
+    // Disable both download buttons while any download is running — the
+    // backend serves a single download slot and refuses a second one.
+    btn.disabled = active;
+  }
+}
+
+async function refreshModelStatus() {
+  try {
+    const s = await invoke("get_model_status");
+    const active = s.phase === "downloading" || s.phase === "verifying" || s.phase === "extracting";
+
+    updateModelButton(btnModel, dotModel, s.parakeet_present, active, "parakeet");
+    updateModelButton(btnCleanup, dotCleanup, s.cleanup_present, active, "cleanup");
+
+    const text = phaseText(s);
+    if (text) {
+      modelProgress.textContent = text;
+      modelProgressRow.style.display = "";
+    } else {
+      modelProgressRow.style.display = "none";
+    }
+
+    scheduleModelPoll(active);
+  } catch (e) {
+    console.error("model status failed", e);
+  }
+}
+
+btnModel.addEventListener("click", async () => {
+  await startDownload("parakeet");
+});
+btnCleanup.addEventListener("click", async () => {
+  await startDownload("cleanup");
+});
+
+async function startDownload(kind) {
+  try {
+    await invoke("start_model_download", { kind });
+    // Show progress immediately and switch to fast polling without waiting for
+    // the next slow tick.
+    modelProgressRow.style.display = "";
+    modelProgress.textContent = "Starting…";
+    scheduleModelPoll(true);
+    refreshModelStatus();
+  } catch (e) {
+    modelProgressRow.style.display = "";
+    modelProgress.textContent = "Error: " + e;
   }
 }
 
@@ -138,6 +235,8 @@ loadTranscript();
 loadProfilesPath();
 loadHistory();
 refreshPermissions();
+refreshModelStatus();
+scheduleModelPoll(false);
 setInterval(refreshPermissions, 2000);
 setInterval(loadTranscript, 2000);
 setInterval(loadHistory, 3000);

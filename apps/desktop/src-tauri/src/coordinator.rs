@@ -858,6 +858,11 @@ fn run_coordinator(
                     }
                     Err(e) => {
                         eprintln!("[vzt-flow] transcription error: {e}");
+                        // Map the real engine error to user-facing text before
+                        // moving `e` into the listen reply — a missing-model
+                        // failure becomes an actionable "download it" prompt
+                        // instead of the old hard-coded "Transcription failed".
+                        let text = transcription_error_message(&e);
                         if let Some(tx) = listen_reply {
                             let _ = tx.send(Err(e));
                         }
@@ -866,7 +871,7 @@ fn run_coordinator(
                         // vanishing, then dismiss (F2).
                         overlay::emit_overlay(
                             &app,
-                            OverlayEvent::Message { text: "Transcription failed".to_string() },
+                            OverlayEvent::Message { text },
                         );
                         let app2 = app.clone();
                         std::thread::spawn(move || {
@@ -900,6 +905,21 @@ fn run_coordinator(
             CoordinatorMsg::Model(ModelStatusEvent::LoadFailed(e)) => {
                 eprintln!("[vzt-flow] model load failed: {e}");
                 *state.model_lifecycle.lock().unwrap() = ModelLifecycle::Unloaded;
+                // Give the failure a user-visible surface too — previously it
+                // was only `eprintln!`'d, so a load failure was invisible. Skip
+                // it while Recording so we don't cover the live level bars; the
+                // transcribe reply path (`TranscribeResult::Err`) handles the
+                // Transcribing case with the same mapped message.
+                if *state.dictation_state.lock().unwrap() != DictationState::Recording {
+                    let text = transcription_error_message(&e);
+                    overlay::show_overlay(&app);
+                    overlay::emit_overlay(&app, OverlayEvent::Message { text });
+                    let app2 = app.clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_millis(2500));
+                        overlay::hide_overlay(&app2);
+                    });
+                }
                 tray::refresh_menu(&app);
             }
             CoordinatorMsg::Model(ModelStatusEvent::Unloaded) => {
@@ -948,8 +968,89 @@ fn max_handsfree_secs(app: &AppHandle) -> u64 {
         .max_handsfree_secs
 }
 
+/// Maps a transcription / model-load error string to the short line shown on
+/// the overlay. Pure (no I/O) so it's unit-testable. Recognizes the engine's
+/// "model directory … does not exist" marker (`engine.rs`'s `ParakeetModel::
+/// load` bail) and turns it into an actionable "download the model" prompt;
+/// everything else collapses to a short generic so we never surface a raw
+/// internal error string to the user.
+fn transcription_error_message(err: &str) -> String {
+    let lower = err.to_ascii_lowercase();
+    if lower.contains("model directory") && lower.contains("does not exist") {
+        "Speech model not installed — open VZT Flow Settings to download it".to_string()
+    } else {
+        "Transcription failed".to_string()
+    }
+}
+
+/// Whether the Parakeet model is installed, using the hot-path cache in
+/// `AppState.model_download` and only falling back to a filesystem check when
+/// the cache says "absent". The cache only ever flips absent→present (a model
+/// directory doesn't vanish under a running app), so a cached `true` is always
+/// safe; a cached `false` triggers one cheap `check_parakeet_model()` (a
+/// directory stat — sub-millisecond on APFS, negligible against the 300ms hold
+/// threshold) which also refreshes the cache once a model appears.
+fn parakeet_installed(app: &AppHandle) -> bool {
+    let state = app.state::<AppState>();
+    if state.model_download.parakeet_present.load(Ordering::Relaxed) {
+        return true;
+    }
+    let present = flow_core::models::check_parakeet_model()
+        .map(|s| s.present)
+        .unwrap_or(false);
+    if present {
+        state.model_download.parakeet_present.store(true, Ordering::Relaxed);
+    }
+    present
+}
+
+/// Builds the overlay line shown when the hotkey is pressed but no speech model
+/// is installed: a live download percentage if one is running (the moment the
+/// user is most likely to be confused about why nothing happens), otherwise a
+/// prompt to open Settings and download it.
+fn model_missing_overlay_text(app: &AppHandle) -> String {
+    let dl = &app.state::<AppState>().model_download;
+    if dl.active_kind.lock().unwrap().is_some() {
+        let done = dl.downloaded.load(Ordering::Relaxed);
+        let total = dl.total.load(Ordering::Relaxed);
+        if total > 0 {
+            let pct = ((done as f64 / total as f64) * 100.0).round() as u64;
+            format!("Downloading speech model… {pct}%")
+        } else {
+            "Downloading speech model…".to_string()
+        }
+    } else {
+        "Speech model not installed — open VZT Flow Settings to download it".to_string()
+    }
+}
+
 fn start_recording(app: &AppHandle, max_secs: u64) {
     let state = app.state::<AppState>();
+
+    // Gate: never record without a speech model. Before this, `start_recording`
+    // captured audio unconditionally and the missing-model failure only
+    // surfaced ~30s later when the lazy model load failed at release — the user
+    // talked into a void. Now we refuse up front, tell them why, and reset any
+    // mode/listen bookkeeping the caller set so we don't get stuck believing a
+    // hands-free session or daemon `listen` is live.
+    if !parakeet_installed(app) {
+        state.hands_free_active.store(false, Ordering::Relaxed);
+        if let Some((tx, _)) = state.pending_listen.lock().unwrap().take() {
+            let _ = tx.send(Err("speech model not installed".to_string()));
+        }
+        let text = model_missing_overlay_text(app);
+        overlay::show_overlay(app);
+        overlay::emit_overlay(app, OverlayEvent::Message { text });
+        // Linger a little longer than the usual transient (900ms) so there's
+        // time to read the download hint.
+        let app2 = app.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(2500));
+            overlay::hide_overlay(&app2);
+        });
+        return;
+    }
+
     state.set_dictation_state(DictationState::Recording);
     *state.recording_started.lock().unwrap() = Some(std::time::Instant::now());
     *state.recording_max_secs.lock().unwrap() = Some(max_secs);
@@ -1277,6 +1378,31 @@ mod tests {
         assert_eq!(
             decide_release(true, DictationState::Recording, false, true),
             ReleaseAction::Noop
+        );
+    }
+
+    // ---- error-string → user-facing overlay text (item 2) ----
+
+    #[test]
+    fn model_missing_engine_error_maps_to_actionable_message() {
+        // The exact string engine.rs's ParakeetModel::load bails with.
+        let engine_err = "model directory /Users/x/.config/vzt-flow/models/parakeet-v3 \
+             does not exist. Run `flow models download parakeet-v3` first.";
+        let msg = transcription_error_message(engine_err);
+        assert_ne!(msg, "Transcription failed", "must not fall through to the generic");
+        assert!(msg.to_lowercase().contains("model"));
+        assert!(msg.to_lowercase().contains("settings") || msg.to_lowercase().contains("download"));
+    }
+
+    #[test]
+    fn unrelated_error_maps_to_generic() {
+        assert_eq!(
+            transcription_error_message("transcription timed out"),
+            "Transcription failed"
+        );
+        assert_eq!(
+            transcription_error_message("some totally unrelated failure"),
+            "Transcription failed"
         );
     }
 

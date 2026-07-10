@@ -122,6 +122,22 @@
       <span><span id="dot-hotkey" class="status-dot bad"></span>Global hotkey (Input Monitoring)</span>
       <span id="hotkey-note" style="opacity:0.6;font-size:11px;">restart after granting</span>
     </div>
+    <div class="row">
+      <span><span id="dot-model" class="status-dot bad"></span>Speech model (required)</span>
+      <button id="btn-model">Download</button>
+    </div>
+    <div class="row">
+      <span><span id="dot-cleanup" class="status-dot bad"></span>Cleanup model (optional)</span>
+      <button id="btn-cleanup">Download</button>
+    </div>
+    <div class="row" id="model-progress-row" style="border-top:none; display:none;">
+      <span id="model-progress" style="opacity:0.6;font-size:11px;">&nbsp;</span>
+    </div>
+    <div class="row" style="border-top:none;">
+      <span style="opacity:0.6;font-size:11px;">The speech model (~478&nbsp;MB) is required to transcribe anything.
+        The cleanup model (~1.1&nbsp;GB) is optional — it polishes grammar/punctuation; without it you get raw
+        transcripts. Downloads run in the background; you can keep this window open.</span>
+    </div>
   </div>
 
   <h2>Hotkey</h2>

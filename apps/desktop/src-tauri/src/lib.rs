@@ -45,6 +45,8 @@ pub fn run() {
             commands::get_profiles_path,
             commands::copy_text,
             commands::test_overlay,
+            commands::get_model_status,
+            commands::start_model_download,
         ])
         .setup(|app| {
             let handle = app.handle().clone();
@@ -53,7 +55,7 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             handle.set_activation_policy(tauri::ActivationPolicy::Accessory)?;
 
-            let config = Config::load().unwrap_or_else(|e| {
+            let mut config = Config::load().unwrap_or_else(|e| {
                 eprintln!("[vzt-flow] failed to load config, using defaults: {e}");
                 Config::default()
             });
@@ -62,6 +64,26 @@ pub fn run() {
             app.manage(AppState::new(config.clone(), is_recording.clone()));
 
             tray::setup_tray(&handle)?;
+
+            // First-run onboarding. `ActivationPolicy::Accessory` means a fresh
+            // install shows NOTHING on launch — no Dock icon, no window — so a
+            // stranger who just installed via .dmg/brew has no way to discover
+            // they must download a model and grant permissions. Open the
+            // Settings/Setup window once, the first time we see `onboarded ==
+            // false`, then flip the flag and persist so we never auto-nag
+            // again. Rule chosen: flip on *first display*, not on completion —
+            // simplest, deterministic, and if they close it early the tray's
+            // "Settings…" item reopens it. Both the on-disk config and the
+            // managed in-memory copy are updated so a later `set_config` from
+            // the webview can't resurrect `onboarded = false`.
+            if !config.onboarded {
+                config.onboarded = true;
+                if let Err(e) = config.save() {
+                    eprintln!("[vzt-flow] failed to persist onboarded flag: {e}");
+                }
+                *app.state::<AppState>().config.lock().unwrap() = config.clone();
+                settings::show_settings(&handle);
+            }
 
             let (coordinator_tx, hotkey_active) =
                 coordinator::spawn(handle.clone(), config, is_recording);

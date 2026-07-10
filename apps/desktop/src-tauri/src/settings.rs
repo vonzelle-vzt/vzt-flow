@@ -9,12 +9,23 @@ pub fn show_settings(app: &AppHandle) {
         return;
     }
 
-    let _ = WebviewWindowBuilder::new(app, SETTINGS_LABEL, WebviewUrl::App("settings.html".into()))
+    match WebviewWindowBuilder::new(app, SETTINGS_LABEL, WebviewUrl::App("settings.html".into()))
         .title("VZT Flow Settings")
         .inner_size(480.0, 760.0)
         .resizable(true)
         .minimizable(false)
         .visible(true)
         .center()
-        .build();
+        .build()
+    {
+        // For an `Accessory` app a freshly built window can open *behind* the
+        // frontmost app, so focus it explicitly on the create path too (the
+        // reuse path above already does). Without this the first-run Settings
+        // window that onboarding opens can be invisible under whatever the
+        // installer/browser left frontmost.
+        Ok(window) => {
+            let _ = window.set_focus();
+        }
+        Err(e) => eprintln!("[vzt-flow] failed to open Settings window: {e}"),
+    }
 }

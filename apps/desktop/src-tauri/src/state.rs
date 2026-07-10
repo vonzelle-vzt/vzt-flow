@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
@@ -9,8 +9,111 @@ use flow_core::dictionary::DictionaryTerm;
 use flow_core::model_manager::ModelCommand;
 use flow_core::profiles::Profiles;
 use flow_core::snippets::Snippets;
+use serde::Serialize;
 
 use crate::coordinator::CoordinatorMsg;
+
+/// Which downloadable model a `start_model_download` request refers to. The
+/// wire form (`"parakeet"` / `"cleanup"`) is what the Settings webview sends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DownloadKind {
+    /// The Parakeet v3 speech-to-text model — required for any transcription.
+    Parakeet,
+    /// The Qwen3 cleanup LLM — optional (raw mode works without it).
+    Cleanup,
+}
+
+impl DownloadKind {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "parakeet" | "parakeet-v3" => Some(DownloadKind::Parakeet),
+            "cleanup" => Some(DownloadKind::Cleanup),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DownloadKind::Parakeet => "parakeet",
+            DownloadKind::Cleanup => "cleanup",
+        }
+    }
+}
+
+/// Coarse phase of the active model download, polled by the Settings webview.
+/// Serialized to the lowercase strings the JS switches on. `Verifying` covers
+/// both the sha check and (for Parakeet) the tar.gz extraction that follow the
+/// byte transfer: the underlying `download_*_with_progress` fns are a single
+/// blocking call whose progress callback only reports the download itself, so
+/// those tail steps can't be told apart from outside — they're reported
+/// together as "verifying". `Extracting` is reserved for a future finer split.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DownloadPhase {
+    Idle,
+    Downloading,
+    Verifying,
+    /// Reserved: the current worker collapses the post-download sha-verify and
+    /// tar.gz extraction into `Verifying` (they can't be told apart from
+    /// outside the single blocking download call), so this is never emitted
+    /// yet. Kept in the enum so the wire contract and the JS `phaseText`
+    /// switch already handle it if a finer split lands. Mirrors the
+    /// `#[allow(dead_code)]` on `OverlayEvent::Hidden`.
+    #[allow(dead_code)]
+    Extracting,
+    Done,
+    Error,
+}
+
+/// Shared, pollable state for the in-app model downloader. A single "slot":
+/// at most one download runs at a time (`active_kind`), so the byte/phase
+/// fields describe whichever one is in flight. Lives behind an `Arc` in
+/// [`AppState`] so the worker thread can own a handle for the (up to 1.1GB,
+/// minutes-long) download without holding a Tauri `State` guard.
+pub struct ModelDownload {
+    /// `Some(kind)` while a download worker is running; `None` when idle. Also
+    /// the concurrency guard — `start_model_download` refuses to start while
+    /// this is `Some`.
+    pub active_kind: Mutex<Option<DownloadKind>>,
+    pub phase: Mutex<DownloadPhase>,
+    /// Bytes downloaded / total advertised by the server (`total == 0` = the
+    /// server didn't send a content-length yet), updated from the worker's
+    /// `ProgressFn`.
+    pub downloaded: AtomicU64,
+    pub total: AtomicU64,
+    /// Last error message, set when `phase` becomes `Error`.
+    pub error: Mutex<Option<String>>,
+    /// Cached "Parakeet model is present". Seeded at startup (cheap dir stat),
+    /// flipped `true` by the worker on a successful Parakeet download, and
+    /// lazily refreshed by the hotkey gate. The gate reads this on the hot
+    /// path so a present model costs one atomic load, not a filesystem walk.
+    pub parakeet_present: AtomicBool,
+    /// Cached "cleanup model is present + verified". Seeded off-thread at
+    /// startup (a first-run verify may hash 1.1GB — kept off the launch path),
+    /// flipped `true` by the worker on a successful cleanup download.
+    pub cleanup_present: AtomicBool,
+}
+
+impl ModelDownload {
+    fn new() -> Self {
+        Self {
+            active_kind: Mutex::new(None),
+            phase: Mutex::new(DownloadPhase::Idle),
+            downloaded: AtomicU64::new(0),
+            total: AtomicU64::new(0),
+            error: Mutex::new(None),
+            parakeet_present: AtomicBool::new(false),
+            cleanup_present: AtomicBool::new(false),
+        }
+    }
+
+    /// Test-only constructor so `run_model_download` can be driven without a
+    /// full `AppState`/`AppHandle`.
+    #[cfg(test)]
+    pub fn new_for_test() -> Arc<Self> {
+        Arc::new(Self::new())
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DictationState {
@@ -102,6 +205,9 @@ pub struct AppState {
     /// joined on stop. Independent of the dictation state machine above — a
     /// meeting and hold-to-talk dictation can be active at the same time.
     pub meeting_session: Mutex<Option<flow_core::meeting::MeetingHandle>>,
+    /// In-app model downloader state (see [`ModelDownload`]). `Arc` so a
+    /// download worker thread can own a handle across the whole transfer.
+    pub model_download: Arc<ModelDownload>,
 }
 
 impl AppState {
@@ -118,6 +224,27 @@ impl AppState {
             eprintln!("[vzt-flow] failed to load snippets, using seed defaults: {e}");
             flow_core::snippets::seed_snippets()
         });
+
+        // Seed model-presence caches. Parakeet is a cheap directory stat, done
+        // inline so the hotkey gate is accurate from the first press. The
+        // cleanup verify can hash a 1.1GB file on a first-run/migration config
+        // (see `models::check_cleanup_model`), so it's pushed off the launch
+        // path onto a background thread — `cleanup_present` reads `false` until
+        // it completes (a few seconds at most), which only understates an
+        // optional model in the Settings dot briefly.
+        let model_download = Arc::new(ModelDownload::new());
+        let parakeet_present = flow_core::models::check_parakeet_model()
+            .map(|s| s.present)
+            .unwrap_or(false);
+        model_download.parakeet_present.store(parakeet_present, Ordering::Relaxed);
+        {
+            let md = model_download.clone();
+            std::thread::spawn(move || {
+                let present = flow_core::models::check_cleanup_model().unwrap_or(false);
+                md.cleanup_present.store(present, Ordering::Relaxed);
+            });
+        }
+
         Self {
             dictation_state: Mutex::new(DictationState::Idle),
             model_lifecycle: Mutex::new(ModelLifecycle::Unloaded),
@@ -139,6 +266,7 @@ impl AppState {
             recording_started: Mutex::new(None),
             recording_max_secs: Mutex::new(None),
             meeting_session: Mutex::new(None),
+            model_download,
         }
     }
 
