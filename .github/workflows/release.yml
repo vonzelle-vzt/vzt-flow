@@ -599,11 +599,32 @@ jobs:
             # escape hatch is present until an Intel Mac has actually launched it.
             codesign -d --entitlements - --xml "$APP" 2>/dev/null | grep -q "com.apple.security.cs.disable-library-validation" \
               || echo "::warning::Intel hardened build has no disable-library-validation entitlement; if the bundled libonnxruntime fails to load, that is why"
-            spctl -a -vv "$APP" 2>&1 | grep -q "accepted" \
-              || { echo "::error::Gatekeeper rejects the signed Intel app (spctl)"; exit 1; }
+            # `stapler validate` is the arch-independent proof of notarization:
+            # a ticket only exists if Apple accepted the submission. Assert it on
+            # BOTH the app and the dmg, since the bundler staples only the app.
+            xcrun stapler validate "$APP" \
+              || { echo "::error::notarization ticket is not stapled to the Intel app"; exit 1; }
             xcrun stapler validate "$DMG" \
               || { echo "::error::notarization ticket is not stapled to the Intel dmg"; exit 1; }
-            echo "signed OK (Intel): Developer ID, audio-input entitlement, spctl accepted, ticket stapled"
+
+            # spctl assesses whether the host would RUN this code, so on an
+            # arm64 runner without Rosetta it rejects an x86_64-only app no
+            # matter how it is signed. This is not hypothetical: in the v0.3.1
+            # run the arm64 and x86_64 apps came off the same pipeline with the
+            # same certificate and the same notarization, and spctl accepted the
+            # first and rejected the second on a macos-26-arm64 host. Assert it
+            # only where the verdict means something, and say so out loud when
+            # it is skipped rather than passing silently.
+            SPCTL_OUT="$(spctl -a -vv "$APP" 2>&1 || true)"
+            echo "spctl says: $SPCTL_OUT"
+            if arch -x86_64 /usr/bin/true >/dev/null 2>&1; then
+              printf '%s' "$SPCTL_OUT" | grep -q "accepted" \
+                || { echo "::error::Gatekeeper rejects the signed Intel app (spctl): $SPCTL_OUT"; exit 1; }
+              echo "signed OK (Intel): Developer ID, audio-input entitlement, spctl accepted, ticket stapled"
+            else
+              echo "::warning::skipped the spctl assertion — this runner is arm64 with no Rosetta, so spctl cannot assess an x86_64-only app. Notarization is still proven by the stapled tickets above."
+              echo "signed OK (Intel): Developer ID, audio-input entitlement, ticket stapled on app + dmg"
+            fi
           fi
 
           echo "bundle OK (verified inside shipped dmg): mic purpose string present, resources sealed, signature verifies, onnxruntime dylib + rpath present, minimumSystemVersion=$MINOS"
