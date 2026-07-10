@@ -1,5 +1,15 @@
 <p align="center"><img src="docs/assets/banner.png" alt="VZT Flow — Local. Private. On-Device Voice Dictation." width="100%"></p>
 
+<p align="center">
+  <img src="docs/assets/icon.png" alt="The VZT Flow app icon" width="128" height="128">
+</p>
+
+<p align="center">
+  <b><a href="https://github.com/vonzelle-vzt/vzt-flow/releases/latest">Download for macOS</a></b> ·
+  <a href="#the-whole-thing-in-three-steps">Three-step setup</a> ·
+  <a href="#feature-tour">What it does</a>
+</p>
+
 # VZT Flow
 
 [![Build](https://github.com/vonzelle-vzt/vzt-flow/actions/workflows/build.yml/badge.svg)](https://github.com/vonzelle-vzt/vzt-flow/actions/workflows/build.yml)
@@ -317,11 +327,31 @@ The app is signed with an Apple Developer ID and notarized, so it opens by
 double-clicking like any other Mac app — see
 [Gatekeeper](#gatekeeper-and-code-signing).
 
+### Where to download
+
+Everything ships from the [**Releases page**](https://github.com/vonzelle-vzt/vzt-flow/releases/latest).
+Pick the file that matches your Mac — Apple menu → **About This Mac** tells you
+which chip you have:
+
+| Your Mac | Download | Minimum macOS |
+|---|---|---|
+| Apple Silicon (M1–M5) | `VZT.Flow_<version>_aarch64.dmg` | 13.0 (Ventura) |
+| Intel | `VZT.Flow_<version>_x64.dmg` | 13.3 |
+
+Every `.dmg` is signed with an Apple Developer ID and notarized by Apple, with
+the ticket stapled, so it opens by double-clicking. Nothing about VZT Flow costs
+money, phones home, or needs an account.
+
+The `.dmg` gives you the app alone. The one-liner below gives you the app **plus**
+the `flow` CLI, the MCP server, and the speech model — which is why it's the
+recommended path.
+
 ### Let Claude do it
 
 Paste this into [Claude Code](https://claude.com/claude-code) and it installs
-everything — app, `flow` CLI, MCP server, and the ~640MB Parakeet model —
-then verifies the result with `flow doctor` and a real transcription:
+everything — app, `flow` CLI, MCP server, and the Parakeet speech model
+(456 MB download, ~640 MB on disk) — then proves it worked by running
+`flow doctor` and transcribing a real audio clip:
 
 > Install VZT Flow on this machine by following
 > https://raw.githubusercontent.com/vonzelle-vzt/vzt-flow/main/AGENT-INSTALL.md
@@ -333,21 +363,43 @@ an agent **can't** do (the three macOS permission grants are TCC-protected —
 no shell, `sudo`, or plist edit can grant them, so that step stays human, and
 the agent is told not to claim the hotkey works until you've tested it).
 
+You will still have to grant the three permissions yourself, and the agent is
+instructed to say so rather than pretend it finished.
+
 ### macOS: one-liner
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/vonzelle-vzt/vzt-flow/main/scripts/install.sh | bash
 ```
 
-Downloads the latest GitHub Release, installs `VZT Flow.app` to
-`/Applications`, the `flow` CLI to a PATH directory (`/usr/local/bin`, or
-`~/.local/bin` if that isn't writable), fetches the 456 MB Parakeet speech
-model, registers the MCP server with `claude mcp add` if the `claude` CLI is
-present, and launches the app. Nothing here needs `sudo`.
+**What it does, in order.** It resolves the latest GitHub Release, downloads the
+`.dmg` matching your chip, and then:
+
+| Step | Where it lands |
+|---|---|
+| Installs the menu-bar app | `/Applications/VZT Flow.app` |
+| Installs the `flow` CLI | `/usr/local/bin/flow`, or `~/.local/bin/flow` if that isn't writable |
+| Installs the MCP server | `~/.vzt-flow/mcp/` |
+| Registers it with Claude Code | via `claude mcp add`, only if the `claude` CLI is on your PATH |
+| Downloads the speech model | `~/.config/vzt-flow/models/` (456 MB download, ~640 MB on disk) |
+| Launches the app | menu bar, top-right — no Dock icon |
+
+**Nothing here needs `sudo`**, and nothing is installed system-wide beyond
+`/Applications`. To remove it all: delete those five paths.
+
+**What happens next.** The app opens its Settings window once, showing a live
+permission panel that re-checks every two seconds. Grant
+[the three permissions](#the-three-permissions), hold Right Option, and talk.
 
 The app is Developer ID signed and notarized, so it opens on a normal
 double-click no matter how it reached your disk (see
-[Gatekeeper](#gatekeeper-and-code-signing)).
+[Gatekeeper](#gatekeeper-and-code-signing)). `curl | bash` sets no quarantine
+attribute, so this path doesn't even show the "downloaded from the Internet"
+confirmation.
+
+If you'd rather read the script before piping it into a shell — a reasonable
+instinct — it's [`scripts/install.sh`](scripts/install.sh), and it is linted and
+executed against a clean macOS and Linux runner on every change.
 
 Four environment variables change what it does:
 
