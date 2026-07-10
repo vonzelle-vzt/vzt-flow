@@ -53,7 +53,7 @@ extended (a concurrent workstream may be mid-merge)
 | Personal dictionary | ✅ | `dictionary.json`, fuzzy (Levenshtein, budget `len/4`/word) for terms 4+ chars, exact-match only below that. Applied before cleanup/code-mode. Seeded with the project's own stack (Supabase, Whop, Vercel, Tauri, Parakeet, ...). |
 | Snippets | ✅ | `snippets.json`, trigger phrase → fixed expansion, fires only when the trigger is the *entire* cleaned transcript (or `"insert <trigger>"`). Applied after cleanup. |
 | History | ✅ | `history.jsonl`; `flow history -n <N>` and the tray's "Copy last transcript." |
-| CLI + daemon socket | ✅ | `flow listen/transcribe/models/doctor/status/toggle/cancel/history` plus hidden diagnostics `paste-test`/`clean-test`/`code-test`. Daemon-first (drives the desktop app's overlay) with a fully standalone fallback (no daemon required). Transport is a Unix domain socket on macOS/Linux and a **Windows named pipe** (`\\.\pipe\vzt-flow-daemon`, shipped `11493ce`+`519004f`+`3ca31c8`) — so `flow` and the MCP server are daemon-first on Windows too. CI-unit-tested (real pipe connect + status round trip); full desktop-app-as-daemon path still unverified on real Windows hardware. |
+| CLI + daemon socket | ✅ | `flow listen/transcribe/models/doctor/status/toggle/cancel/history` plus hidden diagnostics `paste-test`/`clean-test`/`code-test`. Daemon-first (drives the desktop app's overlay) with a fully standalone fallback (no daemon required). Transport is a Unix domain socket on macOS/Linux and a **Windows named pipe** (`\\.\pipe\vzt-flow-daemon`, shipped `11493ce`+`519004f`+`3ca31c8`) — so `flow` and the MCP server are daemon-first on Windows too. CI-unit-tested (real pipe connect + status round trip); the full desktop-app-as-daemon path was **verified on real Windows 11 hardware (2026-07-10)**. |
 | MCP voice input for Claude Code | ✅ | `mcp/src/index.ts`: `listen`, `transcribe_file`, `dictation_history` tools, backed by the daemon socket when available, standalone `flow` CLI otherwise. The headline differentiator — no other dictation product exposes an MCP tool for coding agents. |
 | Meeting transcription + summary | ✅ | `flow meeting` — dual-stream capture (ScreenCaptureKit for system/participant audio + mic), both transcribed by the same local Parakeet engine, speaker-labelled Markdown transcript with an echo filter (Jaccard similarity > 0.7 on time-overlapping lines) to dedupe your own mic picking up speaker audio. On stop, local Qwen3 appends a summary + action items. `meeting_transcript` MCP tool exposes transcripts to Claude Code. macOS-only (ScreenCaptureKit is a macOS 13+ framework). |
 | Meeting auto-detect | ✅ | Shipped `308b899`. Background detector (`crates/flow-core/src/meeting/detect.rs`) combines a frontmost-app rule table (Zoom/Meet/Teams, localized-dash-tolerant) with mic-live signal (CoreAudio `kAudioDevicePropertyDeviceIsRunningSomewhere`) via a debounced state machine (2 polls to start, 3 absent polls to end; mute never ends a meeting) — 100% local, titles-only, no screenshots/OCR. Tray **Meeting auto-detect ▸ Ask/Auto/Off** submenu, persisted as `meeting_auto` in `config.toml`. "Ask" prompts via a system notification; "Auto" starts `flow meeting` immediately. |
@@ -138,13 +138,15 @@ grants survive rebuilds (not yet done — see Out of scope below).
   `519004f`+`3ca31c8`): `flow status`/`toggle`/`cancel`, the daemon-driven
   overlay for `flow listen`, and the MCP daemon path are all daemon-first on
   Windows, matching macOS. This is **CI-unit-tested** (a real pipe connect +
-  status round trip) but the full desktop-app-as-daemon path — and the
-  Windows build generally (hold/tap timing, permission prompts, stability) —
-  has **never been run on real Windows hardware**; those remain "verified in
-  code, untested in practice." Known runner quirk: GitHub's windows-2025
-  runners reject `set_recv_timeout` on named-pipe client streams, so the
-  client degrades to a blocking read (safe — callers gate on `is_alive`
-  first; `3ca31c8`).
+  status round trip), and on 2026-07-10 the full desktop-app-as-daemon path —
+  along with install, model download, ASR, the Ctrl+Shift+Space hold/tap,
+  hands-free auto-stop, the MCP server, and a human dictating by voice — was
+  **verified on real Windows 11 hardware**. That run also found that auto-paste
+  sent a `VK_PACKET` character event rather than Ctrl+V and silently did
+  nothing (fixed in v0.3.2). `set_recv_timeout` on a named-pipe client stream
+  fails on **real Windows as well as CI**, so the blocking-read degradation is
+  the normal Windows path rather than a runner quirk (safe — callers gate on
+  `is_alive` first; `3ca31c8`).
 - **Linux Wayland-native hotkey + meeting capture, and real-hardware
   validation** — the Linux build (`x86_64-unknown-linux-gnu`) is CI-built and
   tested but never run on real Linux hardware. On X11 it's full-featured; on

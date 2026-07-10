@@ -51,7 +51,7 @@ what they're getting:
 | macOS Apple Silicon | Supported, tested | `scripts/install.sh` | app + CLI + MCP |
 | macOS Intel | CI-built, CPU-only inference, never run on real Intel hardware | `scripts/install.sh` | app + CLI + MCP |
 | Linux x86_64 | Experimental; CI-built, never run on real Linux hardware. X11 full, Wayland degraded. No cleanup LLM, no meeting mode | `scripts/install.sh` | app + CLI + MCP |
-| Windows x64 | Experimental; CI-built, never run on real Windows hardware. No cleanup LLM, no per-app profiles | `scripts/install.ps1` | app + CLI + MCP |
+| Windows x64 | Experimental, but **verified end to end on real Windows hardware (2026-07-10)**. No cleanup LLM, no per-app profiles. Installers are unsigned — SmartScreen warns | `scripts/install.ps1` | app + CLI + MCP |
 
 **Windows ships the CLI and MCP server as of v0.3.0.** `install.ps1` installs
 `flow.exe`, adds it to the user PATH, registers the MCP server, and can download
