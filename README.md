@@ -270,11 +270,10 @@ with a fully standalone fallback (capture/transcribe/cleanup, no daemon
 required) — see [CLI reference](docs/USAGE-macOS.md#cli-reference) for the
 complete command list, including the hidden diagnostic commands
 (`paste-test`, `clean-test`, `code-test`). On **Windows** the same daemon
-path now runs over a native named pipe (`\\.\pipe\vzt-flow-daemon`), so
+path runs over a native named pipe (`\\.\pipe\vzt-flow-daemon`), so
 `flow status`/`toggle`/`cancel`/`listen` and the MCP server are daemon-first
-there too — CI-unit-tested (a real pipe connect + status round trip), though
-the full desktop-app-as-daemon path is still unverified on real Windows
-hardware.
+there too — verified end to end on real Windows hardware (2026-07-10), not
+just in CI's pipe unit tests.
 
 ### Resource discipline
 
@@ -660,34 +659,40 @@ this build works around.
 ### Windows (experimental)
 
 > [!WARNING]
-> Experimental, but now **run once on real Windows hardware (2026-07-10)**:
-> install, model download, transcription (RTF 0.131x on CPU ONNX), the
-> Ctrl+Shift+Space hotkey, hands-free auto-stop, and the full
+> Experimental, but **verified end to end on real Windows hardware
+> (2026-07-10)**: install, model download, transcription (RTF 0.131x on CPU
+> ONNX), the Ctrl+Shift+Space hotkey, hands-free auto-stop, the full
 > desktop-app-as-daemon round trip over the named pipe
-> (`\\.\pipe\vzt-flow-daemon`) — including the MCP server — all verified
-> working. **v0.3.1's auto-paste is broken** (transcript lands on the
-> clipboard only; fixed on `main`). The Windows installers are **unsigned** —
-> there is no code signing in CI — so a browser-downloaded installer may hit
-> SmartScreen's "Windows protected your PC" on first run: choose **More info →
-> Run anyway**. (The Apple Developer ID signing described under
-> [Gatekeeper](#gatekeeper-and-code-signing) covers the macOS `.dmg` only.)
-> Still no per-app profiles, no `clean`/`polish` cleanup LLM yet, Ctrl+V paste
-> with no secure-field detection. Default hotkey is **Ctrl+Shift+Space**.
-> Details:
-> [docs/USAGE-Windows.md](docs/USAGE-Windows.md#first-real-hardware-test-results-2026-07-10).
+> (`\\.\pipe\vzt-flow-daemon`), the MCP server, and a real human dictating
+> by voice — all working. One bug found in that run: **v0.3.1's auto-paste
+> silently does nothing** (your words still land on the clipboard — press
+> Ctrl+V); fixed on `main`, re-verified on the same machine, ships in the
+> next release. Still no per-app profiles and no `clean`/`polish` cleanup
+> LLM on Windows.
+
+**Install** — one PowerShell line, no admin needed (Windows 10 1803+/11,
+x64, ~1.2 GB disk):
 
 ```powershell
-cargo build --release -p flow-cli
-.\target\release\flow.exe models download parakeet-v3
-cd apps\desktop
-npm install
-cargo install tauri-cli --version "^2"
-cargo tauri build --target x86_64-pc-windows-msvc
+iwr https://raw.githubusercontent.com/vonzelle-vzt/vzt-flow/main/scripts/install.ps1 -UseBasicParsing | iex
 ```
 
-Every verified difference from macOS is documented in
-[docs/USAGE-Windows.md](docs/USAGE-Windows.md). Windows on Arm (`aarch64-pc-windows-msvc`)
-is attempted in CI as an allowed-to-fail job — see
+That installs the tray app, the `flow` CLI (open a new terminal to pick up
+the PATH change), the MCP server for Claude Code, and the Parakeet speech
+model — then **hold Ctrl+Shift+Space, talk, let go** (or tap it for
+hands-free). The hotkey is fixed on Windows — the hotkey picker in Settings
+only applies to macOS. The installers are **unsigned** — there is no code
+signing in CI — so a browser-downloaded installer may hit SmartScreen's
+"Windows protected your PC" on first run: choose **More info → Run anyway**.
+(The Apple Developer ID signing described under
+[Gatekeeper](#gatekeeper-and-code-signing) covers the macOS `.dmg` only.)
+
+The full Windows guide — quick start, day-to-day dictation notes,
+troubleshooting, CI/bleeding-edge installs, build-from-source, and the
+real-hardware test matrix — is
+[docs/USAGE-Windows.md](docs/USAGE-Windows.md). Windows on Arm
+(`aarch64-pc-windows-msvc`) is attempted in CI as an allowed-to-fail job —
+see
 [docs/USAGE-Windows.md#hardware-requirements](docs/USAGE-Windows.md#hardware-requirements)
 for current status.
 
@@ -723,7 +728,7 @@ source steps: [docs/USAGE-Linux.md](docs/USAGE-Linux.md).
 |---|---|---|
 | macOS Apple Silicon (`aarch64-apple-darwin`) | **Supported, tested** | Primary dev platform (M5 MacBook Air); Metal cleanup + CoreML ASR |
 | macOS Intel (`x86_64-apple-darwin`) | Built in CI, CPU-only inference | Never run on real Intel hardware; effective floor is macOS **13.3**, not the 12.0 in `tauri.conf.json` — see [USAGE-macOS.md](docs/USAGE-macOS.md#hardware-requirements) |
-| Windows x64 (`x86_64-pc-windows-msvc`) | Built in CI, experimental — **run once on real hardware (2026-07-10)** | Install/ASR/hotkey/daemon-over-named-pipe/MCP all verified on a real Windows 11 machine; v0.3.1 auto-paste broken (fixed on `main`); still no per-app profiles/cleanup LLM |
+| Windows x64 (`x86_64-pc-windows-msvc`) | Built in CI, experimental — **verified on real hardware (2026-07-10)** | Install/ASR/hotkey/daemon-over-named-pipe/MCP/human-dictation all verified on a real Windows 11 machine; v0.3.1 auto-paste broken (fixed on `main`, re-verified); still no per-app profiles/cleanup LLM |
 | Windows Arm (`aarch64-pc-windows-msvc`) | Attempted in CI, allowed to fail | Status depends on upstream (`ort`, WebView2-on-Arm) support this week — check the latest `build` workflow run |
 | Linux x64 (`x86_64-unknown-linux-gnu`) | **Unsupported, community-maintained** | Never run on real Linux hardware; not part of the supported release surface — `.deb` + `.AppImage` keep shipping from CI (built + unit-tested on every push), provided as-is. **X11**: hotkey/paste/tray/overlay all work as designed. **Wayland**: no global hotkey across native apps (no fix planned), clipboard-only paste, best-effort overlay (Wayland denies clients global input grabs). No cleanup LLM / profiles / meeting mode (as Windows). See [USAGE-Linux.md](docs/USAGE-Linux.md) |
 
