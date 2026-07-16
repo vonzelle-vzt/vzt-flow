@@ -34,7 +34,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
           cache: npm
@@ -56,7 +56,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
       - name: Install frontend/MCP dependencies
@@ -172,7 +172,7 @@ jobs:
         with:
           workspaces: ". -> target"
           key: x86_64-apple-darwin
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
       - name: Install frontend/MCP dependencies
@@ -325,7 +325,7 @@ jobs:
         with:
           workspaces: ". -> target"
           key: x86_64-unknown-linux-gnu
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
       - name: Install Linux system dependencies (Tauri/WebKitGTK, tray appindicator, ALSA, X11 paste)
@@ -391,7 +391,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
       - name: Install frontend/MCP dependencies
@@ -446,7 +446,7 @@ jobs:
         with:
           workspaces: ". -> target"
           key: aarch64-pc-windows-msvc
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
       - name: Install frontend/MCP dependencies
