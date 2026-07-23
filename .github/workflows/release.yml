@@ -307,13 +307,13 @@ jobs:
           EOF
           tar -C "$(dirname "$STAGE")" -czf vzt-flow-cli-macos-aarch64.tar.gz "$(basename "$STAGE")"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: vzt-flow-macos-aarch64-dmg
           path: ${{ steps.find_dmg.outputs.path }}
           if-no-files-found: error
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: vzt-flow-cli-macos-aarch64
           path: vzt-flow-cli-macos-aarch64.tar.gz
@@ -669,13 +669,13 @@ jobs:
           EOF
           tar -C "$(dirname "$STAGE")" -czf vzt-flow-cli-macos-x86_64.tar.gz "$(basename "$STAGE")"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: vzt-flow-macos-x86_64-dmg
           path: ${{ steps.find_dmg.outputs.path }}
           if-no-files-found: error
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: vzt-flow-cli-macos-x86_64
           path: vzt-flow-cli-macos-x86_64.tar.gz
@@ -721,7 +721,7 @@ jobs:
             \( -name '*.msi' -o -name '*.exe' \) -exec cp {} ci-artifacts/ \;
           ls -la ci-artifacts
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: vzt-flow-windows-x64-installers
           path: ci-artifacts/*
@@ -779,7 +779,7 @@ jobs:
           EOF
           tar -C "$(dirname "$STAGE")" -czf vzt-flow-cli-windows-x86_64.tar.gz "$(basename "$STAGE")"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: vzt-flow-cli-windows-x86_64
           path: vzt-flow-cli-windows-x86_64.tar.gz
@@ -826,7 +826,7 @@ jobs:
             \( -name '*.msi' -o -name '*.exe' \) -exec cp {} ci-artifacts/ \;
           ls -la ci-artifacts
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: vzt-flow-windows-arm64-installers
           path: ci-artifacts/*
@@ -921,7 +921,7 @@ jobs:
           tar -C "$(dirname "$STAGE")" -czf out/vzt-flow-cli-linux-x86_64.tar.gz "$(basename "$STAGE")"
           ls -la out
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: vzt-flow-linux-x64-bundles
           path: out/*
