@@ -156,29 +156,32 @@ Bump the version in **three** places first — `Cargo.toml` (workspace),
 `apps/desktop/package.json`, `apps/desktop/src-tauri/tauri.conf.json` — plus a
 `CHANGELOG.md` entry.
 
-**Three install paths, and they do NOT update together.** The Releases page and
-`scripts/install.sh` both resolve `releases/latest`, so they follow a new tag
-automatically. The **Homebrew cask lives in a separate repo**
+**Three install paths, and nothing in THIS repo updates the third.** The
+Releases page and `scripts/install.sh` both resolve `releases/latest`, so they
+follow a new tag within seconds. The **Homebrew cask lives in a separate repo**
 (`vonzelle-vzt/homebrew-vzt`, `Casks/vzt-flow.rb`) and pins `version` plus two
-literal `sha256`s — nothing in this repo would touch it, so before the
-`homebrew` job existed a release silently left every `brew upgrade` user on the
-previous build. That bit us at v0.3.3, whose entire content was a crash fix.
+literal `sha256`s, so it used to need a manual bump — miss it and every
+`brew upgrade` user stays on the old build with no failure anywhere to notice.
+That nearly bit us at v0.3.3, whose entire content was a crash fix.
 
-The `homebrew` job needs a repository secret **`HOMEBREW_TAP_TOKEN`**: a
-fine-grained PAT scoped to `vonzelle-vzt/homebrew-vzt` only, with
-**Contents: read and write**. It hashes the *published* dmgs (the bytes users
-actually download, not the local artifacts), rewrites the cask via
-`.github/scripts/bump_cask.py`, and pushes to the tap.
+**The tap now updates itself and needs nothing from us.** Its own `auto-bump`
+workflow polls this repo's `releases/latest` daily, and on a new stable version
+downloads the published dmgs, hashes them, rewrites the cask and commits. It
+lives there rather than here deliberately: pushing into the tap from this
+workflow would need a PAT stored as a secret, whereas polling from inside the
+tap uses its built-in `GITHUB_TOKEN` — no secret to leak, expire, or rotate.
+So **cutting a release is just the tag; the cask follows within a day.**
 
-If that job goes red, **the cask is stale and brew users are stuck** — that is
-why a missing token is a hard failure rather than a skipped job. The release
-itself is already published by then, so recovery is just re-running the job (or
-running `bump_cask.py` by hand against a tap checkout; it takes the same four
-arguments and is idempotent). `windows-arm64` going red is *expected* and does
-not block anything — it is `continue-on-error: true`, attempt-only.
+Two things worth knowing. To get a release into brew immediately rather than
+waiting for the cron, hit **Run workflow** on `auto-bump` in the tap. And
+GitHub disables scheduled workflows after **60 days of repository inactivity** —
+each bump is a commit so a normal cadence self-sustains, but after a 2+ month
+release gap check the tap's Actions tab (GitHub emails first) or just run it
+manually. Pre-release tags are skipped on purpose; brew keeps serving the last
+stable version.
 
-Pre-release tags (`v0.4.0-rc1`, anything with a `-`) skip the cask bump on
-purpose; brew must keep serving the last stable version.
+`windows-arm64` going red is *expected* and blocks nothing — it is
+`continue-on-error: true`, attempt-only.
 
 ## Shared-worktree hygiene
 
