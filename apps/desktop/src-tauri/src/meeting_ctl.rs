@@ -23,7 +23,7 @@ use flow_core::meeting::detect::{self, Debouncer, DetectEvent, MeetingApp};
 use tauri::{AppHandle, Manager};
 use tauri_plugin_notification::NotificationExt;
 
-use crate::state::AppState;
+use crate::state::{AppState, LockRecover};
 use crate::tray;
 
 /// Environment override for the meeting-output directory (mirrors the MCP
@@ -34,7 +34,7 @@ const MEETINGS_DIR_ENV: &str = "FLOW_MEETINGS_DIR";
 /// Whether a meeting session is currently running (thread alive).
 pub fn is_active(app: &AppHandle) -> bool {
     let state = app.state::<AppState>();
-    let guard = state.meeting_session.lock().unwrap();
+    let guard = state.meeting_session.lock_or_recover();
     guard.as_ref().map(|h| h.is_running()).unwrap_or(false)
 }
 
@@ -65,7 +65,7 @@ fn notify(app: &AppHandle, title: &str, body: &str) {
 pub fn start(app: &AppHandle, title: Option<String>, notify_start: bool) {
     {
         let state = app.state::<AppState>();
-        let mut guard = state.meeting_session.lock().unwrap();
+        let mut guard = state.meeting_session.lock_or_recover();
         // Reap a session that already finished (e.g. errored out on a missing
         // permission) so a stale handle can't block a fresh start.
         if let Some(h) = guard.as_ref() {
@@ -96,7 +96,7 @@ pub fn start(app: &AppHandle, title: Option<String>, notify_start: bool) {
 pub fn stop(app: &AppHandle) {
     let handle = {
         let state = app.state::<AppState>();
-        let mut guard = state.meeting_session.lock().unwrap();
+        let mut guard = state.meeting_session.lock_or_recover();
         guard.take()
     };
     let Some(handle) = handle else {
@@ -165,7 +165,7 @@ pub fn open_folder(app: &AppHandle) {
 pub fn set_auto_mode(app: &AppHandle, mode: MeetingAuto) {
     let state = app.state::<AppState>();
     {
-        let mut cfg = state.config.lock().unwrap();
+        let mut cfg = state.config.lock_or_recover();
         cfg.meeting_auto = mode.as_str().to_string();
         if let Err(e) = cfg.save() {
             eprintln!("[vzt-flow] failed to save meeting_auto: {e}");
@@ -201,7 +201,7 @@ fn detector_loop(app: AppHandle) {
 
         let mode = {
             let state = app.state::<AppState>();
-            let cfg = state.config.lock().unwrap();
+            let cfg = state.config.lock_or_recover();
             cfg.meeting_auto_mode()
         };
         if mode == MeetingAuto::Off {

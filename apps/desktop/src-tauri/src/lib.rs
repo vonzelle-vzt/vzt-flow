@@ -11,11 +11,39 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use flow_core::config::Config;
-use state::AppState;
+use state::{AppState, LockRecover};
 use tauri::Manager;
+
+/// Log every panic with its location before the default handler runs.
+///
+/// There was no panic hook at all before this, so a panic on any background
+/// thread vanished silently: Rust's default handler writes to stderr, which a
+/// GUI app launched from Finder does not have anywhere useful. The coordinator
+/// supervisor in `coordinator::spawn` recovers from those panics, but recovery
+/// without a record just means the bug is invisible instead of fatal — and the
+/// thing that made the 2026-07-29 investigation slow was precisely that a
+/// broken app and a working one looked identical from the outside.
+///
+/// Chains to the previous hook rather than replacing it, so Tauri's own
+/// reporting (if any) still runs.
+fn install_panic_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<unknown location>".to_string());
+        let thread = std::thread::current();
+        let thread_name = thread.name().unwrap_or("<unnamed>");
+        eprintln!("[vzt-flow] PANIC on thread '{thread_name}' at {location}: {info}");
+        previous(info);
+    }));
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    install_panic_hook();
+
     #[allow(unused_mut)]
     let mut builder = tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
@@ -83,13 +111,13 @@ pub fn run() {
                 if let Err(e) = config.save() {
                     eprintln!("[vzt-flow] failed to persist onboarded flag: {e}");
                 }
-                *app.state::<AppState>().config.lock().unwrap() = config.clone();
+                *app.state::<AppState>().config.lock_or_recover() = config.clone();
                 settings::show_settings(&handle);
             }
 
             let (coordinator_tx, hotkey_active) =
                 coordinator::spawn(handle.clone(), config, is_recording);
-            *app.state::<AppState>().coordinator_tx.lock().unwrap() = Some(coordinator_tx);
+            *app.state::<AppState>().coordinator_tx.lock_or_recover() = Some(coordinator_tx);
             if !hotkey_active {
                 eprintln!(
                     "[vzt-flow] global hold-to-talk key is NOT active. Use the tray's \

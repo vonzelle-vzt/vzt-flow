@@ -6,14 +6,14 @@ use tauri_plugin_autostart::ManagerExt;
 use flow_core::config::MeetingAuto;
 
 use crate::coordinator::CoordinatorMsg;
-use crate::state::{AppState, DictationState, ModelLifecycle};
+use crate::state::{AppState, DictationState, LockRecover, ModelLifecycle};
 
 pub const TRAY_ID: &str = "vzt-flow-tray";
 
 pub fn build_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     let state = app.state::<AppState>();
-    let dictation_state = *state.dictation_state.lock().unwrap();
-    let model_lifecycle = *state.model_lifecycle.lock().unwrap();
+    let dictation_state = *state.dictation_state.lock_or_recover();
+    let model_lifecycle = *state.model_lifecycle.lock_or_recover();
     let launch_at_login = app.autolaunch().is_enabled().unwrap_or(false);
 
     let status_label = format!(
@@ -33,7 +33,7 @@ pub fn build_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
 
     // --- meeting transcription state ---
     let meeting_active = crate::meeting_ctl::is_active(app);
-    let meeting_auto = state.config.lock().unwrap().meeting_auto_mode();
+    let meeting_auto = state.config.lock_or_recover().meeting_auto_mode();
     let meeting_toggle_label = if meeting_active {
         "Stop meeting transcription (\u{25cf} recording)"
     } else {
@@ -148,7 +148,7 @@ fn handle_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
     let state = app.state::<AppState>();
     match event.id().as_ref() {
         "toggle_dictation" => {
-            if let Some(tx) = state.coordinator_tx.lock().unwrap().as_ref() {
+            if let Some(tx) = state.coordinator_tx.lock_or_recover().as_ref() {
                 let _ = tx.send(CoordinatorMsg::TrayToggleDictation);
             }
         }
@@ -174,7 +174,7 @@ fn handle_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
             crate::settings::show_settings(app);
         }
         "test_overlay" => {
-            if let Some(tx) = state.coordinator_tx.lock().unwrap().as_ref() {
+            if let Some(tx) = state.coordinator_tx.lock_or_recover().as_ref() {
                 let _ = tx.send(CoordinatorMsg::TestOverlay);
             }
         }
@@ -189,7 +189,7 @@ fn handle_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
                 eprintln!("[vzt-flow] failed to toggle launch-at-login: {e}");
             }
             {
-                let mut cfg = state.config.lock().unwrap();
+                let mut cfg = state.config.lock_or_recover();
                 cfg.launch_at_login = !enabled;
                 let _ = cfg.save();
             }
@@ -203,7 +203,7 @@ fn handle_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
 }
 
 fn copy_last_transcript(app: &AppHandle, state: &State<AppState>) {
-    if let Some(text) = state.last_transcript.lock().unwrap().clone() {
+    if let Some(text) = state.last_transcript.lock_or_recover().clone() {
         if let Ok(mut clipboard) = arboard::Clipboard::new() {
             let _ = clipboard.set_text(text);
         }

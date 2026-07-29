@@ -575,11 +575,25 @@ failed: that's **Accessibility**.
 **3. Does the overlay say the speech model is missing?** Run
 `flow models download parakeet-v3`.
 
-**4. Is the app actually running?** It has no dock icon. Check the menu bar, or:
+**4. Is the app actually running?** It has no dock icon, so a crash looks
+exactly like a broken hotkey — there's no dialog and no dock icon to disappear.
+Check the menu bar, or:
 
 ```bash
 pgrep -f vzt-flow-desktop || open -a "/Applications/VZT Flow.app"
 ```
+
+If it wasn't running, check whether it *quit* rather than never started:
+
+```bash
+ls -t ~/Library/Logs/DiagnosticReports/vzt-flow-desktop-*.ips | head -3
+```
+
+A report dated when you last tried to dictate means the app crashed. **Versions
+before 0.3.3 had exactly this bug** — the auto-paste could abort the process at
+the very end of an otherwise-successful dictation ([details in the
+changelog](CHANGELOG.md)). Upgrade. If you see a crash on 0.3.3 or later,
+please open an issue with that `.ips` file attached.
 
 **5. Still stuck?** `flow doctor` prints the model, daemon, hotkey binding, and
 MCP registration state in one shot. Include its output in a bug report.
@@ -788,7 +802,7 @@ single-display setup.)*
 |---|---|
 | `crates/flow-core` | The engine: audio capture, ASR, LLM cleanup, dictionary, code mode, snippets, profiles, history, hotkey monitoring, paste, model download/management, daemon IPC. Platform-agnostic; macOS-only pieces are `#[cfg(target_os = "macos")]`-gated. |
 | `crates/flow-cli` | The `flow` binary. Daemon-first, standalone fallback. |
-| `apps/desktop` | The [Tauri 2](https://tauri.app) menu-bar app: tray icon, overlay, Settings window, hotkey, daemon control socket. |
+| `apps/desktop` | The [Tauri 2](https://tauri.app) menu-bar app: tray icon, overlay, Settings window, hotkey, daemon control socket. The dictation loop is supervised — a panic mid-dictation resets the recorder, says so in the overlay, and restarts, rather than leaving the hotkey silently dead. |
 | `mcp/` | Node/TypeScript MCP server (`listen`, `transcribe_file`, `dictation_history`, `meeting_transcript`) for Claude Code. |
 
 Key dependencies: [Tauri 2](https://tauri.app) (native webview shell — an

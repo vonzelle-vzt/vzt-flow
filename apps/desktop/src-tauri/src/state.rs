@@ -210,6 +210,58 @@ pub struct AppState {
     pub model_download: Arc<ModelDownload>,
 }
 
+/// Poison-tolerant `Mutex::lock`.
+///
+/// Every `AppState` mutex is guarded state for a *single-threaded* state
+/// machine, never a data structure whose invariants a panic could leave
+/// half-written. So a poisoned lock here carries no information worth
+/// propagating — but `.lock_or_recover()` on it panics, which is how one bad
+/// dictation used to become a permanently dead hotkey: the first panic
+/// poisons the mutex, and every subsequent press panics on the same line
+/// before it can do anything. The coordinator supervisor
+/// (`coordinator::spawn`) restarts the loop after a panic, and this is what
+/// makes that restart able to make progress instead of re-panicking forever.
+///
+/// Deliberately NOT `unwrap_or_else(|_| panic!(..))` and not a `Result` — the
+/// caller has nothing useful to do with the poison flag.
+pub trait LockRecover<T> {
+    /// Lock, taking the guard even if a previous holder panicked.
+    fn lock_or_recover(&self) -> std::sync::MutexGuard<'_, T>;
+}
+
+impl<T> LockRecover<T> for Mutex<T> {
+    fn lock_or_recover(&self) -> std::sync::MutexGuard<'_, T> {
+        self.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+impl AppState {
+    /// Return the dictation state machine to a usable Idle state after the
+    /// coordinator thread panicked mid-dictation.
+    ///
+    /// Without this the restart is useless: `run_coordinator` refuses a new
+    /// press unless `dictation_state == Idle` (and hands-free/`is_recording`
+    /// gate other paths), so a panic during Recording/Transcribing would leave
+    /// every future hotkey press silently ignored — the same dead-hotkey
+    /// symptom the supervisor exists to prevent, just latched in a different
+    /// variable. Any guard we add has to have a path back to its clear state.
+    ///
+    /// A daemon `listen` waiting on a reply is answered with an error rather
+    /// than dropped, so the CLI caller fails fast instead of blocking forever.
+    pub fn reset_after_panic(&self) {
+        *self.dictation_state.lock_or_recover() = DictationState::Idle;
+        *self.recording_started.lock_or_recover() = None;
+        *self.recording_max_secs.lock_or_recover() = None;
+        self.is_recording.store(false, Ordering::Relaxed);
+        self.hands_free_active.store(false, Ordering::Relaxed);
+        if let Some((reply, _mode)) = self.pending_listen.lock_or_recover().take() {
+            let _ = reply.send(Err(
+                "dictation failed unexpectedly; the recorder has been reset".to_string(),
+            ));
+        }
+    }
+}
+
 impl AppState {
     pub fn new(config: Config, is_recording: Arc<AtomicBool>) -> Self {
         let dictionary = flow_core::dictionary::load_or_seed().unwrap_or_else(|e| {
@@ -271,8 +323,41 @@ impl AppState {
     }
 
     pub fn set_dictation_state(&self, s: DictationState) {
-        *self.dictation_state.lock().unwrap() = s;
+        *self.dictation_state.lock_or_recover() = s;
         self.is_recording
             .store(s == DictationState::Recording, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod lock_recover_tests {
+    use super::*;
+
+    /// The anti-latching property the coordinator supervisor depends on.
+    ///
+    /// Before `LockRecover`, one panic while an `AppState` mutex was held
+    /// poisoned it permanently, so every later `.lock().unwrap()` panicked on
+    /// the same line — restarting the coordinator would just panic again, and
+    /// the hotkey stayed dead until the user quit and relaunched the app.
+    #[test]
+    fn a_poisoned_mutex_is_still_usable() {
+        let m = Arc::new(Mutex::new(41));
+
+        // Poison it exactly the way a panicking dictation would.
+        let m2 = m.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = m2.lock().unwrap();
+            panic!("simulated panic while holding the lock");
+        })
+        .join();
+        assert!(m.is_poisoned(), "precondition: the mutex must be poisoned");
+
+        // The plain path is what used to strand us.
+        assert!(m.lock().is_err(), "control: .lock() reports the poison");
+
+        // The recovering path still hands over the guard, and the value is
+        // intact — so the restarted coordinator can make progress.
+        *m.lock_or_recover() += 1;
+        assert_eq!(*m.lock_or_recover(), 42);
     }
 }

@@ -97,6 +97,38 @@ on `is_alive` first, so an unanswerable pipe is caught before the read rather
 than by a timeout. Don't turn that into a hard error, and don't assume a
 recv-timeout is available on any named-pipe stream.
 
+**(h) macOS input-source / TSM APIs abort off the main thread — and the
+coordinator IS off the main thread.** `TISCopyCurrentKeyboardInputSource`,
+`TISGetInputSourceProperty` and friends go through HIToolbox's
+`islGetInputSourceListWithAdditions`, which asserts the main queue and
+**aborts the process** (SIGTRAP/SIGABRT, not a catchable Rust panic) when it
+has to build the input-source list. This killed the whole app mid-dictation on
+2026-07-29: `enigo`'s `Key::Unicode('v')` resolves the character against the
+live layout (256 TSM calls per paste) and `insert::simulate_paste` runs on the
+coordinator thread. Fix was to send the raw keycode (`Key::Other(0x09)` =
+`kVK_ANSI_V`) so no lookup happens — see `paste_v_key` in
+`crates/flow-core/src/insert.rs`. **It is a race**: one background caller
+usually wins and survives, which is why it looked intermittent — reproduce it
+with concurrency (`paste_from_background_thread_does_not_trap`, 8 threads),
+never with a single call. Before calling any Carbon/HIToolbox/AppKit API from
+a worker thread, check whether it is main-thread-only; Tauri's own window ops
+(`show`/`hide`) are safe because they marshal via `send_user_message`, but
+that is a property of Tauri, not of the platform.
+
+**(i) A panic on the coordinator thread is invisible, not fatal — which is
+worse.** The release profile unwinds (no `panic = "abort"`), so a panic in
+`run_coordinator` kills only that thread: the process, tray icon and Settings
+window all survive while the hotkey silently stops responding forever. There
+is no crash report to find. The loop is therefore supervised (`catch_unwind`
+→ `AppState::reset_after_panic` → restart) and every `AppState` mutex is
+locked via `LockRecover::lock_or_recover`, because a panic holding a lock
+poisons it and `.lock().unwrap()` would then panic on every subsequent press —
+the restart has to be able to make progress. **Do not reintroduce
+`.lock().unwrap()` in the desktop crate**, and keep `run_coordinator`
+borrowing its receiver rather than owning it (a moved receiver is dropped when
+the first pass unwinds, so the restart has no channel to serve — pinned by
+`a_panicking_pass_does_not_consume_the_channel`).
+
 ## Verification norms
 
 - **Test with real TTS audio**, not silence/noise: `say -o /tmp/clip.aiff

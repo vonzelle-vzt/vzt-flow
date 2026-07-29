@@ -372,6 +372,20 @@ isn't readable — most web pages, Electron apps, and secure fields don't expose
 it — verification is skipped and the paste is assumed to have worked (the
 prior behavior). The whole check is bounded to well under half a second.
 
+**How the keystroke is sent (and one layout caveat).** As of 0.3.3 the `V` is
+sent as a raw virtual keycode (`kVK_ANSI_V`, `0x09`) rather than as the
+character `'v'`. Asking for the character made the key-simulation library
+resolve it against your live keyboard layout, which calls macOS input-source
+APIs that are not safe off the main thread — and that could abort the whole app
+mid-dictation (see [the changelog](../CHANGELOG.md)).
+
+The consequence is that the paste keystroke is now **layout-blind**: `0x09` is
+the physical key that types `v` on a QWERTY layout. If you use Dvorak, Colemak,
+or another layout that moves `v`, the simulated shortcut will land on the wrong
+key and the paste won't fire — your transcript is still on the clipboard, so
+Cmd+V by hand always works. Please open an issue if this affects you; the
+proper fix is to resolve the keycode once at startup on the main thread.
+
 ## Modes & per-app behavior
 
 Four pipeline modes, resolved per-app via `profiles.toml`:
@@ -693,6 +707,14 @@ Check registration status any time with `flow doctor` (it shells out to
 ## Troubleshooting
 
 **Hotkey does nothing (no overlay, nothing pasted):**
+- **First, confirm the app is still running.** It's a menu-bar-only app, so a
+  crash is indistinguishable from a dead hotkey: no dialog, no dock icon to
+  vanish. `pgrep -f vzt-flow-desktop` — and if it's gone, check
+  `ls -t ~/Library/Logs/DiagnosticReports/vzt-flow-desktop-*.ips | head -3`
+  for a report timestamped when you last tried to dictate. **On versions before
+  0.3.3 the auto-paste itself could abort the process** at the end of an
+  otherwise-successful dictation (a macOS input-source API called off the main
+  thread); upgrading fixes it. A crash on 0.3.3+ is worth an issue.
 - Almost always a permissions issue — see the
   [rebuild-drops-permissions gotcha](#the-rebuild-drops-permissions-gotcha)
   above. This is *especially* likely right after a fresh build.
