@@ -124,7 +124,9 @@ is no crash report to find. The loop is therefore supervised (`catch_unwind`
 locked via `LockRecover::lock_or_recover`, because a panic holding a lock
 poisons it and `.lock().unwrap()` would then panic on every subsequent press —
 the restart has to be able to make progress. **Do not reintroduce
-`.lock().unwrap()` in the desktop crate**, and keep `run_coordinator`
+`.lock().unwrap()` on `AppState` in the desktop crate** — the only remaining
+occurrences are in tests (one poisons a mutex deliberately), so a grep hit
+outside `#[cfg(test)]` is a regression. Keep `run_coordinator`
 borrowing its receiver rather than owning it (a moved receiver is dropped when
 the first pass unwinds, so the restart has no channel to serve — pinned by
 `a_panicking_pass_does_not_consume_the_channel`).

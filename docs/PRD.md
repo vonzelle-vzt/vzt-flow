@@ -103,6 +103,49 @@ time, RTF 0.074, ~8.9GB peak RSS** — well within budget. The underlying
 `transcribe-rs` quadratic growth is unchanged upstream; the chunker is the
 fix, not a raised ceiling.
 
+### Reliability: a dead app must not look like a dead hotkey
+
+A menu-bar-only app has no dock icon to vanish and no window to close, so
+**every way the dictation path can die presents identically to the user: you
+hold the hotkey and nothing happens.** That is also what an ungranted
+permission looks like, and what a stale TCC grant after a rebuild looks like.
+The failure modes are indistinguishable from outside, which makes them
+expensive to diagnose and easy to misattribute — v0.3.3 was reported as "the
+speak button doesn't work in VS Code" and was neither the button nor VS Code.
+
+Two distinct classes, and only one of them is catchable:
+
+- **Process abort.** A main-thread-only macOS API called from a worker thread
+  (HIToolbox input-source lookups, reached via the keyboard-layout resolution
+  in the paste path) aborts the process outright — SIGTRAP/SIGABRT raised by
+  Apple's code, *not* a Rust panic. `catch_unwind` cannot contain it and no
+  error handling will. The only defence is not making the call: the paste
+  sends a raw `kVK_ANSI_V` keycode so no layout lookup happens. **Requirement:
+  audit any Carbon/HIToolbox/AppKit call reachable from the coordinator
+  thread.** Tauri's window ops are safe because they marshal to the event
+  loop; that is a property of Tauri, not of the platform.
+- **Thread death.** The release profile unwinds rather than aborts, so a Rust
+  panic on the coordinator thread kills only that thread — process, tray icon
+  and Settings window all survive while the hotkey silently stops forever,
+  with no crash report. Arguably worse than a crash, because there is no
+  artifact to diagnose from. **Requirement: the dictation loop is supervised**
+  — it catches the unwind, resets the state machine to Idle, tells the user
+  via the overlay, and restarts on the same channel. Mutexes recover from
+  poisoning rather than propagating it, since a panic holding a lock would
+  otherwise make every subsequent press panic on the same line.
+
+**A guard whose clearing condition it also blocks is not a guard.** The
+restart is only useful because `reset_after_panic` returns `dictation_state`
+to Idle — a supervisor that restarted into a latched `Recording` state would
+reproduce the exact symptom it exists to prevent.
+
+**Measurement note.** This class is a *race*: the abort needs concurrent
+callers, so a single background call usually survives and the bug reads as
+intermittent. The first regression test written for it passed against the
+broken code. Anything claiming to reproduce a fault here must be shown to
+FAIL before the fix, or it is evidence of nothing — the working control uses
+8 concurrent threads and aborts reliably (SIGABRT) pre-fix.
+
 ### Offline-only guarantee
 
 No audio, transcript, or screenshot leaves the device during normal
