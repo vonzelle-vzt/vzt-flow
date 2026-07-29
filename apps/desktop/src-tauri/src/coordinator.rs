@@ -21,7 +21,7 @@ use tauri::{AppHandle, Manager};
 use tauri_plugin_notification::NotificationExt;
 
 use crate::overlay::{self, OverlayEvent};
-use crate::state::{AppState, DictationState, ModelLifecycle};
+use crate::state::{AppState, DictationState, LockRecover, ModelLifecycle};
 use crate::tray;
 
 pub enum CoordinatorMsg {
@@ -107,7 +107,7 @@ fn spawn_hotkey_monitor(
     let hotkey_result = flow_core::hotkey::spawn_monitor(keycode, is_recording, tx);
     let active = hotkey_result.is_ok();
     if let Ok(keycode_handle) = &hotkey_result {
-        *app.state::<AppState>().hotkey_keycode_handle.lock().unwrap() = Some(keycode_handle.clone());
+        *app.state::<AppState>().hotkey_keycode_handle.lock_or_recover() = Some(keycode_handle.clone());
     } else {
         eprintln!(
             "[vzt-flow] hotkey monitor failed to install a CGEventTap — this almost always means \
@@ -163,7 +163,7 @@ fn spawn_hotkey_rearm_driver(
                     // change made while unarmed only persisted to config (there
                     // was no live handle to update), so read it fresh rather
                     // than reuse the stale launch-time value.
-                    let keycode = state.config.lock().unwrap().hotkey_keycode;
+                    let keycode = state.config.lock_or_recover().hotkey_keycode;
                     match flow_core::hotkey::spawn_monitor(
                         keycode,
                         is_recording.clone(),
@@ -175,9 +175,9 @@ fn spawn_hotkey_rearm_driver(
                             // reconcile against config once more to close the
                             // read-keycode / publish-handle race (if it changed
                             // during the brief spawn, apply the latest).
-                            *state.hotkey_keycode_handle.lock().unwrap() = Some(handle.clone());
+                            *state.hotkey_keycode_handle.lock_or_recover() = Some(handle.clone());
                             handle.store(
-                                state.config.lock().unwrap().hotkey_keycode,
+                                state.config.lock_or_recover().hotkey_keycode,
                                 Ordering::Relaxed,
                             );
                             state.hotkey_monitor_active.store(true, Ordering::Relaxed);
@@ -348,7 +348,7 @@ pub fn spawn(
             }
         });
     }
-    *app.state::<AppState>().cleanup_cmd_tx.lock().unwrap() = Some(cleanup_cmd_tx);
+    *app.state::<AppState>().cleanup_cmd_tx.lock_or_recover() = Some(cleanup_cmd_tx);
 
     // --- hotkey monitor ---
     // Keep a sender clone (`hotkey_tx`) past the install so the macOS re-arm
@@ -372,8 +372,8 @@ pub fn spawn(
         });
     }
 
-    *app.state::<AppState>().audio_cmd_tx.lock().unwrap() = Some(audio_cmd_tx.clone());
-    *app.state::<AppState>().model_cmd_tx.lock().unwrap() = Some(model_cmd_tx.clone());
+    *app.state::<AppState>().audio_cmd_tx.lock_or_recover() = Some(audio_cmd_tx.clone());
+    *app.state::<AppState>().model_cmd_tx.lock_or_recover() = Some(model_cmd_tx.clone());
     app.state::<AppState>()
         .hotkey_monitor_active
         .store(hotkey_active, Ordering::Relaxed);
@@ -393,10 +393,59 @@ pub fn spawn(
     drop(hotkey_tx);
 
     // --- coordinator thread ---
+    //
+    // Supervised, because a panic in here is invisible and permanent. Rust's
+    // default panic strategy unwinds and kills only the panicking THREAD, so
+    // without this the process stays alive — tray icon, Settings window, all
+    // of it — while the hotkey silently stops doing anything. No crash report,
+    // no dialog, nothing to diagnose from. A user reports "the speak button
+    // isn't working" and every visible sign says the app is fine.
+    //
+    // So: catch the unwind, put the state machine back to Idle
+    // (`reset_after_panic` — a restart that left `dictation_state` at
+    // Recording would still ignore every press), tell the user, and re-enter
+    // the loop. The receiver is borrowed rather than moved so the restarted
+    // loop keeps draining the SAME channel; queued messages survive.
+    //
+    // This cannot catch a process ABORT (e.g. the HIToolbox main-thread
+    // assert that killed the app on 2026-07-29 — see `flow_core::insert`).
+    // Nothing in-process can. That class has to be fixed by not making the
+    // call; this handles the Rust-panic class only.
     {
         let app = app.clone();
-        std::thread::spawn(move || {
-            run_coordinator(app, unified_rx, audio_cmd_tx, model_cmd_tx);
+        std::thread::spawn(move || loop {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_coordinator(
+                    app.clone(),
+                    &unified_rx,
+                    audio_cmd_tx.clone(),
+                    model_cmd_tx.clone(),
+                );
+            }));
+            match outcome {
+                // Clean return: the channel closed, i.e. the app is shutting
+                // down. Restarting here would spin forever on a dead channel.
+                Ok(()) => break,
+                Err(_) => {
+                    eprintln!(
+                        "[vzt-flow] coordinator thread panicked; resetting the recorder and \
+                         restarting it. The hotkey stays live — please retry your dictation. \
+                         (Any transcript already produced is on your clipboard.)"
+                    );
+                    app.state::<AppState>().reset_after_panic();
+                    overlay::emit_overlay(
+                        &app,
+                        OverlayEvent::Message {
+                            text: "Dictation failed — recorder reset, try again".to_string(),
+                        },
+                    );
+                    let app2 = app.clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_secs(3));
+                        overlay::hide_overlay(&app2);
+                    });
+                }
+            }
         });
     }
 
@@ -493,9 +542,17 @@ fn should_start_after_hold(same_press: bool, still_down: bool, consumed: bool) -
     same_press && still_down && !consumed
 }
 
+/// Drains the coordinator channel until it closes.
+///
+/// `rx` is borrowed, not owned, so the supervisor in [`spawn`] can re-enter
+/// this function after a panic and keep serving the same channel. Returning
+/// normally means the channel closed (shutdown); panicking means the
+/// supervisor restarts us with the local state below rebuilt from scratch,
+/// which is the correct recovery — none of it is worth preserving across a
+/// panic.
 fn run_coordinator(
     app: AppHandle,
-    rx: mpsc::Receiver<CoordinatorMsg>,
+    rx: &mpsc::Receiver<CoordinatorMsg>,
     audio_cmd_tx: Sender<AudioCommand>,
     model_cmd_tx: Sender<ModelCommand>,
 ) {
@@ -530,7 +587,7 @@ fn run_coordinator(
                     // start anything new.
                     continue;
                 }
-                if *state.dictation_state.lock().unwrap() != DictationState::Idle {
+                if *state.dictation_state.lock_or_recover() != DictationState::Idle {
                     continue; // mid-transcription/paste; ignore new presses
                 }
 
@@ -540,7 +597,7 @@ fn run_coordinator(
                 let consumed = hold.consumed.clone();
                 let (threshold, max_hold_secs) = {
                     let st = app2.state::<AppState>();
-                    let cfg = st.config.lock().unwrap();
+                    let cfg = st.config.lock_or_recover();
                     (
                         Duration::from_millis(cfg.hold_threshold_ms),
                         cfg.max_hold_secs,
@@ -553,7 +610,7 @@ fn run_coordinator(
                     let consumed = consumed.load(Ordering::Relaxed);
                     if should_start_after_hold(same_press, still_down, consumed) {
                         let state = app2.state::<AppState>();
-                        if *state.dictation_state.lock().unwrap() == DictationState::Idle {
+                        if *state.dictation_state.lock_or_recover() == DictationState::Idle {
                             start_recording(&app2, max_hold_secs);
                         }
                     }
@@ -566,7 +623,7 @@ fn run_coordinator(
                 let was_consumed = hold.consumed.swap(true, Ordering::Relaxed);
                 let other_key = hold.other_key.load(Ordering::Relaxed);
                 let hands_free = state.hands_free_active.load(Ordering::Relaxed);
-                let current = *state.dictation_state.lock().unwrap();
+                let current = *state.dictation_state.lock_or_recover();
 
                 // The `!was_consumed` guard (F4) stops an Idle reached via
                 // Escape-cancel / cap from being misread as a fresh tap that
@@ -598,7 +655,7 @@ fn run_coordinator(
                     // Mark consumed so the delayed hold-check won't start a
                     // recording and the release won't arm hands-free.
                     hold.consumed.store(true, Ordering::Relaxed);
-                    if *state.dictation_state.lock().unwrap() == DictationState::Recording {
+                    if *state.dictation_state.lock_or_recover() == DictationState::Recording {
                         // A false start already began (hold outlived the
                         // threshold before the special char was typed):
                         // discard it — the user is typing, not dictating.
@@ -608,7 +665,7 @@ fn run_coordinator(
                 }
             }
             CoordinatorMsg::Hotkey(HotkeyEvent::CancelRequested) => {
-                if *state.dictation_state.lock().unwrap() == DictationState::Recording {
+                if *state.dictation_state.lock_or_recover() == DictationState::Recording {
                     // The recording is being thrown away; mark the in-flight
                     // press consumed so its release doesn't arm hands-free (F4).
                     hold.consumed.store(true, Ordering::Relaxed);
@@ -617,7 +674,7 @@ fn run_coordinator(
                 }
             }
             CoordinatorMsg::TrayToggleDictation => {
-                let current = *state.dictation_state.lock().unwrap();
+                let current = *state.dictation_state.lock_or_recover();
                 if current == DictationState::Idle {
                     // Manual start behaves like a hands-free session; consume
                     // any dangling press so a stray release can't double-toggle.
@@ -638,11 +695,11 @@ fn run_coordinator(
                 rolling_epoch = rolling_epoch.wrapping_add(1);
                 rolling_preview.clear();
                 pending_rolling = None;
-                let rolling_enabled = state.config.lock().unwrap().rolling_transcription;
+                let rolling_enabled = state.config.lock_or_recover().rolling_transcription;
                 if rolling_enabled {
                     let epoch = rolling_epoch;
                     let (out_tx, out_rx) = mpsc::channel::<RollingOutput>();
-                    if let Some(coord_tx) = state.coordinator_tx.lock().unwrap().clone() {
+                    if let Some(coord_tx) = state.coordinator_tx.lock_or_recover().clone() {
                         // Forward the worker's output onto the coordinator
                         // channel, epoch-tagged. Exits when the worker drops
                         // `out_tx` (recording finalized or abandoned).
@@ -675,7 +732,7 @@ fn run_coordinator(
                     .unwrap()
                     .map(|s| s.elapsed())
                     .unwrap_or_default();
-                let max_secs = state.recording_max_secs.lock().unwrap().unwrap_or(0);
+                let max_secs = state.recording_max_secs.lock_or_recover().unwrap_or(0);
                 overlay::emit_overlay(&app, overlay::recording_event(level, elapsed, max_secs));
             }
             CoordinatorMsg::Audio(AudioReply::Stopped { samples, duration, capped, auto_stopped_silence }) => {
@@ -699,14 +756,14 @@ fn run_coordinator(
                 // A daemon `listen` command's reply channel (+ optional mode
                 // override), if this recording was triggered that way rather
                 // than via the hotkey/tray toggle.
-                let listen_pending = state.pending_listen.lock().unwrap().take();
+                let listen_pending = state.pending_listen.lock_or_recover().take();
 
                 // Frontmost app + resolved profile, captured now (right as
                 // recording ends) rather than after ASR completes — that's
                 // both a more accurate "at paste time" reading and lets the
                 // overlay show the mode badge immediately.
                 let app_bundle_id = permissions::frontmost_bundle_id();
-                let mut profile = state.profiles.lock().unwrap().resolve(app_bundle_id.as_deref());
+                let mut profile = state.profiles.lock_or_recover().resolve(app_bundle_id.as_deref());
                 if let Some((_, Some(mode_override))) = &listen_pending {
                     profile.mode = mode_override.clone();
                 }
@@ -727,7 +784,7 @@ fn run_coordinator(
                         listen_reply,
                         epoch: rolling_epoch,
                     });
-                    if let Some(tx) = state.coordinator_tx.lock().unwrap().clone() {
+                    if let Some(tx) = state.coordinator_tx.lock_or_recover().clone() {
                         let epoch = rolling_epoch;
                         let timeout = duration + Duration::from_secs(60);
                         std::thread::spawn(move || {
@@ -752,7 +809,7 @@ fn run_coordinator(
                     overlay::hide_overlay(&app);
                     continue;
                 }
-                let forward_tx = state.coordinator_tx.lock().unwrap().clone();
+                let forward_tx = state.coordinator_tx.lock_or_recover().clone();
                 std::thread::spawn(move || {
                     // Never wait forever on the transcriber. A dropped reply
                     // channel (panicked worker) surfaces as RecvError; a wedged
@@ -799,7 +856,7 @@ fn run_coordinator(
                             "[vzt-flow] microphone disconnected mid-recording; finalizing the {:.1}s captured (rolling)",
                             duration.as_secs_f64()
                         );
-                        if let Some(tx) = state.coordinator_tx.lock().unwrap().clone() {
+                        if let Some(tx) = state.coordinator_tx.lock_or_recover().clone() {
                             let _ = tx.send(CoordinatorMsg::Audio(AudioReply::Stopped {
                                 samples: Vec::new(),
                                 duration,
@@ -812,7 +869,7 @@ fn run_coordinator(
                         rolling_in = None;
                         rolling_epoch = rolling_epoch.wrapping_add(1);
                         rolling_preview.clear();
-                        if let Some((tx, _)) = state.pending_listen.lock().unwrap().take() {
+                        if let Some((tx, _)) = state.pending_listen.lock_or_recover().take() {
                             let _ = tx.send(Err("microphone disconnected".to_string()));
                         }
                         state.set_dictation_state(DictationState::Idle);
@@ -831,7 +888,7 @@ fn run_coordinator(
 
                 if samples.is_empty() {
                     eprintln!("[vzt-flow] microphone disconnected mid-recording; nothing to salvage");
-                    if let Some((tx, _)) = state.pending_listen.lock().unwrap().take() {
+                    if let Some((tx, _)) = state.pending_listen.lock_or_recover().take() {
                         let _ = tx.send(Err("microphone disconnected".to_string()));
                     }
                     state.set_dictation_state(DictationState::Idle);
@@ -846,7 +903,7 @@ fn run_coordinator(
                     });
                 } else {
                     eprintln!("[vzt-flow] microphone disconnected mid-recording; transcribing the {:.1}s captured", duration.as_secs_f64());
-                    if let Some(tx) = state.coordinator_tx.lock().unwrap().clone() {
+                    if let Some(tx) = state.coordinator_tx.lock_or_recover().clone() {
                         let _ = tx.send(CoordinatorMsg::Audio(AudioReply::Stopped {
                             samples,
                             duration,
@@ -864,7 +921,7 @@ fn run_coordinator(
                 rolling_epoch = rolling_epoch.wrapping_add(1);
                 rolling_preview.clear();
                 pending_rolling = None;
-                if let Some((tx, _)) = state.pending_listen.lock().unwrap().take() {
+                if let Some((tx, _)) = state.pending_listen.lock_or_recover().take() {
                     let _ = tx.send(Err("recording cancelled".to_string()));
                 }
                 state.set_dictation_state(DictationState::Idle);
@@ -876,7 +933,7 @@ fn run_coordinator(
                 rolling_epoch = rolling_epoch.wrapping_add(1);
                 rolling_preview.clear();
                 pending_rolling = None;
-                if let Some((tx, _)) = state.pending_listen.lock().unwrap().take() {
+                if let Some((tx, _)) = state.pending_listen.lock_or_recover().take() {
                     let _ = tx.send(Err(e.clone()));
                 }
                 state.set_dictation_state(DictationState::Idle);
@@ -897,9 +954,9 @@ fn run_coordinator(
                         // Live preview (Feature B): only while still recording,
                         // dictionary-corrected (no LLM) for display. Appended to
                         // the running raw tail; the overlay shows its last chars.
-                        if *state.dictation_state.lock().unwrap() == DictationState::Recording {
+                        if *state.dictation_state.lock_or_recover() == DictationState::Recording {
                             let corrected = {
-                                let dict = state.dictionary.lock().unwrap().clone();
+                                let dict = state.dictionary.lock_or_recover().clone();
                                 dictionary::correct(&chunk_text, &dict)
                             };
                             let corrected = corrected.trim();
@@ -1000,23 +1057,23 @@ fn run_coordinator(
                 );
             }
             CoordinatorMsg::Model(ModelStatusEvent::Loading) => {
-                *state.model_lifecycle.lock().unwrap() = ModelLifecycle::Loading;
+                *state.model_lifecycle.lock_or_recover() = ModelLifecycle::Loading;
                 tray::refresh_menu(&app);
             }
             CoordinatorMsg::Model(ModelStatusEvent::Loaded { load_time }) => {
-                *state.model_lifecycle.lock().unwrap() = ModelLifecycle::Loaded;
+                *state.model_lifecycle.lock_or_recover() = ModelLifecycle::Loaded;
                 eprintln!("[vzt-flow] model loaded in {:.2}s", load_time.as_secs_f64());
                 tray::refresh_menu(&app);
             }
             CoordinatorMsg::Model(ModelStatusEvent::LoadFailed(e)) => {
                 eprintln!("[vzt-flow] model load failed: {e}");
-                *state.model_lifecycle.lock().unwrap() = ModelLifecycle::Unloaded;
+                *state.model_lifecycle.lock_or_recover() = ModelLifecycle::Unloaded;
                 // Give the failure a user-visible surface too — previously it
                 // was only `eprintln!`'d, so a load failure was invisible. Skip
                 // it while Recording so we don't cover the live level bars; the
                 // transcribe reply path (`TranscribeResult::Err`) handles the
                 // Transcribing case with the same mapped message.
-                if *state.dictation_state.lock().unwrap() != DictationState::Recording {
+                if *state.dictation_state.lock_or_recover() != DictationState::Recording {
                     let text = transcription_error_message(&e);
                     overlay::show_overlay(&app);
                     overlay::emit_overlay(&app, OverlayEvent::Message { text });
@@ -1029,7 +1086,7 @@ fn run_coordinator(
                 tray::refresh_menu(&app);
             }
             CoordinatorMsg::Model(ModelStatusEvent::Unloaded) => {
-                *state.model_lifecycle.lock().unwrap() = ModelLifecycle::Unloaded;
+                *state.model_lifecycle.lock_or_recover() = ModelLifecycle::Unloaded;
                 tray::refresh_menu(&app);
             }
             // cleanup_manager already logs its own lifecycle to stderr;
@@ -1042,18 +1099,18 @@ fn run_coordinator(
                     CleanupStatusEvent::LoadFailed(_) => ModelLifecycle::Unloaded,
                     CleanupStatusEvent::Unloaded => ModelLifecycle::Unloaded,
                 };
-                *state.cleanup_lifecycle.lock().unwrap() = lifecycle;
+                *state.cleanup_lifecycle.lock_or_recover() = lifecycle;
             }
             CoordinatorMsg::TestOverlay => {
                 run_overlay_self_test(&app);
             }
             CoordinatorMsg::DaemonListen { mode, max_secs, reply } => {
-                if *state.dictation_state.lock().unwrap() != DictationState::Idle {
+                if *state.dictation_state.lock_or_recover() != DictationState::Idle {
                     let _ = reply.send(Err("already recording or transcribing".to_string()));
                     continue;
                 }
                 let cap = max_secs.unwrap_or_else(|| max_handsfree_secs(&app));
-                *state.pending_listen.lock().unwrap() = Some((reply, mode));
+                *state.pending_listen.lock_or_recover() = Some((reply, mode));
                 // Behaves like a hands-free (tap-to-toggle) recording: RMS
                 // auto-stop is enabled by `start_recording` whenever
                 // `hands_free_active` is set, and there's no hotkey press
@@ -1116,7 +1173,7 @@ fn parakeet_installed(app: &AppHandle) -> bool {
 /// prompt to open Settings and download it.
 fn model_missing_overlay_text(app: &AppHandle) -> String {
     let dl = &app.state::<AppState>().model_download;
-    if dl.active_kind.lock().unwrap().is_some() {
+    if dl.active_kind.lock_or_recover().is_some() {
         let done = dl.downloaded.load(Ordering::Relaxed);
         let total = dl.total.load(Ordering::Relaxed);
         if total > 0 {
@@ -1141,7 +1198,7 @@ fn start_recording(app: &AppHandle, max_secs: u64) {
     // hands-free session or daemon `listen` is live.
     if !parakeet_installed(app) {
         state.hands_free_active.store(false, Ordering::Relaxed);
-        if let Some((tx, _)) = state.pending_listen.lock().unwrap().take() {
+        if let Some((tx, _)) = state.pending_listen.lock_or_recover().take() {
             let _ = tx.send(Err("speech model not installed".to_string()));
         }
         let text = model_missing_overlay_text(app);
@@ -1158,22 +1215,22 @@ fn start_recording(app: &AppHandle, max_secs: u64) {
     }
 
     state.set_dictation_state(DictationState::Recording);
-    *state.recording_started.lock().unwrap() = Some(std::time::Instant::now());
-    *state.recording_max_secs.lock().unwrap() = Some(max_secs);
+    *state.recording_started.lock_or_recover() = Some(std::time::Instant::now());
+    *state.recording_max_secs.lock_or_recover() = Some(max_secs);
     tray::refresh_menu(app);
     overlay::show_overlay(app);
     overlay::emit_overlay(app, overlay::recording_event(0.0, Duration::ZERO, max_secs));
     // Energy-based auto-stop only applies to hands-free recordings — a
     // hold-to-talk recording's only stop signal is releasing the key.
     let (handsfree_silence_secs, rolling) = {
-        let cfg = state.config.lock().unwrap();
+        let cfg = state.config.lock_or_recover();
         let hf = state
             .hands_free_active
             .load(Ordering::Relaxed)
             .then_some(cfg.handsfree_silence_secs);
         (hf, cfg.rolling_transcription)
     };
-    let tx = state.audio_cmd_tx.lock().unwrap().clone();
+    let tx = state.audio_cmd_tx.lock_or_recover().clone();
     if let Some(tx) = tx {
         // `rolling` must match what the `Started` handler reads from config to
         // decide whether to create a rolling worker — both read the same flag.
@@ -1184,7 +1241,7 @@ fn start_recording(app: &AppHandle, max_secs: u64) {
     // user speaking, so it's already warm by the time transcription
     // finishes and the real (deadline-bound) cleanup call runs. The manager
     // no-ops if it's already loaded/warmed.
-    let cleanup_tx = state.cleanup_cmd_tx.lock().unwrap().clone();
+    let cleanup_tx = state.cleanup_cmd_tx.lock_or_recover().clone();
     if let Some(cleanup_tx) = cleanup_tx {
         let _ = cleanup_tx.send(CleanupCommand::Warmup);
     }
@@ -1208,7 +1265,7 @@ fn run_pipeline(
     listen_reply: Option<Sender<Result<ListenOutcome, String>>>,
 ) {
     let state = app.state::<AppState>();
-    let dict = state.dictionary.lock().unwrap().clone();
+    let dict = state.dictionary.lock_or_recover().clone();
     let corrected = dictionary::correct(&raw_text, &dict);
 
     if profile.mode == "code" {
@@ -1227,12 +1284,12 @@ fn run_pipeline(
     }
 
     let timeout_ms = {
-        let cfg = state.config.lock().unwrap();
+        let cfg = state.config.lock_or_recover();
         flow_core::cleanup_manager::cleanup_deadline_ms(corrected.chars().count(), &cfg)
     };
     let dictionary_terms: Vec<String> = dict.iter().map(|d| d.term.clone()).collect();
     let ctx = CleanupContext { app_name: app_bundle_id.clone(), tone: profile.tone.clone(), dictionary_terms };
-    let cleanup_tx = state.cleanup_cmd_tx.lock().unwrap().clone();
+    let cleanup_tx = state.cleanup_cmd_tx.lock_or_recover().clone();
 
     let Some(cleanup_tx) = cleanup_tx else {
         finalize_dictation(app, &raw_text, &corrected, &mode_label, audio_duration, app_bundle_id, listen_reply);
@@ -1252,7 +1309,7 @@ fn run_pipeline(
         return;
     }
 
-    let forward_tx = state.coordinator_tx.lock().unwrap().clone();
+    let forward_tx = state.coordinator_tx.lock_or_recover().clone();
     std::thread::spawn(move || {
         // The cleanup manager itself enforces the deadline internally and
         // always replies; this is just a backstop in case its reply
@@ -1284,10 +1341,10 @@ fn finalize_dictation(
 ) {
     let state = app.state::<AppState>();
 
-    let snips = state.snippets.lock().unwrap().clone();
+    let snips = state.snippets.lock_or_recover().clone();
     let final_text = snippets::expand(cleaned_text, &snips).unwrap_or_else(|| cleaned_text.to_string());
 
-    *state.last_transcript.lock().unwrap() = Some(final_text.clone());
+    *state.last_transcript.lock_or_recover() = Some(final_text.clone());
 
     // A daemon `listen` command never pastes — it hands the text back over
     // the socket instead. Everything else (history logging, overlay
@@ -1422,6 +1479,46 @@ fn run_overlay_self_test(app: &AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- coordinator supervision (panic recovery) ----
+
+    /// Pins the structural decision that makes the supervisor in [`spawn`]
+    /// work: `run_coordinator` BORROWS the receiver instead of owning it.
+    ///
+    /// If it took `rx` by value, the receiver would be moved into the first
+    /// `catch_unwind` closure and dropped when that call unwound — the restart
+    /// would have no channel to serve, the hotkey would be dead anyway, and
+    /// every message already queued behind the panicking one would be lost.
+    /// This models exactly that loop and asserts the survivors are delivered.
+    #[test]
+    fn a_panicking_pass_does_not_consume_the_channel() {
+        let (tx, rx) = mpsc::channel::<u8>();
+        for msg in [1u8, 2, 3] {
+            tx.send(msg).unwrap();
+        }
+        drop(tx);
+
+        let seen = std::sync::Mutex::new(Vec::new());
+        loop {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // Stand-in for run_coordinator: drains the BORROWED receiver,
+                // and panics part-way through the way a bad dictation would.
+                while let Ok(v) = rx.recv() {
+                    if v == 2 {
+                        panic!("simulated mid-dictation panic");
+                    }
+                    seen.lock().unwrap().push(v);
+                }
+            }));
+            if outcome.is_ok() {
+                break; // channel closed — clean shutdown, as in spawn()
+            }
+        }
+
+        // 2 is lost (it was in flight when the panic hit) but 3 still arrives:
+        // the restarted loop kept serving the same channel.
+        assert_eq!(*seen.lock().unwrap(), vec![1, 3]);
+    }
 
     // ---- Feature A: accidental-press guard state transitions ----
 

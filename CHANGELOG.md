@@ -6,6 +6,74 @@ versioning](https://semver.org/). Numbers quoted below were measured on this
 repo's dev hardware (M5 MacBook Air) unless noted — see `README.md` /
 `docs/PRD.md` for the full methodology.
 
+## [0.3.3] — 2026-07-29
+
+**The app could die in the middle of a dictation, and you'd never be told.**
+It quit silently — no dialog, no error, the menu-bar icon simply gone — so the
+next time you held the hotkey, nothing happened. Every visible sign pointed at
+a broken hotkey or a permissions problem. The actual cause was the auto-paste,
+and it had been latent since the first macOS build.
+
+There is a pleasing symmetry with 0.3.2: that release fixed `Key::Unicode('v')`
+on Windows because it pasted *nothing*. This one fixes the same call on macOS
+because it brought down the *process*. Same line of code, opposite failure,
+found the same way — by running it on real hardware until it broke.
+
+### Fixed
+
+- **macOS auto-paste could abort the entire app.** `enigo`'s
+  `Key::Unicode('v')` resolves the character against the live keyboard layout,
+  sweeping keycodes 0–127 across two modifier states — **256
+  `TISCopyCurrentKeyboardInputSource` / `TISGetInputSourceProperty` calls per
+  paste**. Those HIToolbox APIs are not safe off the main thread: internally
+  `islGetInputSourceListWithAdditions` asserts the main queue and kills the
+  process. `simulate_paste` runs on the coordinator's background thread, so a
+  dictation that had already been transcribed successfully could take the whole
+  app down at the final step. Now sends the raw keycode `kVK_ANSI_V` (`0x09`),
+  which enigo posts directly as a `CGEvent` with no layout lookup.
+
+  It is a **race** — a single background caller usually wins and survives,
+  which is exactly why this looked random and survived months of daily use. It
+  reproduces deterministically with concurrency: one thread passes, eight
+  abort. The regression test uses eight.
+
+  This failure is a process abort, not a Rust panic, so no amount of error
+  handling could have contained it. The only fix is not making the call.
+
+  *Trade-off, stated plainly:* a raw keycode is layout-blind. `0x09` is the key
+  that types `v` on QWERTY; on Dvorak or Colemak it is not, so those layouts
+  would get the wrong shortcut. This is the same trade-off the Windows `VK_V`
+  fix already accepts. If it affects you, please open an issue — the fix is to
+  resolve the keycode once on the main thread at startup and cache it, not to
+  go back to the crashing call.
+
+- **A panic in the dictation loop left the hotkey permanently dead, silently.**
+  Rust unwinds rather than aborts here, so a panic on the coordinator thread
+  killed only that thread — the process, tray icon and Settings window all kept
+  running while the hotkey quietly stopped responding. No crash report, nothing
+  to diagnose from, and the only cure was quitting and relaunching. It also
+  latched: a panic while holding a lock poisoned it, so every later press hit
+  the same poisoned `unwrap`. The loop is now supervised — it catches the
+  unwind, resets the recorder to Idle, tells you via the overlay, and restarts,
+  keeping the same message channel so queued work isn't lost. Locks recover
+  from poisoning instead of propagating it.
+
+- **Panics were never logged.** There was no panic hook at all, so a panic on
+  any background thread vanished without a trace — a GUI app launched from
+  Finder has nowhere useful to write stderr. Panics now log thread name and
+  source location before the default handler runs.
+
+### Notes
+
+- Audited the rest of the coordinator thread for the same main-thread hazard.
+  The overlay's `show`/`hide` are safe: Tauri marshals them to the event loop
+  via `send_user_message`. The permission checks (`IsSecureEventInputEnabled`,
+  `AXIsProcessTrustedWithOptions`, `IOHIDCheckAccess`) and the Accessibility
+  paste-verification read are not main-thread-restricted. No changes needed.
+- Four regression tests added, including one that pins the receiver as
+  *borrowed* — if it ever becomes owned again, the restart silently loses the
+  channel and the supervision is worthless.
+
 ## [0.3.2] — 2026-07-10
 
 **Windows works, for real.** The Windows build had never been run on Windows.

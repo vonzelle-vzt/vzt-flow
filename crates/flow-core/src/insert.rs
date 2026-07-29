@@ -161,6 +161,54 @@ fn paste_modifier() -> Key {
     Key::Control
 }
 
+/// The key pressed with [`paste_modifier`] to trigger the paste.
+///
+/// Both macOS and Windows deliberately send a RAW VIRTUAL KEYCODE rather than
+/// `Key::Unicode('v')`, for two different reasons that happen to want the same
+/// thing. enigo maps `Key::Other(n)` straight onto the platform keycode and
+/// posts it directly (`enigo::raw`), skipping all character translation.
+///
+/// **Windows (2026-07-10):** `Key::Unicode('v')` is delivered as a
+/// KEYEVENTF_UNICODE / VK_PACKET character event, which target apps do not map
+/// onto the Ctrl+V paste accelerator — verified on real hardware: enigo
+/// reported success while Notepad received nothing, and the identical Ctrl+V
+/// via a raw VK_V (0x56) SendInput pasted fine.
+///
+/// **macOS (2026-07-29):** `Key::Unicode('v')` makes enigo resolve the
+/// character against the live keyboard layout — `get_layoutdependent_keycode`
+/// loops keycodes 0..128 across 2 modifier states, calling
+/// `TISCopyCurrentKeyboardInputSource` / `TISGetInputSourceProperty` each time
+/// (256 HIToolbox/TSM calls per paste). Those APIs are **not safe off the main
+/// thread**: `islGetInputSourceListWithAdditions` aborts the process when it
+/// has to build the input-source list concurrently. `simulate_paste` runs on
+/// the desktop app's coordinator background thread, so this killed the whole
+/// app mid-dictation (crash 2026-07-29 09:27:55, `EXC_BREAKPOINT`/SIGTRAP via
+/// `dispatch_assert_queue`). It is a race, which is why it looked intermittent
+/// — reproduced deterministically with 8 concurrent threads, see
+/// `paste_from_background_thread_does_not_trap`.
+///
+/// The failure is a process ABORT, not a Rust panic, so it cannot be contained
+/// with `catch_unwind` — not making the call is the only fix.
+///
+/// **Known trade-off:** a raw keycode is layout-blind. `kVK_ANSI_V` (0x09) is
+/// the physical key that types `v` on QWERTY; on Dvorak/Colemak it is not, so
+/// those users would get the wrong shortcut. This matches the trade-off the
+/// Windows branch already accepts. If that ever bites a real user, the fix is
+/// NOT to go back to `Key::Unicode` — resolve the keycode once on the MAIN
+/// thread at startup and cache it in a `OnceLock<u16>` for `enigo::raw`.
+#[cfg(target_os = "windows")]
+fn paste_v_key() -> Key {
+    Key::Other(0x56) // VK_V
+}
+#[cfg(target_os = "macos")]
+fn paste_v_key() -> Key {
+    Key::Other(0x09) // kVK_ANSI_V
+}
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn paste_v_key() -> Key {
+    Key::Unicode('v')
+}
+
 /// Whether the platform can reliably synthesize the paste keystroke into the
 /// focused window. macOS and Windows always can here — their permission /
 /// secure-input caveats are handled by the checks in `paste_text` above.
@@ -197,16 +245,7 @@ fn can_synthesize_paste() -> bool {
 fn simulate_paste() -> Result<()> {
     let mut enigo = Enigo::new(&Settings::default()).context("failed to init enigo")?;
     let modifier = paste_modifier();
-    // Windows: `Key::Unicode('v')` is delivered as a KEYEVENTF_UNICODE /
-    // VK_PACKET character event, which target apps do not map onto the
-    // Ctrl+V paste accelerator — verified on real Windows hardware
-    // (2026-07-10): enigo reported success while Notepad received nothing,
-    // and the identical Ctrl+V via a raw VK_V (0x56) SendInput pasted fine.
-    // Send the real virtual key instead.
-    #[cfg(target_os = "windows")]
-    let v_key = Key::Other(0x56); // VK_V
-    #[cfg(not(target_os = "windows"))]
-    let v_key = Key::Unicode('v');
+    let v_key = paste_v_key();
     enigo
         .key(modifier, Direction::Press)
         .context("failed to press paste modifier")?;
@@ -423,6 +462,22 @@ mod tests {
         assert!(!should_restore(None, ""));
     }
 
+    /// Pins the raw-keycode choice made in [`paste_v_key`]. Reverting either
+    /// platform to `Key::Unicode` reintroduces a shipped bug: on Windows the
+    /// paste silently does nothing (VK_PACKET), and on macOS it aborts the
+    /// whole app from a background thread (HIToolbox/TSM, 2026-07-29).
+    /// Unlike `paste_from_background_thread_does_not_trap`, this runs in a
+    /// normal `cargo test` — it costs nothing and never synthesizes input.
+    #[test]
+    fn paste_key_is_a_raw_keycode_not_a_unicode_char() {
+        #[cfg(target_os = "macos")]
+        assert_eq!(paste_v_key(), Key::Other(0x09), "macOS must use kVK_ANSI_V");
+        #[cfg(target_os = "windows")]
+        assert_eq!(paste_v_key(), Key::Other(0x56), "Windows must use VK_V");
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        assert_eq!(paste_v_key(), Key::Unicode('v'));
+    }
+
     // ---- Feature C: paste-verification tail matching ----
 
     #[test]
@@ -472,6 +527,75 @@ mod tests {
         assert_eq!(normalized_tail("abcdef", 3), "def");
         assert_eq!(normalized_tail("ab", 5), "ab");
         assert_eq!(normalized_tail("   ", 5), "");
+    }
+
+    /// Regression control for the 2026-07-29 crash: `simulate_paste` runs on
+    /// the desktop app's coordinator *background* thread, and enigo's
+    /// `Key::Unicode('v')` resolves the character against the live keyboard
+    /// layout via HIToolbox/TSM (`TISCopyCurrentKeyboardInputSource`), which
+    /// macOS 26 asserts must run on the main queue — `dispatch_assert_queue`
+    /// raises SIGTRAP and kills the whole process.
+    ///
+    /// Reproducing it needs CONCURRENCY, not merely a background thread: the
+    /// abort happens inside `islGetInputSourceListWithAdditions` while the
+    /// input-source list is being built, so a single background caller
+    /// usually wins the race and survives. Verified 2026-07-29 with a
+    /// standalone C harness — 1 thread survived, 8 concurrent threads aborted
+    /// (`Abort trap: 6`, faulting frame `islGetInputSourceListWithAdditions`).
+    /// That race is exactly why the production crash looked intermittent.
+    ///
+    /// Note the failure mode is a process abort, NOT a Rust panic — it cannot
+    /// be caught with `catch_unwind`, which is precisely why the fix has to be
+    /// "don't make the call" rather than "guard the call".
+    ///
+    /// `#[ignore]`d because it posts real Cmd+V keystrokes into whatever
+    /// window has focus. The clipboard is emptied first so they paste nothing,
+    /// and the Cmd modifier is explicitly released at the end so an abort
+    /// mid-sequence can't leave it stuck down.
+    #[test]
+    #[ignore = "posts real Cmd+V keystrokes into the focused app; run explicitly"]
+    fn paste_from_background_thread_does_not_trap() {
+        const THREADS: usize = 8;
+        const ITERATIONS: usize = 20;
+
+        // Empty the clipboard so the synthetic Cmd+V is a no-op in whatever
+        // window happens to be focused while this runs.
+        let saved = Clipboard::new().ok().and_then(|mut c| c.get_text().ok());
+        if let Ok(mut c) = Clipboard::new() {
+            let _ = c.set_text(String::new());
+        }
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    for _ in 0..ITERATIONS {
+                        simulate_paste()?;
+                    }
+                    Ok::<(), anyhow::Error>(())
+                })
+            })
+            .collect();
+
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|h| h.join().expect("paste thread panicked"))
+            .collect();
+
+        // Belt and braces: make sure no synthetic Cmd is left held down.
+        if let Ok(mut e) = Enigo::new(&Settings::default()) {
+            let _ = e.key(paste_modifier(), Direction::Release);
+        }
+        if let Some(prev) = saved {
+            if let Ok(mut c) = Clipboard::new() {
+                let _ = c.set_text(prev);
+            }
+        }
+
+        // Reaching this line at all is the real assertion: the process
+        // survived pastes synthesized concurrently off the main thread.
+        for r in results {
+            assert!(r.is_ok(), "simulate_paste failed: {r:?}");
+        }
     }
 
     /// Exercises the clipboard save/set/restore mechanics without invoking

@@ -16,7 +16,7 @@ use flow_core::model_manager::ModelCommand;
 use tauri::{AppHandle, Manager};
 
 use crate::coordinator::CoordinatorMsg;
-use crate::state::{AppState, ModelLifecycle};
+use crate::state::{AppState, LockRecover, ModelLifecycle};
 
 /// Spawns the socket-accept loop on a dedicated thread. Binding happens
 /// synchronously (so a bind failure surfaces immediately, before `setup()`
@@ -101,9 +101,9 @@ fn handle_request(app: &AppHandle, req: Request) -> Response {
 
 fn handle_status(app: &AppHandle) -> Response {
     let state = app.state::<AppState>();
-    let ds = *state.dictation_state.lock().unwrap();
-    let model_loaded = *state.model_lifecycle.lock().unwrap() == ModelLifecycle::Loaded;
-    let cleanup_loaded = *state.cleanup_lifecycle.lock().unwrap() == ModelLifecycle::Loaded;
+    let ds = *state.dictation_state.lock_or_recover();
+    let model_loaded = *state.model_lifecycle.lock_or_recover() == ModelLifecycle::Loaded;
+    let cleanup_loaded = *state.cleanup_lifecycle.lock_or_recover() == ModelLifecycle::Loaded;
     Response {
         ok: true,
         state: Some(ds.daemon_label().to_string()),
@@ -115,7 +115,7 @@ fn handle_status(app: &AppHandle) -> Response {
 }
 
 fn handle_toggle(app: &AppHandle) -> Response {
-    let Some(tx) = app.state::<AppState>().coordinator_tx.lock().unwrap().clone() else {
+    let Some(tx) = app.state::<AppState>().coordinator_tx.lock_or_recover().clone() else {
         return Response::err("coordinator not ready");
     };
     if tx.send(CoordinatorMsg::TrayToggleDictation).is_err() {
@@ -125,24 +125,24 @@ fn handle_toggle(app: &AppHandle) -> Response {
     // coordinator thread; give it a moment so the reported state reflects
     // the transition rather than the pre-toggle state.
     std::thread::sleep(Duration::from_millis(80));
-    let ds = *app.state::<AppState>().dictation_state.lock().unwrap();
+    let ds = *app.state::<AppState>().dictation_state.lock_or_recover();
     Response { ok: true, state: Some(ds.daemon_label().to_string()), ..Default::default() }
 }
 
 fn handle_cancel(app: &AppHandle) -> Response {
-    let Some(tx) = app.state::<AppState>().coordinator_tx.lock().unwrap().clone() else {
+    let Some(tx) = app.state::<AppState>().coordinator_tx.lock_or_recover().clone() else {
         return Response::err("coordinator not ready");
     };
     if tx.send(CoordinatorMsg::Hotkey(flow_core::hotkey::HotkeyEvent::CancelRequested)).is_err() {
         return Response::err("coordinator channel closed");
     }
     std::thread::sleep(Duration::from_millis(80));
-    let ds = *app.state::<AppState>().dictation_state.lock().unwrap();
+    let ds = *app.state::<AppState>().dictation_state.lock_or_recover();
     Response { ok: true, state: Some(ds.daemon_label().to_string()), ..Default::default() }
 }
 
 fn handle_listen(app: &AppHandle, mode: Option<String>, timeout_secs: Option<u64>, max_secs: Option<u64>) -> Response {
-    let Some(tx) = app.state::<AppState>().coordinator_tx.lock().unwrap().clone() else {
+    let Some(tx) = app.state::<AppState>().coordinator_tx.lock_or_recover().clone() else {
         return Response::err("coordinator not ready");
     };
 
@@ -187,7 +187,7 @@ fn handle_transcribe(app: &AppHandle, path: &str) -> Response {
         Err(e) => return Response::err(format!("failed to load {path}: {e}")),
     };
 
-    let Some(model_cmd_tx) = app.state::<AppState>().model_cmd_tx.lock().unwrap().clone() else {
+    let Some(model_cmd_tx) = app.state::<AppState>().model_cmd_tx.lock_or_recover().clone() else {
         return Response::err("transcriber not ready");
     };
     let (reply_tx, reply_rx) = mpsc::channel();
@@ -207,7 +207,7 @@ fn handle_transcribe(app: &AppHandle, path: &str) -> Response {
         Err(_) => return Response::err("transcription timed out"),
     };
 
-    let dict = app.state::<AppState>().dictionary.lock().unwrap().clone();
+    let dict = app.state::<AppState>().dictionary.lock_or_recover().clone();
     let corrected = flow_core::dictionary::correct(&transcript.text, &dict);
     Response {
         ok: true,

@@ -12,7 +12,7 @@ use flow_core::permissions;
 use serde::Serialize;
 use tauri::{AppHandle, Manager, State};
 
-use crate::state::{AppState, DownloadKind, DownloadPhase, ModelDownload};
+use crate::state::{AppState, DownloadKind, DownloadPhase, LockRecover, ModelDownload};
 
 /// Peak on-disk footprint of a Parakeet download. `download_parakeet_v3` never
 /// deletes the archive before unpacking, so the 478,517,071-byte `.tar.gz` and
@@ -49,7 +49,7 @@ pub struct PermissionStatus {
 
 #[tauri::command]
 pub fn get_config(state: State<AppState>) -> Config {
-    state.config.lock().unwrap().clone()
+    state.config.lock_or_recover().clone()
 }
 
 #[tauri::command]
@@ -60,10 +60,10 @@ pub fn set_config(state: State<AppState>, config: Config) -> Result<(), String> 
     // reads it on every event. hold_threshold_ms is also read live by the
     // coordinator each press. idle_unload_secs would require restarting the
     // model-manager thread, so it only takes effect after an app restart.
-    if let Some(handle) = state.hotkey_keycode_handle.lock().unwrap().as_ref() {
+    if let Some(handle) = state.hotkey_keycode_handle.lock_or_recover().as_ref() {
         handle.store(config.hotkey_keycode, Ordering::Relaxed);
     }
-    *state.config.lock().unwrap() = config;
+    *state.config.lock_or_recover() = config;
     Ok(())
 }
 
@@ -101,12 +101,12 @@ pub fn request_input_monitoring() -> bool {
 
 #[tauri::command]
 pub fn get_last_transcript(state: State<AppState>) -> Option<String> {
-    state.last_transcript.lock().unwrap().clone()
+    state.last_transcript.lock_or_recover().clone()
 }
 
 #[tauri::command]
 pub fn copy_last_transcript(state: State<AppState>) -> bool {
-    if let Some(text) = state.last_transcript.lock().unwrap().clone() {
+    if let Some(text) = state.last_transcript.lock_or_recover().clone() {
         if let Ok(mut clipboard) = arboard::Clipboard::new() {
             return clipboard.set_text(text).is_ok();
         }
@@ -139,7 +139,7 @@ pub fn copy_text(text: String) -> bool {
 /// of the tray (kept for completeness; the tray item is the primary path).
 #[tauri::command]
 pub fn test_overlay(app: AppHandle) {
-    if let Some(tx) = app.state::<AppState>().coordinator_tx.lock().unwrap().as_ref() {
+    if let Some(tx) = app.state::<AppState>().coordinator_tx.lock_or_recover().as_ref() {
         let _ = tx.send(crate::coordinator::CoordinatorMsg::TestOverlay);
     }
 }
@@ -172,10 +172,10 @@ pub fn get_model_status(state: State<AppState>) -> ModelDownloadStatus {
     ModelDownloadStatus {
         parakeet_present,
         cleanup_present: dl.cleanup_present.load(Ordering::Relaxed),
-        phase: *dl.phase.lock().unwrap(),
+        phase: *dl.phase.lock_or_recover(),
         downloaded: dl.downloaded.load(Ordering::Relaxed),
         total: dl.total.load(Ordering::Relaxed),
-        error: dl.error.lock().unwrap().clone(),
+        error: dl.error.lock_or_recover().clone(),
     }
 }
 
@@ -191,7 +191,7 @@ pub fn start_model_download(state: State<AppState>, kind: String) -> Result<(), 
     let dl = state.model_download.clone();
 
     {
-        let mut active = dl.active_kind.lock().unwrap();
+        let mut active = dl.active_kind.lock_or_recover();
         if let Some(current) = *active {
             // Refuse a second concurrent download of the same kind explicitly;
             // and, since the status slot is single, of any kind.
@@ -210,10 +210,10 @@ pub fn start_model_download(state: State<AppState>, kind: String) -> Result<(), 
         }
 
         *active = Some(dk);
-        *dl.phase.lock().unwrap() = DownloadPhase::Downloading;
+        *dl.phase.lock_or_recover() = DownloadPhase::Downloading;
         dl.downloaded.store(0, Ordering::Relaxed);
         dl.total.store(0, Ordering::Relaxed);
-        *dl.error.lock().unwrap() = None;
+        *dl.error.lock_or_recover() = None;
     }
 
     std::thread::spawn(move || run_model_download(dl, dk));
@@ -234,7 +234,7 @@ pub(crate) fn run_model_download(dl: Arc<ModelDownload>, kind: DownloadKind) {
         progress_dl.downloaded.store(done, Ordering::Relaxed);
         progress_dl.total.store(total, Ordering::Relaxed);
         if total > 0 && done >= total {
-            *progress_dl.phase.lock().unwrap() = DownloadPhase::Verifying;
+            *progress_dl.phase.lock_or_recover() = DownloadPhase::Verifying;
         }
     };
 
@@ -253,15 +253,15 @@ pub(crate) fn run_model_download(dl: Arc<ModelDownload>, kind: DownloadKind) {
                 DownloadKind::Parakeet => dl.parakeet_present.store(true, Ordering::Relaxed),
                 DownloadKind::Cleanup => dl.cleanup_present.store(true, Ordering::Relaxed),
             }
-            *dl.phase.lock().unwrap() = DownloadPhase::Done;
+            *dl.phase.lock_or_recover() = DownloadPhase::Done;
         }
         Err(e) => {
-            *dl.error.lock().unwrap() = Some(format!("{e:#}"));
-            *dl.phase.lock().unwrap() = DownloadPhase::Error;
+            *dl.error.lock_or_recover() = Some(format!("{e:#}"));
+            *dl.phase.lock_or_recover() = DownloadPhase::Error;
         }
     }
 
-    *dl.active_kind.lock().unwrap() = None;
+    *dl.active_kind.lock_or_recover() = None;
 }
 
 /// Peak on-disk footprint required to install `kind`.
@@ -372,10 +372,10 @@ mod tests {
         run_model_download(dl.clone(), DownloadKind::Parakeet);
 
         assert_eq!(
-            *dl.phase.lock().unwrap(),
+            *dl.phase.lock_or_recover(),
             DownloadPhase::Done,
             "worker error: {:?}",
-            dl.error.lock().unwrap()
+            dl.error.lock_or_recover()
         );
         assert!(dl.total.load(Ordering::Relaxed) > 0, "progress must have seen a nonzero total");
         assert!(dl.downloaded.load(Ordering::Relaxed) > 0);
@@ -384,7 +384,7 @@ mod tests {
             flow_core::models::check_parakeet_model().unwrap().present,
             "model must be installed on disk"
         );
-        assert!(dl.active_kind.lock().unwrap().is_none(), "slot must be released");
+        assert!(dl.active_kind.lock_or_recover().is_none(), "slot must be released");
 
         std::env::remove_var(flow_core::config::CONFIG_DIR_ENV);
         std::fs::remove_dir_all(&tmp).ok();
