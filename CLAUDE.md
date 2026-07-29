@@ -146,6 +146,40 @@ the first pass unwinds, so the restart has no channel to serve — pinned by
   paste-test, daemon socket, overlay states): see
   `.claude/agents/flow-verifier.md` and `.claude/skills/verify-dictation/SKILL.md`.
 
+## Releasing
+
+Push a `v*` tag on `main` and `.github/workflows/release.yml` does the rest:
+builds every platform, signs + notarizes + staples the macOS dmgs, publishes
+the GitHub Release, then bumps the Homebrew cask.
+
+Bump the version in **three** places first — `Cargo.toml` (workspace),
+`apps/desktop/package.json`, `apps/desktop/src-tauri/tauri.conf.json` — plus a
+`CHANGELOG.md` entry.
+
+**Three install paths, and they do NOT update together.** The Releases page and
+`scripts/install.sh` both resolve `releases/latest`, so they follow a new tag
+automatically. The **Homebrew cask lives in a separate repo**
+(`vonzelle-vzt/homebrew-vzt`, `Casks/vzt-flow.rb`) and pins `version` plus two
+literal `sha256`s — nothing in this repo would touch it, so before the
+`homebrew` job existed a release silently left every `brew upgrade` user on the
+previous build. That bit us at v0.3.3, whose entire content was a crash fix.
+
+The `homebrew` job needs a repository secret **`HOMEBREW_TAP_TOKEN`**: a
+fine-grained PAT scoped to `vonzelle-vzt/homebrew-vzt` only, with
+**Contents: read and write**. It hashes the *published* dmgs (the bytes users
+actually download, not the local artifacts), rewrites the cask via
+`.github/scripts/bump_cask.py`, and pushes to the tap.
+
+If that job goes red, **the cask is stale and brew users are stuck** — that is
+why a missing token is a hard failure rather than a skipped job. The release
+itself is already published by then, so recovery is just re-running the job (or
+running `bump_cask.py` by hand against a tap checkout; it takes the same four
+arguments and is idempotent). `windows-arm64` going red is *expected* and does
+not block anything — it is `continue-on-error: true`, attempt-only.
+
+Pre-release tags (`v0.4.0-rc1`, anything with a `-`) skip the cask bump on
+purpose; brew must keep serving the last stable version.
+
 ## Shared-worktree hygiene
 
 Multiple agents may be working in `~/vzt-flow` concurrently. Never
