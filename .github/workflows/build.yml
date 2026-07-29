@@ -132,7 +132,7 @@ jobs:
           fi
           echo "path=$DMG" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: vzt-flow-macos-aarch64-dmg
           path: ${{ steps.find_dmg.outputs.path }}
@@ -302,7 +302,7 @@ jobs:
 
           echo "bundle OK (verified inside dmg): mic purpose string present, resources sealed, signature verifies, onnxruntime dylib + rpath present"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: vzt-flow-macos-x86_64-dmg
           path: ${{ steps.find_dmg.outputs.path }}
@@ -375,7 +375,7 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: vzt-flow-linux-x64-bundles
           path: ci-artifacts/*
@@ -423,7 +423,7 @@ jobs:
             \( -name '*.msi' -o -name '*.exe' \) -exec cp {} ci-artifacts/ \;
           ls -la ci-artifacts
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: vzt-flow-windows-x64-installers
           path: ci-artifacts/*
@@ -473,7 +473,7 @@ jobs:
             \( -name '*.msi' -o -name '*.exe' \) -exec cp {} ci-artifacts/ \;
           ls -la ci-artifacts
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: vzt-flow-windows-arm64-installers
           path: ci-artifacts/*
