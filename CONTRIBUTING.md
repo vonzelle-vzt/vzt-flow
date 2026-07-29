@@ -66,7 +66,7 @@ Tests alone are not sufficient for anything touching audio, ASR, or paste.
 - **QA overlay states via the tray's "Test overlay" item**, which cycles
   Recording → Transcribing → Done with no mic or model involved.
 
-## Two gotchas that will waste your afternoon
+## Three gotchas that will waste your afternoon
 
 **Unsigned rebuilds silently drop macOS permission grants.** Every unsigned
 `cargo tauri build` mints a new code signature, and macOS revokes the Input
@@ -84,6 +84,25 @@ call `.transcribe()` on more than ~60 s directly — route long audio through
 `crates/flow-core/src/chunking.rs`. Release latency on long clips is handled
 separately by `crates/flow-core/src/rolling.rs`. Both problems are already
 solved; extend those paths rather than reinventing them.
+
+**The dictation loop is not the main thread, and macOS cares.** Everything
+after the hotkey — recording, transcription, cleanup, paste — runs on the
+coordinator thread in `apps/desktop/src-tauri/src/coordinator.rs`. Two traps
+live there. Calling a main-thread-only Carbon/HIToolbox/AppKit API from it
+**aborts the whole process** (that is what a keyboard-layout lookup in the
+paste path did in v0.3.3); the abort is not a Rust panic, so no error handling
+can contain it — check before you call, and note Tauri's window ops are safe
+only because they marshal to the event loop. And a plain Rust `panic!` there
+kills just that thread, leaving the app running with a silently dead hotkey
+and no crash report, which is why the loop is supervised and every `AppState`
+mutex uses `lock_or_recover()` rather than `.lock().unwrap()` — please keep it
+that way. Both failure modes look identical to a user: *"I hold the hotkey and
+nothing happens."*
+
+Also: this class of bug is a **race**. A single background call usually
+survives, so it presents as intermittent. If you write a test for one, prove
+the test FAILS against the broken code before trusting a pass — the first one
+written for v0.3.3 passed against the bug.
 
 ## Pull requests
 

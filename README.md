@@ -441,6 +441,12 @@ refuse to install a cask from a third-party tap that isn't marked trusted —
 if `brew install --cask` errors on that, run `brew trust --cask
 vonzelle-vzt/vzt/vzt-flow` first, then re-run the install.
 
+The tap follows releases automatically — it checks daily and bumps itself — so
+`brew upgrade --cask vzt-flow` picks up a new version within a day of it
+shipping. If you want a release the moment it lands, take the `.dmg` from the
+[Releases page](https://github.com/vonzelle-vzt/vzt-flow/releases) or use the
+one-liner below; both track `releases/latest` directly.
+
 The cask installs the **menu-bar app only** — no `flow` CLI, no MCP server, no
 speech model, and it does not launch the app. Open it from `/Applications` and
 use the Download button in its Settings window to fetch the model.
