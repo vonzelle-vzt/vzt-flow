@@ -13,7 +13,7 @@ cpal = "0.15"
 hound = "3.5"
 dirs = "5"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
-indicatif = "0.17"
+indicatif = "0.18"
 sha2 = "0.10"
 # Pure-Rust tar + gzip extraction for the Parakeet model archive, replacing a
 # shell-out to the `tar` binary (not guaranteed on PATH, notably on Windows).
