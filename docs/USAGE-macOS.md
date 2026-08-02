@@ -745,18 +745,23 @@ Check registration status any time with `flow doctor` (it shells out to
 
 **Recording never stops — `flow status` stuck on `recording`, mic light stays
 on:**
-- The state machine has latched. `AudioCommand::Stop`/`Cancel` are only
-  honoured by the capture loop, so once capture has exited while the app still
-  believes it's recording, `flow cancel` and `flow toggle` are both silently
-  ignored — they return `ok` and change nothing.
-- Restarting the app is the only recovery today:
+- **Fixed in 0.3.4 — upgrade.** On 0.3.3 and earlier, `AudioCommand::Stop`/
+  `Cancel` were honoured only by the capture loop, so if the app and its audio
+  worker fell out of step about whether a recording was live, `flow cancel` and
+  `flow toggle` were both silently ignored — they returned `ok` and changed
+  nothing, leaving the microphone open.
+- On an affected build, restarting is the only recovery:
   ```bash
   pkill -f "VZT Flow.app/Contents/MacOS/vzt-flow-desktop" && open -a "/Applications/VZT Flow.app"
   ```
-- Reproducible on 0.3.3 with `flow toggle` followed by `flow cancel`. It
-  affects the tray toggle, the daemon socket and the MCP `listen` path;
-  hold-to-talk is unaffected. **Don't use a double `flow toggle` as a scripted
-  health check** — that is the sequence that triggers it.
+- It was a race, not a fixed sequence — measured at 3 occurrences in 8
+  `flow toggle` + `flow cancel` cycles on 0.3.3, so a single clean attempt
+  never disproved it. It affected the tray toggle, the daemon socket and the
+  MCP `listen` path; hold-to-talk was never affected, which is why it went
+  unnoticed for so long.
+- If you script anything that starts dictation, **assert that `flow status`
+  returns to `idle` afterwards** rather than assuming it — that check is what
+  distinguishes a working pipeline from a wedged one.
 
 **First dictation after launch is slow:**
 - The Parakeet model isn't loaded until the first recording finishes (lazy

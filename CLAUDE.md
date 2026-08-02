@@ -163,21 +163,32 @@ any code is read:
   `authValue=2` = allowed, `0` = denied. This is what proved Microphone was
   granted while every other signal still pointed at permissions.
 
-**(k) `dictation_state` can latch on `Recording`, and stop/cancel cannot clear
-it.** In the audio worker's *outer* command loop
-(`crates/flow-core/src/audio.rs`), `AudioCommand::Stop | AudioCommand::Cancel
-=> {}` is an explicit no-op — those commands are only honoured by the capture
-loop's `try_recv`. So if capture ever exits while `AppState::dictation_state`
-still reads `Recording`, every later `flow cancel` and `flow toggle` is
-silently swallowed, the mic stays live, and **only restarting the app
-recovers**. Reproduced on **0.3.3**, not just old builds: `flow toggle` →
-`flow cancel` leaves state at `recording` with `caulk` threads still up and
-nothing written to history. The PRD already names this shape — "a guard whose
-clearing condition it also blocks is not a guard" — but the supervisor only
-covers the *panic* route into the latched state, and this path needs no panic.
-Hold-to-talk is unaffected, which is why it survives casual testing. **Never
-script `flow toggle` twice as a health check**: that is the sequence that
-wedges it.
+**(k) The coordinator and the audio worker can disagree about whether a
+recording is live, and the recovery command must work anyway.**
+`start_recording` sets `dictation_state = Recording` when it *sends*
+`AudioCommand::Start` — before the worker has dequeued it — so the two are
+never synchronously in step. That window is normally invisible. It stopped
+being invisible on **0.3.3**, where the audio worker's *outer* command loop
+answered `AudioCommand::Stop | AudioCommand::Cancel` with `{}`: if the two
+ever fell out of step, every later `flow cancel`/`flow toggle` hit that no-op,
+the mic stayed live, and **only restarting the app recovered**. Measured at
+**3 wedges in 8 `toggle`+`cancel` cycles** against a real 0.3.3 build.
+
+Fixed in 0.3.4 by making the acknowledgement mandatory: that arm now replies
+`AudioReply::NotRecording`, and the coordinator reconciles to Idle **only if it
+still believes it is `Recording`** — guarded so a late ack can't tear down an
+in-flight transcription (Transcribing) or fire spuriously (Idle). Pinned by
+`cancel_with_no_recording_is_acknowledged_not_swallowed`, which fails by
+timeout against the old `=> {}` arm.
+
+Two things to keep in mind. **The interleaving that first desynchronises the
+two is still unidentified** — the fix makes the disagreement self-healing on
+the next stop/cancel rather than eliminating it, so if you touch this path,
+treat a desync as expected and the recovery as the invariant. And **the
+symptom is invisible to hold-to-talk**, which is why it survived so long: it
+only shows via the tray toggle, the daemon socket and MCP `listen`. Any health
+check that drives dictation must assert `flow status` returns to `idle`
+afterwards rather than assuming it.
 
 ## Verification norms
 

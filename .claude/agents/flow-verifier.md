@@ -96,12 +96,17 @@ hold the canonical gotchas and checklist this ladder is built from.
    note); launching an extra instance can collide with the user's daily
    driver.
 
-   **Do not run `flow toggle` twice as a start/stop check.** Per gotcha (k)
-   the second toggle can latch `dictation_state` on `Recording` with the mic
-   live, unclearable by `cancel` or `toggle` — only an app restart recovers,
-   so this "check" bricks the user's daily driver. Reproducible on 0.3.3. If
-   the toggle path must be exercised, confirm `flow status` returns to `idle`
-   afterwards; if it does not, restart the app and report a **failure**.
+   Exercising the toggle path is fine **only with the state assertion**:
+   ```bash
+   ./target/release/flow toggle && ./target/release/flow status | grep '^state:'  # recording
+   ./target/release/flow cancel && ./target/release/flow status | grep '^state:'  # MUST be idle
+   ```
+   Per gotcha (k), on 0.3.3 and earlier a cancel that arrived while the audio
+   worker wasn't capturing was discarded, latching `dictation_state` on
+   `Recording` with the mic live — only an app restart recovered, so an
+   unasserted check bricked the user's daily driver (3 wedges in 8 cycles).
+   Fixed in 0.3.4, but the desync is self-healing rather than gone. If state
+   does not return to `idle`, restart the app and report a **failure**.
 
 9. **Overlay states** — only if explicitly asked for visual QA and the
    desktop app is already running: use the tray's "Test overlay" item (not

@@ -149,21 +149,34 @@ restart is only useful because `reset_after_panic` returns `dictation_state`
 to Idle — a supervisor that restarted into a latched `Recording` state would
 reproduce the exact symptom it exists to prevent.
 
-That latched state is not hypothetical, and **the panic supervisor does not
-cover the route into it**. The audio worker's outer command loop treats
-`Stop`/`Cancel` as a no-op — they are only honoured inside the capture loop —
-so if capture exits while `dictation_state` still reads `Recording`, the guard
-is set with its clearing condition unreachable: every subsequent cancel and
-toggle is swallowed, the microphone stays live, and only a process restart
-recovers. Confirmed on 0.3.3 via `flow toggle` → `flow cancel` (state pinned
-at `recording`, CoreAudio threads still up, nothing written to history). Two
-requirements follow. **State transitions must be driven by the worker's
-completion reply, never assumed by the sender** — the coordinator setting
-`Recording` optimistically is what allows sender and worker to disagree. And
-**a recovery command must be able to run from any state**, including the state
-it is meant to escape; a cancel that only works while already cancellable is
-not a recovery path. Note this failure is invisible to hold-to-talk, so a
-verification pass that only exercises the hotkey will never see it.
+That latched state was not hypothetical, and **the panic supervisor did not
+cover the route into it**. `start_recording` sets `dictation_state` to
+`Recording` when it *sends* `AudioCommand::Start`, before the audio worker has
+dequeued it, so the two are never synchronously in step. On 0.3.3 the worker's
+outer command loop answered `Stop`/`Cancel` with a no-op — honouring them only
+inside the capture loop — so once the two fell out of step the guard was set
+with its clearing condition unreachable: every subsequent cancel and toggle was
+swallowed, the microphone stayed live, and only a process restart recovered.
+Measured at **3 wedges in 8 `toggle`+`cancel` cycles** on a real 0.3.3 build;
+it is a race, not a deterministic sequence, which is why it reads as
+intermittent and why a single passing trial proves nothing.
+
+Fixed in 0.3.4 (`AudioReply::NotRecording`), and the shape generalises to two
+requirements. **A recovery command must be able to run from any state,
+including the state it is meant to escape** — a cancel that only works while
+already cancellable is not a recovery path; the acknowledgement is therefore
+unconditional, and the coordinator reconciles only when it still believes it is
+`Recording` so a late ack cannot destroy an in-flight transcription. And
+**where a sender assumes a transition rather than learning it from the worker
+that owns the resource, assume the two will disagree and make the disagreement
+recoverable** — the desynchronising interleaving here is still unidentified,
+so the invariant that carries the safety is the recovery, not the absence of
+the race.
+
+Note the failure is invisible to hold-to-talk — it surfaces only through the
+tray toggle, the daemon socket and MCP `listen` — so a verification pass that
+exercises only the hotkey will never see it. Any automated dictation check must
+assert that state returns to `idle`, rather than assuming it did.
 
 **Measurement note.** This class is a *race*: the abort needs concurrent
 callers, so a single background call usually survives and the bug reads as
