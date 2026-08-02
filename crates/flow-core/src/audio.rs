@@ -223,6 +223,23 @@ pub enum AudioReply {
     /// then carries an empty `samples`.
     RollingSamples { samples: Vec<f32> },
     Error(String),
+    /// A `Stop`/`Cancel` arrived while no recording was in progress.
+    ///
+    /// This is an *acknowledgement*, not a failure: it exists so a stop or
+    /// cancel can never be silently swallowed. `dictation_state` is set by the
+    /// coordinator when it *sends* `Start`, before this worker has dequeued it,
+    /// so the two can disagree — and once they do, a coordinator that believes
+    /// it is `Recording` while the worker is idle would latch there forever,
+    /// microphone live, with every later stop/cancel hitting the no-recording
+    /// branch below and doing nothing. Recovery therefore cannot depend on the
+    /// worker being mid-capture. See `docs/PRD.md` — "a recovery command must
+    /// be able to run from any state, including the state it is meant to
+    /// escape".
+    ///
+    /// The coordinator reconciles to Idle **only** if it still believes it is
+    /// Recording; a late/stale ack must never tear down an in-flight
+    /// transcription.
+    NotRecording,
 }
 
 const LEVEL_UPDATE_INTERVAL: Duration = Duration::from_millis(66); // ~15 Hz
@@ -264,8 +281,17 @@ pub fn spawn_audio_worker(
                             let _ = reply_tx.send(AudioReply::Error(e.to_string()));
                         }
                     }
-                    // Stop/Cancel with no recording in progress: nothing to do.
-                    AudioCommand::Stop | AudioCommand::Cancel => {}
+                    // Stop/Cancel with no recording in progress. There is no
+                    // capture to end, but staying silent here is what allowed
+                    // `dictation_state` to latch on `Recording` with the mic
+                    // live and no way out but restarting the app: the
+                    // coordinator sets Recording when it *sends* `Start`, so
+                    // if it and this worker ever fall out of step, every
+                    // subsequent stop/cancel landed here and did nothing.
+                    // Always acknowledge, so the coordinator can reconcile.
+                    AudioCommand::Stop | AudioCommand::Cancel => {
+                        let _ = reply_tx.send(AudioReply::NotRecording);
+                    }
                 }
             }
         })
@@ -807,5 +833,46 @@ mod tests {
         assert!(!d.push_frame(0.001));
         assert!(!d.push_frame(0.001));
         assert!(d.push_frame(0.001)); // now 3 quiet frames since the last loud one
+    }
+
+    /// A cancel that arrives when the worker is not capturing must still be
+    /// answered. This is the regression guard for the latched-`Recording`
+    /// brick: the coordinator sets `dictation_state` when it *sends* `Start`,
+    /// so it can believe a recording is live while this worker is idle. When
+    /// the outer loop swallowed `Stop`/`Cancel` silently, that disagreement was
+    /// permanent — mic live, every later cancel a no-op, only an app restart
+    /// recovering. Measured at 3 wedges in 8 `toggle`+`cancel` cycles against a
+    /// real 0.3.3 build before the fix.
+    ///
+    /// Written against the pre-fix `AudioCommand::Stop | AudioCommand::Cancel
+    /// => {}` arm, where it fails by timing out with no reply. Neither
+    /// assertion touches a microphone, so it runs in CI.
+    #[test]
+    fn cancel_with_no_recording_is_acknowledged_not_swallowed() {
+        let (cmd_tx, cmd_rx) = mpsc::channel::<AudioCommand>();
+        let (reply_tx, reply_rx) = mpsc::channel::<AudioReply>();
+        let worker = spawn_audio_worker(cmd_rx, reply_tx);
+
+        // Nothing is recording: the worker is parked on the outer `recv`.
+        cmd_tx.send(AudioCommand::Cancel).expect("worker alive");
+        match reply_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(AudioReply::NotRecording) => {}
+            Ok(_) => panic!("cancel while idle must answer NotRecording"),
+            Err(e) => panic!("cancel while idle was swallowed ({e}) — the latch is back"),
+        }
+
+        // Stop takes the same path, and a second cancel must not go quiet
+        // either: recovery has to work every time, not just the first.
+        cmd_tx.send(AudioCommand::Stop).expect("worker alive");
+        assert!(
+            matches!(
+                reply_rx.recv_timeout(Duration::from_secs(5)),
+                Ok(AudioReply::NotRecording)
+            ),
+            "stop while idle must be acknowledged too"
+        );
+
+        drop(cmd_tx);
+        worker.join().expect("worker exits when the command channel closes");
     }
 }

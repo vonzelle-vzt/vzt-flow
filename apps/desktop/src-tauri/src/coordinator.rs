@@ -728,8 +728,7 @@ fn run_coordinator(
             CoordinatorMsg::Audio(AudioReply::Level(level)) => {
                 let elapsed = state
                     .recording_started
-                    .lock()
-                    .unwrap()
+                    .lock_or_recover()
                     .map(|s| s.elapsed())
                     .unwrap_or_default();
                 let max_secs = state.recording_max_secs.lock_or_recover().unwrap_or(0);
@@ -926,6 +925,36 @@ fn run_coordinator(
                 }
                 state.set_dictation_state(DictationState::Idle);
                 overlay::hide_overlay(&app);
+            }
+            CoordinatorMsg::Audio(AudioReply::NotRecording) => {
+                // The worker was idle when a stop/cancel reached it, so this
+                // side and the worker disagree about whether a recording is
+                // live. Reconcile toward the worker — it is the one that
+                // actually owns the microphone.
+                //
+                // Guarded on `Recording` deliberately. A stop/cancel can be
+                // acknowledged *after* a recording has already ended normally,
+                // by which point we are Transcribing and a real transcript is
+                // in flight; clearing state there would discard the user's
+                // words to fix a problem that no longer exists. Idle needs no
+                // action either. So this only ever rescues the stuck case.
+                if *state.dictation_state.lock_or_recover() == DictationState::Recording {
+                    eprintln!(
+                        "[vzt-flow] stop/cancel arrived with no recording in progress — \
+                         state was latched on Recording, resetting to Idle"
+                    );
+                    rolling_in = None;
+                    rolling_epoch = rolling_epoch.wrapping_add(1);
+                    rolling_preview.clear();
+                    pending_rolling = None;
+                    state.hands_free_active.store(false, Ordering::Relaxed);
+                    if let Some((tx, _)) = state.pending_listen.lock_or_recover().take() {
+                        let _ = tx.send(Err("recording cancelled".to_string()));
+                    }
+                    state.set_dictation_state(DictationState::Idle);
+                    tray::refresh_menu(&app);
+                    overlay::hide_overlay(&app);
+                }
             }
             CoordinatorMsg::Audio(AudioReply::Error(e)) => {
                 eprintln!("[vzt-flow] audio error: {e}");
@@ -1126,8 +1155,7 @@ fn run_coordinator(
 fn max_handsfree_secs(app: &AppHandle) -> u64 {
     app.state::<AppState>()
         .config
-        .lock()
-        .unwrap()
+        .lock_or_recover()
         .max_handsfree_secs
 }
 

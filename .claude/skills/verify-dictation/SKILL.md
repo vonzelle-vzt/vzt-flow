@@ -100,14 +100,22 @@ Expect exactly: `const userProfile = await getUser()`
 ./target/release/flow history -n 5
 ```
 
-> **Do not script `flow toggle` twice as a start/stop health check.** Per
-> CLAUDE.md gotcha (k), the second toggle can leave `dictation_state` latched
-> on `Recording` with the mic live, and neither `cancel` nor `toggle` can clear
-> it — only restarting the app does, which means this "check" bricks the
-> user's daily driver. Reproducible on 0.3.3. If you must exercise the toggle
-> path, verify with `flow status` that state returns to `idle` afterwards, and
-> if it doesn't, restart the app and **report it as a failure** rather than
-> moving on.
+Exercising the toggle path is fine **provided you assert the state comes back**
+— never assume it:
+
+```bash
+./target/release/flow toggle && ./target/release/flow status | grep '^state:'   # expect recording
+./target/release/flow cancel && ./target/release/flow status | grep '^state:'   # MUST be idle
+```
+
+That final `idle` is the assertion, not a formality. Per CLAUDE.md gotcha (k),
+on 0.3.3 and earlier a cancel arriving while the audio worker wasn't capturing
+was silently discarded, latching `dictation_state` on `Recording` with the mic
+live — unrecoverable short of restarting the app, i.e. a "health check" that
+bricked the user's daily driver (measured: 3 wedges in 8 cycles). Fixed in
+0.3.4, but the underlying desync is only self-healing, not eliminated. If state
+does **not** return to `idle`, restart the app and **report a failure** rather
+than moving on.
 
 **Long-audio safety** (only relevant if touching ASR/chunking — see CLAUDE.md
 gotcha (b)): never feed >60s of audio straight into `flow transcribe`

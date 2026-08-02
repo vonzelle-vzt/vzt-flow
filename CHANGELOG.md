@@ -6,6 +6,52 @@ versioning](https://semver.org/). Numbers quoted below were measured on this
 repo's dev hardware (M5 MacBook Air) unless noted — see `README.md` /
 `docs/PRD.md` for the full methodology.
 
+## [0.3.4] — 2026-08-02
+
+**A cancel that arrived at the wrong moment was thrown away, and the microphone
+stayed on.** `flow status` would pin at `state: recording` with the mic light
+lit, and nothing could talk it down — `flow cancel` returned `ok` and changed
+nothing, `flow toggle` did the same. Quitting and reopening the app was the only
+way out. It never affected hold-to-talk, only the tray toggle, the daemon socket
+and the MCP `listen` path, which is why it went unnoticed for so long: the
+gesture almost everyone uses is the one gesture that couldn't trigger it.
+
+The app sets its state to "recording" at the moment it *asks* the audio worker
+to start, rather than when the worker confirms it has — so the two are never
+exactly in step. That window is normally harmless. What made it harmful is that
+the worker answered a stop or cancel that arrived outside a recording by doing
+nothing at all, silently: once the two disagreed, every attempt to recover hit
+that silence, and the disagreement became permanent. Measured at **3 wedges in
+8 toggle-then-cancel cycles** on 0.3.3 — a race, which is why one clean attempt
+never disproved it.
+
+The fix is that the acknowledgement is no longer optional. A stop or cancel with
+no recording in progress now answers `NotRecording`, and the app reconciles to
+idle — but only if it still believes it is recording, so a late acknowledgement
+can never tear down a transcription that is already underway.
+
+### Fixed
+
+- **A stuck recording can no longer strand the microphone.** The audio worker's
+  outer command loop replied to `AudioCommand::Stop`/`Cancel` with `{}`; it now
+  sends `AudioReply::NotRecording`, and the coordinator resets to Idle when it
+  still holds `DictationState::Recording` (Transcribing and Idle are left
+  alone). A cancel now always either ends a live recording or clears a stuck
+  one. Pinned by `cancel_with_no_recording_is_acknowledged_not_swallowed`,
+  which fails by timeout against the previous no-op arm.
+- **Two `.lock().unwrap()` calls on `AppState` are gone** from the coordinator's
+  audio-level and hands-free-cap paths, replaced with `lock_or_recover()`. A
+  panic holding either mutex would poison it and make every later hotkey press
+  panic on the same line — the exact failure the 0.3.3 supervisor exists to
+  survive. No production `.lock().unwrap()` on `AppState` remains.
+
+### Known
+
+The interleaving that first desynchronises the coordinator from the audio worker
+has not been identified. The disagreement is now self-healing on the next stop
+or cancel rather than eliminated, so recovery — not the absence of the race — is
+the invariant that carries the safety here.
+
 ## [0.3.3] — 2026-07-29
 
 **The app could die in the middle of a dictation, and you'd never be told.**
