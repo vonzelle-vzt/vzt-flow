@@ -167,28 +167,38 @@ any code is read:
 recording is live, and the recovery command must work anyway.**
 `start_recording` sets `dictation_state = Recording` when it *sends*
 `AudioCommand::Start` — before the worker has dequeued it — so the two are
-never synchronously in step. That window is normally invisible. It stopped
-being invisible on **0.3.3**, where the audio worker's *outer* command loop
-answered `AudioCommand::Stop | AudioCommand::Cancel` with `{}`: if the two
-ever fell out of step, every later `flow cancel`/`flow toggle` hit that no-op,
-the mic stayed live, and **only restarting the app recovered**. Measured at
-**3 wedges in 8 `toggle`+`cancel` cycles** against a real 0.3.3 build.
-
-Fixed in 0.3.4 by making the acknowledgement mandatory: that arm now replies
+never synchronously in step. Through **0.3.3** the audio worker's *outer*
+command loop answered `AudioCommand::Stop | AudioCommand::Cancel` with `{}` —
+no reply, no state change — so a disagreement between the two had nothing that
+could ever resolve it. Fixed in 0.3.4: that arm now replies
 `AudioReply::NotRecording`, and the coordinator reconciles to Idle **only if it
-still believes it is `Recording`** — guarded so a late ack can't tear down an
+still believes it is `Recording`**, guarded so a late ack can't tear down an
 in-flight transcription (Transcribing) or fire spuriously (Idle). Pinned by
 `cancel_with_no_recording_is_acknowledged_not_swallowed`, which fails by
 timeout against the old `=> {}` arm.
 
-Two things to keep in mind. **The interleaving that first desynchronises the
-two is still unidentified** — the fix makes the disagreement self-healing on
-the next stop/cancel rather than eliminating it, so if you touch this path,
-treat a desync as expected and the recovery as the invariant. And **the
-symptom is invisible to hold-to-talk**, which is why it survived so long: it
-only shows via the tray toggle, the daemon socket and MCP `listen`. Any health
-check that drives dictation must assert `flow status` returns to `idle`
-afterwards rather than assuming it.
+**Read the rest of this before you trust the fix.** On 2026-08-01 the app was
+twice observed genuinely stuck at `state: recording` — persisting across
+minutes, several `flow cancel`/`flow toggle` calls and two process samples,
+CoreAudio threads live, coordinator *and* audio worker both idle in `recv`,
+cleared only by restarting. The `{}` arm is a real defect and a *sufficient*
+explanation for a stall nothing can clear, which is why it was fixed. It was
+never shown to be *the* cause, and **the original stall has never been
+reproducible on demand, on any version** — so treat 0.3.4 as removing a known
+hole, not as a confirmed cure.
+
+**Do not measure this by sampling state right after `flow cancel` returns.** A
+start and cancel issued back-to-back leave state legitimately `recording` for
+under a second while CoreAudio opens the input device. An earlier pass read that
+as a wedge and published "3 in 8 cycles"; adding a 1s delay before the cancel
+gives 0/8, and on 0.3.4 a long-window measurement reaches idle within 0–1s in
+6 of 6. Sub-second `recording` after a cancel is normal — only a state that
+*stays* put is a fault, so always measure with a multi-second window.
+
+Finally, **the symptom is invisible to hold-to-talk** — it only ever showed via
+the tray toggle, the daemon socket and MCP `listen` — so a health check that
+drives dictation must assert `flow status` returns to `idle`, with a settle
+window, rather than assuming it.
 
 ## Verification norms
 

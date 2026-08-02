@@ -100,22 +100,31 @@ Expect exactly: `const userProfile = await getUser()`
 ./target/release/flow history -n 5
 ```
 
-Exercising the toggle path is fine **provided you assert the state comes back**
-— never assume it:
+Exercising the toggle path is fine **provided you assert the state comes back —
+with a settle window, never a single read**:
 
 ```bash
-./target/release/flow toggle && ./target/release/flow status | grep '^state:'   # expect recording
-./target/release/flow cancel && ./target/release/flow status | grep '^state:'   # MUST be idle
+./target/release/flow toggle
+./target/release/flow cancel
+# poll for a few seconds; sub-second `recording` here is NORMAL
+for i in $(seq 1 30); do
+  s=$(./target/release/flow status | grep '^state:')
+  [ "$s" = "state: idle" ] && { echo "recovered: $s"; break; }
+done
 ```
 
-That final `idle` is the assertion, not a formality. Per CLAUDE.md gotcha (k),
-on 0.3.3 and earlier a cancel arriving while the audio worker wasn't capturing
-was silently discarded, latching `dictation_state` on `Recording` with the mic
-live — unrecoverable short of restarting the app, i.e. a "health check" that
-bricked the user's daily driver (measured: 3 wedges in 8 cycles). Fixed in
-0.3.4, but the underlying desync is only self-healing, not eliminated. If state
-does **not** return to `idle`, restart the app and **report a failure** rather
-than moving on.
+**The settle window is the whole point.** A cancel issued right after a start
+arrives while CoreAudio is still opening the input device, so state legitimately
+reads `recording` for under a second. A previous pass here read that instantly,
+called it a wedge, and published a bogus 3-in-8 failure rate — a 1s delay before
+the cancel gives 0/8. An instantaneous read cannot distinguish a transient state
+from a stuck one.
+
+A state that *stays* non-idle past the window is a real fault (CLAUDE.md gotcha
+(k)): through 0.3.3 a stop/cancel reaching an idle audio worker was discarded
+outright, leaving `dictation_state` on `Recording` with the mic live and only an
+app restart recovering. 0.3.4 closes that hole. If state does not return to
+`idle`, restart the app and **report a failure** rather than moving on.
 
 **Long-audio safety** (only relevant if touching ASR/chunking — see CLAUDE.md
 gotcha (b)): never feed >60s of audio straight into `flow transcribe`

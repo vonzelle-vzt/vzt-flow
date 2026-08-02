@@ -157,9 +157,9 @@ outer command loop answered `Stop`/`Cancel` with a no-op — honouring them only
 inside the capture loop — so once the two fell out of step the guard was set
 with its clearing condition unreachable: every subsequent cancel and toggle was
 swallowed, the microphone stayed live, and only a process restart recovered.
-Measured at **3 wedges in 8 `toggle`+`cancel` cycles** on a real 0.3.3 build;
-it is a race, not a deterministic sequence, which is why it reads as
-intermittent and why a single passing trial proves nothing.
+The stall was observed directly and twice, but **never reproduced on demand on
+any version**, so the mechanism is a sufficient explanation rather than a
+confirmed cause.
 
 Fixed in 0.3.4 (`AudioReply::NotRecording`), and the shape generalises to two
 requirements. **A recovery command must be able to run from any state,
@@ -177,6 +177,18 @@ Note the failure is invisible to hold-to-talk — it surfaces only through the
 tray toggle, the daemon socket and MCP `listen` — so a verification pass that
 exercises only the hotkey will never see it. Any automated dictation check must
 assert that state returns to `idle`, rather than assuming it did.
+
+**A second measurement trap, learned the expensive way here.** The obvious probe
+— sample `dictation_state` immediately after `flow cancel` returns — does not
+measure this fault. A start and cancel issued back-to-back leave state
+legitimately `Recording` for well under a second while CoreAudio opens the input
+device, so the probe reports a "wedge" that is only device-open latency. An
+earlier pass took that at face value and published a 3-in-8 failure rate for a
+fault it was not observing; a 1s delay before the cancel yields 0/8, and a
+long-window probe reaches Idle within 0–1s in 6 of 6 trials. **A state machine
+with asynchronous transitions can only be probed with a settle window** — an
+instantaneous read of a transient state is indistinguishable from a permanent
+one, and the difference is the entire bug.
 
 **Measurement note.** This class is a *race*: the abort needs concurrent
 callers, so a single background call usually survives and the bug reads as
