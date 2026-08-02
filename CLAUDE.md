@@ -131,6 +131,54 @@ borrowing its receiver rather than owning it (a moved receiver is dropped when
 the first pass unwinds, so the restart has no channel to serve — pinned by
 `a_panicking_pass_does_not_consume_the_channel`).
 
+**(j) Before diagnosing "the hotkey stopped working", establish which build is
+running and whether the threads are actually alive.** On 2026-08-01 that
+symptom was neither a crash nor a permission: `/Applications/VZT Flow.app` was
+an **ad-hoc-signed v0.3.2 dev build** copied there on Jul 29, while the repo
+was on v0.3.3 — the release whose entire content was the (h) crash fix.
+Installing the notarized v0.3.3 dmg fixed it outright. Three checks settle in
+seconds what is otherwise an hour of theorising, and they should run *before*
+any code is read:
+
+- **Identity.** `codesign -dv --verbose=2 "/Applications/VZT Flow.app"`.
+  `flags=0x2(adhoc)` + `TeamIdentifier=not set` is a local build; a release is
+  `flags=0x10000(runtime)` + `TeamIdentifier=LKHKU5BW73` and passes
+  `spctl -a -vvv -t install` with `source=Notarized Developer ID`. Check the
+  version too (`PlistBuddy -c "Print :CFBundleShortVersionString"`), and note
+  `flow status` prints the *daemon's own* `version:` — trust that over what
+  you assume is installed.
+- **Liveness.** `sample <pid> 2 -f /tmp/s.txt`, then read the thread names.
+  `vzt-flow-hotkey-tap` parked in `__CFRunLoopRun`/`mach_msg` means the tap
+  armed — its thread returns early if `CGEventTap::new` fails, so a live
+  runloop *is* proof Input Monitoring was granted. An unnamed thread inside
+  `run_coordinator` blocked in `Channel::recv` means the coordinator is
+  healthy: that is how you rule out (i) when there is no crash report to find.
+  An active recording additionally shows `caulk.*` CoreAudio threads, so their
+  presence/absence tells you whether capture is really running.
+- **Permissions, from the system's own record** instead of guesswork:
+  ```bash
+  log show --last 2m --predicate 'subsystem == "com.apple.TCC"' --style compact \
+    | grep -E "AUTHREQ_RESULT|kTCCServiceMicrophone"
+  ```
+  `authValue=2` = allowed, `0` = denied. This is what proved Microphone was
+  granted while every other signal still pointed at permissions.
+
+**(k) `dictation_state` can latch on `Recording`, and stop/cancel cannot clear
+it.** In the audio worker's *outer* command loop
+(`crates/flow-core/src/audio.rs`), `AudioCommand::Stop | AudioCommand::Cancel
+=> {}` is an explicit no-op — those commands are only honoured by the capture
+loop's `try_recv`. So if capture ever exits while `AppState::dictation_state`
+still reads `Recording`, every later `flow cancel` and `flow toggle` is
+silently swallowed, the mic stays live, and **only restarting the app
+recovers**. Reproduced on **0.3.3**, not just old builds: `flow toggle` →
+`flow cancel` leaves state at `recording` with `caulk` threads still up and
+nothing written to history. The PRD already names this shape — "a guard whose
+clearing condition it also blocks is not a guard" — but the supervisor only
+covers the *panic* route into the latched state, and this path needs no panic.
+Hold-to-talk is unaffected, which is why it survives casual testing. **Never
+script `flow toggle` twice as a health check**: that is the sequence that
+wedges it.
+
 ## Verification norms
 
 - **Test with real TTS audio**, not silence/noise: `say -o /tmp/clip.aiff

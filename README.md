@@ -565,6 +565,22 @@ is why, and upgrading fixes it.)
 
 Work down this list — it's ordered by how often each one is the answer.
 
+**0. Are you running the build you think you are?** Cheapest check, and it has
+been the answer before. If you ever built from source and copied the app into
+`/Applications`, that copy is still there — silently older than every release
+you've installed since.
+
+```bash
+flow status | grep version          # the running daemon's own version
+codesign -dv --verbose=2 "/Applications/VZT Flow.app" 2>&1 | grep -E "flags|TeamIdentifier"
+```
+
+A release prints `flags=0x10000(runtime)` and `TeamIdentifier=LKHKU5BW73`. If
+you instead see `flags=0x2(adhoc)` and `TeamIdentifier=not set`, you're running
+a local build — reinstall from [Releases](https://github.com/vonzelle-vzt/vzt-flow/releases/latest)
+or `brew upgrade --cask vzt-flow`. A stale local build in `/Applications` is
+how you end up running a version whose known crash was fixed months ago.
+
 **1. Is the tap even armed?** Hold the hotkey while watching:
 
 ```bash
@@ -603,6 +619,17 @@ please open an issue with that `.ips` file attached.
 
 **5. Still stuck?** `flow doctor` prints the model, daemon, hotkey binding, and
 MCP registration state in one shot. Include its output in a bug report.
+
+**Recording never stops and the mic stays live?** If `flow status` is pinned at
+`state: recording` and neither `flow cancel` nor `flow toggle` clears it, the
+state machine has latched. Restarting the app is currently the only recovery:
+
+```bash
+pkill -f "VZT Flow.app/Contents/MacOS/vzt-flow-desktop" && open -a "/Applications/VZT Flow.app"
+```
+
+This affects the tray toggle and the daemon/MCP paths; hold-to-talk is not
+affected. Known issue as of 0.3.3.
 
 Two traps that look like bugs but aren't. Holding a *different* Option key than
 the one you bound does nothing, and `CGEventFlags` cannot tell left from right —

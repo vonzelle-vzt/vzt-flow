@@ -707,7 +707,20 @@ Check registration status any time with `flow doctor` (it shells out to
 ## Troubleshooting
 
 **Hotkey does nothing (no overlay, nothing pasted):**
-- **First, confirm the app is still running.** It's a menu-bar-only app, so a
+- **First, confirm you're running the build you think you are.** A menu-bar app
+  shows you no version, so a stale copy in `/Applications` — typically one you
+  built from source months ago — is invisible until you look:
+  ```bash
+  flow status | grep version
+  codesign -dv --verbose=2 "/Applications/VZT Flow.app" 2>&1 | grep -E "flags|TeamIdentifier"
+  ```
+  Releases are `flags=0x10000(runtime)` with `TeamIdentifier=LKHKU5BW73` and
+  pass `spctl -a -vvv -t install`. `flags=0x2(adhoc)` with
+  `TeamIdentifier=not set` is a local build: reinstall from Releases or
+  `brew upgrade --cask vzt-flow`. This has been the real answer to a
+  "the hotkey broke" report — the app was fine, it was just two versions
+  behind the fix for a crash it was still carrying.
+- **Then confirm the app is still running.** It's a menu-bar-only app, so a
   crash is indistinguishable from a dead hotkey: no dialog, no dock icon to
   vanish. `pgrep -f vzt-flow-desktop` — and if it's gone, check
   `ls -t ~/Library/Logs/DiagnosticReports/vzt-flow-desktop-*.ips | head -3`
@@ -729,6 +742,21 @@ Check registration status any time with `flow doctor` (it shells out to
   re-arms itself both from the tap's own `TapDisabledByTimeout`/
   `TapDisabledByUserInput` callbacks and a belt-and-braces 5-second poll, so
   a Mac waking from sleep does not require restarting the app.
+
+**Recording never stops — `flow status` stuck on `recording`, mic light stays
+on:**
+- The state machine has latched. `AudioCommand::Stop`/`Cancel` are only
+  honoured by the capture loop, so once capture has exited while the app still
+  believes it's recording, `flow cancel` and `flow toggle` are both silently
+  ignored — they return `ok` and change nothing.
+- Restarting the app is the only recovery today:
+  ```bash
+  pkill -f "VZT Flow.app/Contents/MacOS/vzt-flow-desktop" && open -a "/Applications/VZT Flow.app"
+  ```
+- Reproducible on 0.3.3 with `flow toggle` followed by `flow cancel`. It
+  affects the tray toggle, the daemon socket and the MCP `listen` path;
+  hold-to-talk is unaffected. **Don't use a double `flow toggle` as a scripted
+  health check** — that is the sequence that triggers it.
 
 **First dictation after launch is slow:**
 - The Parakeet model isn't loaded until the first recording finishes (lazy
@@ -761,9 +789,9 @@ Check registration status any time with `flow doctor` (it shells out to
   visible console. Launch it from a terminal instead to see its stderr
   output live:
   ```bash
-  /Applications/VZT\ Flow.app/Contents/MacOS/vzt-flow
+  /Applications/VZT\ Flow.app/Contents/MacOS/vzt-flow-desktop
   # or, for a source build:
-  ./target/release/bundle/macos/VZT\ Flow.app/Contents/MacOS/vzt-flow
+  ./target/release/bundle/macos/VZT\ Flow.app/Contents/MacOS/vzt-flow-desktop
   ```
   This surfaces model load times, hotkey monitor status, daemon socket bind
   status, cleanup fallback reasons, and every `[vzt-flow] ...` diagnostic
