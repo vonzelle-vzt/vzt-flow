@@ -754,14 +754,18 @@ on:**
   ```bash
   pkill -f "VZT Flow.app/Contents/MacOS/vzt-flow-desktop" && open -a "/Applications/VZT Flow.app"
   ```
-- It was a race, not a fixed sequence — measured at 3 occurrences in 8
-  `flow toggle` + `flow cancel` cycles on 0.3.3, so a single clean attempt
-  never disproved it. It affected the tray toggle, the daemon socket and the
-  MCP `listen` path; hold-to-talk was never affected, which is why it went
-  unnoticed for so long.
+- **Sub-second `recording` right after a cancel is normal, not a fault.** A
+  cancel issued immediately after a start arrives while CoreAudio is still
+  opening the input device, so state legitimately reads `recording` for under a
+  second. Only a state that *stays* put is a problem — on 0.3.4 a long-window
+  check reaches `idle` within 0–1s.
+- It affected the tray toggle, the daemon socket and the MCP `listen` path;
+  hold-to-talk was never affected, which is why it went unnoticed for so long.
+  The stall was seen directly but never reproduced on demand, so 0.3.4 closes a
+  known hole rather than a confirmed cause — reports welcome.
 - If you script anything that starts dictation, **assert that `flow status`
-  returns to `idle` afterwards** rather than assuming it — that check is what
-  distinguishes a working pipeline from a wedged one.
+  returns to `idle`, polling for a few seconds** rather than reading it once.
+  An instantaneous read cannot tell a transient state from a stuck one.
 
 **First dictation after launch is slow:**
 - The Parakeet model isn't loaded until the first recording finishes (lazy

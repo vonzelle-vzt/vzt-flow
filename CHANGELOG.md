@@ -20,10 +20,8 @@ The app sets its state to "recording" at the moment it *asks* the audio worker
 to start, rather than when the worker confirms it has — so the two are never
 exactly in step. That window is normally harmless. What made it harmful is that
 the worker answered a stop or cancel that arrived outside a recording by doing
-nothing at all, silently: once the two disagreed, every attempt to recover hit
-that silence, and the disagreement became permanent. Measured at **3 wedges in
-8 toggle-then-cancel cycles** on 0.3.3 — a race, which is why one clean attempt
-never disproved it.
+nothing at all, silently: with no reply and no state change, a disagreement
+between the two had nothing that could ever resolve it.
 
 The fix is that the acknowledgement is no longer optional. A stop or cancel with
 no recording in progress now answers `NotRecording`, and the app reconciles to
@@ -47,10 +45,22 @@ can never tear down a transcription that is already underway.
 
 ### Known
 
-The interleaving that first desynchronises the coordinator from the audio worker
-has not been identified. The disagreement is now self-healing on the next stop
-or cancel rather than eliminated, so recovery — not the absence of the race — is
-the invariant that carries the safety here.
+**This fix is not proven against the original symptom.** The stall was observed
+directly and twice — state pinned at `recording` across minutes, multiple
+`flow cancel`/`flow toggle` calls and two process samples, CoreAudio threads
+live, both the coordinator and audio-worker threads idle in `recv`, cleared only
+by restarting. The swallowed-command path above is a real defect and a
+*sufficient* explanation for a stall that nothing can clear, which is why it was
+fixed. It has not been demonstrated to be *the* cause, and the original stall has
+not been reproducible on demand on any version.
+
+An earlier draft of this entry cited "3 wedges in 8 toggle-then-cancel cycles".
+**That figure is withdrawn**: it sampled state immediately after `flow cancel`
+returned, and a start and cancel issued back-to-back leave state legitimately
+`recording` for under a second while CoreAudio opens the input device. It was
+measuring device-open latency, not a stuck state. Inserting a 1s delay before the
+cancel gives 0/8, and on 0.3.4 a long-window measurement resolves to idle within
+0–1s in 6 of 6 trials. Treat sub-second `recording` after a cancel as normal.
 
 ## [0.3.3] — 2026-07-29
 

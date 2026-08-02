@@ -96,17 +96,20 @@ hold the canonical gotchas and checklist this ladder is built from.
    note); launching an extra instance can collide with the user's daily
    driver.
 
-   Exercising the toggle path is fine **only with the state assertion**:
+   Exercising the toggle path is fine **only with a settle window**, never a
+   single instantaneous read:
    ```bash
-   ./target/release/flow toggle && ./target/release/flow status | grep '^state:'  # recording
-   ./target/release/flow cancel && ./target/release/flow status | grep '^state:'  # MUST be idle
+   ./target/release/flow toggle; ./target/release/flow cancel
+   for i in $(seq 1 30); do s=$(./target/release/flow status | grep '^state:'); \
+     [ "$s" = "state: idle" ] && { echo "recovered"; break; }; done
    ```
-   Per gotcha (k), on 0.3.3 and earlier a cancel that arrived while the audio
-   worker wasn't capturing was discarded, latching `dictation_state` on
-   `Recording` with the mic live — only an app restart recovered, so an
-   unasserted check bricked the user's daily driver (3 wedges in 8 cycles).
-   Fixed in 0.3.4, but the desync is self-healing rather than gone. If state
-   does not return to `idle`, restart the app and report a **failure**.
+   Sub-second `recording` after a cancel is **normal** — CoreAudio is still
+   opening the device. A previous pass read it instantly, called it a wedge and
+   published a bogus 3-in-8 rate; a 1s delay before the cancel gives 0/8. Only
+   a state that *stays* non-idle is a fault (gotcha (k)): through 0.3.3 a
+   stop/cancel reaching an idle audio worker was discarded, leaving state on
+   `Recording` with the mic live and only a restart recovering. Fixed in 0.3.4.
+   If state does not settle to `idle`, restart the app and report a **failure**.
 
 9. **Overlay states** — only if explicitly asked for visual QA and the
    desktop app is already running: use the tray's "Test overlay" item (not

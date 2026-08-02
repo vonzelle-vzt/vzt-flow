@@ -620,19 +620,27 @@ please open an issue with that `.ips` file attached.
 **5. Still stuck?** `flow doctor` prints the model, daemon, hotkey binding, and
 MCP registration state in one shot. Include its output in a bug report.
 
-**Recording never stops and the mic stays live?** Fixed in **0.3.4** — upgrade.
-On 0.3.3 and earlier, `flow status` could pin at `state: recording` with the
-microphone still live, and neither `flow cancel` nor `flow toggle` would clear
-it; a stop or cancel that arrived when the audio worker wasn't capturing was
-silently discarded. It affected the tray toggle and the daemon/MCP paths (never
-hold-to-talk), and only restarting the app recovered:
+**Recording never stops and the mic stays live?** First, give it a second — a
+cancel issued immediately after a start leaves `state: recording` briefly while
+the microphone device opens, and that is normal. Only a state that *stays* put
+is a fault.
+
+If it genuinely persists: on 0.3.3 and earlier, a stop or cancel that arrived
+while the audio worker wasn't capturing was silently discarded, so `flow status`
+could pin at `state: recording` with the microphone live and neither
+`flow cancel` nor `flow toggle` able to clear it. **0.3.4 closes that hole** —
+upgrade. It affected the tray toggle and the daemon/MCP paths, never
+hold-to-talk. On an affected build, restarting is the only recovery:
 
 ```bash
 pkill -f "VZT Flow.app/Contents/MacOS/vzt-flow-desktop" && open -a "/Applications/VZT Flow.app"
 ```
 
 0.3.4 makes the acknowledgement mandatory, so a cancel now always either ends a
-live recording or clears a stuck one.
+live recording or clears a stuck one. If you still see a recording that stays
+stuck on 0.3.4 or later, please open an issue — the original stall was never
+reproducible on demand, so a report with `flow status` output would genuinely
+help.
 
 Two traps that look like bugs but aren't. Holding a *different* Option key than
 the one you bound does nothing, and `CGEventFlags` cannot tell left from right —
