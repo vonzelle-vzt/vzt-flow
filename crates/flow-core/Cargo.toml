@@ -14,7 +14,7 @@ hound = "3.5"
 dirs = "5"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 indicatif = "0.17"
-sha2 = "0.10"
+sha2 = "0.11"
 # Pure-Rust tar + gzip extraction for the Parakeet model archive, replacing a
 # shell-out to the `tar` binary (not guaranteed on PATH, notably on Windows).
 # `flate2` is already in the tree transitively (via arboard→image); pinned here
