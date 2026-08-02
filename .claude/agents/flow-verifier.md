@@ -14,6 +14,26 @@ hold the canonical gotchas and checklist this ladder is built from.
 
 ## Ladder
 
+0. **Build identity — always first.** Verifying the wrong binary yields a
+   confident green result about an app nobody runs. Establish what is actually
+   installed and running before measuring anything (CLAUDE.md gotcha (j)):
+   ```bash
+   ./target/release/flow status | grep version    # the RUNNING daemon
+   grep -m1 '^version' Cargo.toml                 # what this tree is
+   codesign -dv --verbose=2 "/Applications/VZT Flow.app" 2>&1 | grep -E "flags|TeamIdentifier"
+   ```
+   Release = `flags=0x10000(runtime)` + `TeamIdentifier=LKHKU5BW73`; local
+   build = `flags=0x2(adhoc)` + `TeamIdentifier=not set`. Report the build
+   under test explicitly, and flag any mismatch between the running daemon's
+   version and `Cargo.toml` — that mismatch has itself been the root cause of
+   a "the hotkey is broken" report.
+
+   If the app appears broken, take a thread census before reading code:
+   `sample <pid> 2 -f /tmp/s.txt`. `vzt-flow-hotkey-tap` in `__CFRunLoopRun`
+   proves the tap armed (so Input Monitoring is granted); an unnamed thread in
+   `run_coordinator` blocked in `Channel::recv` proves the coordinator is
+   alive, ruling out gotcha (i) with no crash report available.
+
 1. **Build.**
    ```bash
    source ~/.cargo/env
@@ -70,12 +90,18 @@ hold the canonical gotchas and checklist this ladder is built from.
    ```bash
    ./target/release/flow status
    ```
-   If a daemon is reachable, also run `flow toggle` + `flow toggle` again
-   (start/stop) and `flow history -n 5`, and report actual output. If no
-   daemon is running, say so — do not launch the app yourself unless
+   If a daemon is reachable, run `flow history -n 5` and report actual output.
+   If no daemon is running, say so — do not launch the app yourself unless
    explicitly asked (see CLAUDE.md's "never kill/relaunch without care"
    note); launching an extra instance can collide with the user's daily
    driver.
+
+   **Do not run `flow toggle` twice as a start/stop check.** Per gotcha (k)
+   the second toggle can latch `dictation_state` on `Recording` with the mic
+   live, unclearable by `cancel` or `toggle` — only an app restart recovers,
+   so this "check" bricks the user's daily driver. Reproducible on 0.3.3. If
+   the toggle path must be exercised, confirm `flow status` returns to `idle`
+   afterwards; if it does not, restart the app and report a **failure**.
 
 9. **Overlay states** — only if explicitly asked for visual QA and the
    desktop app is already running: use the tray's "Test overlay" item (not

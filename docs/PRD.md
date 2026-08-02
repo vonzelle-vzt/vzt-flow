@@ -113,7 +113,7 @@ The failure modes are indistinguishable from outside, which makes them
 expensive to diagnose and easy to misattribute — v0.3.3 was reported as "the
 speak button doesn't work in VS Code" and was neither the button nor VS Code.
 
-Two distinct classes, and only one of them is catchable:
+Three distinct classes, and only one of them is catchable in-process:
 
 - **Process abort.** A main-thread-only macOS API called from a worker thread
   (HIToolbox input-source lookups, reached via the keyboard-layout resolution
@@ -133,11 +133,37 @@ Two distinct classes, and only one of them is catchable:
   via the overlay, and restarts on the same channel. Mutexes recover from
   poisoning rather than propagating it, since a panic holding a lock would
   otherwise make every subsequent press panic on the same line.
+- **Wrong binary.** The one no amount of in-process defence can reach: the app
+  is alive, healthy and fully granted — it is simply *not the build anyone
+  thinks it is*. On 2026-08-01 a "the hotkey stopped working" report resolved
+  to an ad-hoc-signed **v0.3.2** dev build sitting in `/Applications`, days
+  after v0.3.3 shipped the fix for the abort described above. Every in-process
+  signal was green because nothing in-process was wrong. **Requirement: build
+  identity is the first question in any triage, not the last** — signature
+  flags, team identifier and version, checked against the release, before a
+  line of code is read. A menu-bar app gives the user no version affordance,
+  so this is diagnosis's blind spot by construction.
 
 **A guard whose clearing condition it also blocks is not a guard.** The
 restart is only useful because `reset_after_panic` returns `dictation_state`
 to Idle — a supervisor that restarted into a latched `Recording` state would
 reproduce the exact symptom it exists to prevent.
+
+That latched state is not hypothetical, and **the panic supervisor does not
+cover the route into it**. The audio worker's outer command loop treats
+`Stop`/`Cancel` as a no-op — they are only honoured inside the capture loop —
+so if capture exits while `dictation_state` still reads `Recording`, the guard
+is set with its clearing condition unreachable: every subsequent cancel and
+toggle is swallowed, the microphone stays live, and only a process restart
+recovers. Confirmed on 0.3.3 via `flow toggle` → `flow cancel` (state pinned
+at `recording`, CoreAudio threads still up, nothing written to history). Two
+requirements follow. **State transitions must be driven by the worker's
+completion reply, never assumed by the sender** — the coordinator setting
+`Recording` optimistically is what allows sender and worker to disagree. And
+**a recovery command must be able to run from any state**, including the state
+it is meant to escape; a cancel that only works while already cancellable is
+not a recovery path. Note this failure is invisible to hold-to-talk, so a
+verification pass that only exercises the hotkey will never see it.
 
 **Measurement note.** This class is a *race*: the abort needs concurrent
 callers, so a single background call usually survives and the bug reads as

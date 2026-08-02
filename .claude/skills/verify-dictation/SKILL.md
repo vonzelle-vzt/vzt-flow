@@ -11,6 +11,23 @@ and real numbers — not "the code compiles so it probably works."
 
 ## 0. Prerequisites
 
+**First, confirm which build you are about to verify.** Verifying the wrong
+binary is worse than not verifying — it produces a confident green result about
+an app nobody is running. This has happened: a "hotkey is broken" investigation
+ran for an hour against a healthy process before anyone checked that
+`/Applications/VZT Flow.app` was an ad-hoc v0.3.2 dev build, two versions
+behind a crash fix it was still carrying (CLAUDE.md gotcha (j)).
+
+```bash
+./target/release/flow status | grep version    # the RUNNING daemon's version
+grep -m1 '^version' Cargo.toml                 # what this tree is
+codesign -dv --verbose=2 "/Applications/VZT Flow.app" 2>&1 | grep -E "flags|TeamIdentifier"
+```
+
+Release = `flags=0x10000(runtime)` + `TeamIdentifier=LKHKU5BW73`. Local build =
+`flags=0x2(adhoc)` + `TeamIdentifier=not set`. State which one you tested; a
+report that doesn't name the build under test is not a verification.
+
 ```bash
 source ~/.cargo/env
 cargo build --release --workspace
@@ -80,10 +97,17 @@ Expect exactly: `const userProfile = await getUser()`
 `flow status` first, don't launch an extra instance):
 ```bash
 ./target/release/flow status
-./target/release/flow toggle   # start hands-free
-./target/release/flow toggle   # stop it
 ./target/release/flow history -n 5
 ```
+
+> **Do not script `flow toggle` twice as a start/stop health check.** Per
+> CLAUDE.md gotcha (k), the second toggle can leave `dictation_state` latched
+> on `Recording` with the mic live, and neither `cancel` nor `toggle` can clear
+> it — only restarting the app does, which means this "check" bricks the
+> user's daily driver. Reproducible on 0.3.3. If you must exercise the toggle
+> path, verify with `flow status` that state returns to `idle` afterwards, and
+> if it doesn't, restart the app and **report it as a failure** rather than
+> moving on.
 
 **Long-audio safety** (only relevant if touching ASR/chunking — see CLAUDE.md
 gotcha (b)): never feed >60s of audio straight into `flow transcribe`
