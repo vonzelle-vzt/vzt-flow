@@ -200,6 +200,42 @@ the tray toggle, the daemon socket and MCP `listen` — so a health check that
 drives dictation must assert `flow status` returns to `idle`, with a settle
 window, rather than assuming it.
 
+**(l) Whatever sits at the *end* of the cleanup system prompt is what the model
+recites when there is nothing to correct.** The dictionary block used to be
+appended last (`build_system_prompt` in `crates/flow-core/src/cleanup.rs`), and
+1.9% of real dictations came back as `These terms are spelled: Supabase, Whop,
+…` — the speaker's words replaced outright, not degraded. Qwen3-1.7B decodes
+greedily (`chain_simple([dist(1234), greedy()])`), so given an input with little
+to fix it takes the highest-probability continuation available and copies the
+most recent text in its context. **Keep the task instruction ("Output only the
+corrected text") in the tail position**; anything appended after it is a
+candidate for regurgitation. Pinned by
+`glossary_leads_the_prompt_and_the_task_instruction_trails_it`.
+
+The prompt ordering is a mitigation, not a guarantee — `is_glossary_echo` is the
+backstop, and it is **load-bearing, not belt-and-braces**: the reorder fixes 7 of
+the 9 reproducible cases and the guard catches the other 2. It returns
+`Ok(String::new())` rather than the raw text, deliberately: every caller already
+treats empty output as "no usable output → fall back to raw"
+(`cleanup_manager.rs`, `clean_test.rs`), so one check inside `clean()` covers the
+desktop coordinator, the daemon/MCP path and `clean-test` with no call-site
+changes. **Any new output-side guard should use that same contract** rather than
+inventing a second fallback path. Note `dictionary::correct()` has already run
+deterministically before cleanup (`coordinator.rs`, `daemon.rs`), so the prompt
+copy of the term list is a best-effort second pass, not the mechanism.
+
+⚠️ An input-side check cannot catch this. The 0.2.0 `raw.trim().is_empty()`
+guard covers a silent key-press and still works, but these failures all had
+healthy, non-empty input.
+
+To measure any of it: `cargo run --release --example cleanup_replay --
+<corpus.jsonl>` replays transcripts through the real provider (loaded **once** —
+`flow clean-test` pays several seconds of Metal pipeline JIT per invocation and
+is useless for a corpus) and counts echoes. Build the corpus from
+`~/.config/vzt-flow/history.jsonl`, which stores `raw_text` and `clean_text` per
+dictation and is therefore the record of what the LLM pass actually did. Keep
+corpora out of the repo — it is the user's dictation history.
+
 ## Verification norms
 
 - **Test with real TTS audio**, not silence/noise: `say -o /tmp/clip.aiff

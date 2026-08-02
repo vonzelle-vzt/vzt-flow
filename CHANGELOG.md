@@ -6,6 +6,46 @@ versioning](https://semver.org/). Numbers quoted below were measured on this
 repo's dev hardware (M5 MacBook Air) unless noted — see `README.md` /
 `docs/PRD.md` for the full methodology.
 
+## [0.3.5] — 2026-08-02
+
+**Dictation sometimes pasted your dictionary instead of what you said.** You
+would hold the key, say a sentence, and get this:
+
+```
+These terms are spelled: Supabase, Whop, VZT, Resend, Vercel, …
+```
+
+Not a garbled version of your words — your words, gone, replaced by the list of
+terms from Settings → Dictionary. On this repo's own dictation history it hit 13
+of 699 dictations (1.9%).
+
+The transcription was never at fault. Every one of those recordings was
+transcribed correctly; the cleanup pass that runs afterwards is what threw the
+result away. Cleanup tells the model how your dictionary terms are spelled, and
+that list was the *last* thing in its instructions. Handed a sentence with
+little to correct — "Merge.", or a command that was already clean — the model
+reached for the most recent text it had seen and recited the list instead. That
+is why it looked random: it depends on how much there was to fix, not on how
+long or how clearly you spoke.
+
+Two changes, either of which would have prevented it. The dictionary now leads
+the instructions rather than trailing them, so the task itself is what the model
+reads last — that alone fixes 7 of the 9 reproducible cases. And cleanup output
+that recites the dictionary is now rejected outright: when the model does it
+anyway, you get your raw transcript with dictionary corrections applied instead
+of the term list. Both layers are load-bearing; the guard still catches the
+remaining 2.
+
+An earlier fix (0.2.0) covered the case where you pressed the key and said
+nothing. That one still holds, but it could only ever check the *input* — these
+failures had perfectly healthy input, so nothing on that side could see them.
+
+Also adds `cargo run --release --example cleanup_replay -- <corpus.jsonl>`, which
+replays a corpus of transcripts through the real cleanup model and counts how
+many come back as a dictionary recital. It reports 9 of 13 on the build before
+this fix and 0 of 13 after, and 0 of 60 on a control sample of dictations that
+were always fine.
+
 ## [0.3.4] — 2026-08-02
 
 **A cancel that arrived at the wrong moment was thrown away, and the microphone

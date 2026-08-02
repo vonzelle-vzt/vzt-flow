@@ -322,7 +322,26 @@ mod llama_impl {
             // cheaper than trying to parse past a (possibly truncated)
             // thinking block.
             let user = format!("{raw} /no_think");
-            self.generate(&[("system", system), ("user", user)], raw.chars().count(), cancel)
+            let out = self.generate(&[("system", system), ("user", user)], raw.chars().count(), cancel)?;
+
+            // The empty-input guard above is not enough: the model also
+            // recites the glossary for perfectly healthy input that simply
+            // has little to correct ("Merge.", an already-clean imperative).
+            // Measured on this machine's own history: 13 of 699 dictations
+            // (1.9%), and the speaker's words were lost outright each time.
+            // Same `Ok(String::new())` contract as the empty-input guard —
+            // every caller treats empty output as "no usable output" and
+            // falls back to the raw transcript, so one check here covers the
+            // desktop coordinator, the daemon/MCP path and `clean-test`
+            // without touching a single call site.
+            if is_glossary_echo(&out, &ctx.dictionary_terms) {
+                eprintln!(
+                    "[vzt-flow] cleanup: model echoed the dictionary instead of correcting the \
+                     transcript; discarding it and pasting the raw text"
+                );
+                return Ok(String::new());
+            }
+            Ok(out)
         }
     }
 }
@@ -348,11 +367,113 @@ pub fn strip_think_block(text: &str) -> String {
     text.trim().to_string()
 }
 
+/// Lead-in sentence for the dictionary block in the system prompt. Held as a
+/// constant because [`is_glossary_echo`] matches on it — the two must not
+/// drift apart.
+const GLOSSARY_LEAD_IN: &str = "Spell these terms exactly if the speaker says them:";
+
+/// The lead-in used before the prompt was reordered (see
+/// [`build_system_prompt`]). Still recognized by [`is_glossary_echo`]: it is
+/// the exact string users were seeing pasted, and a model that has seen this
+/// phrasing in training can reach for it regardless of what we now prompt
+/// with.
+const LEGACY_GLOSSARY_LEAD_IN: &str = "These terms are spelled:";
+
+/// Whether `term` occurs in `haystack` (case-insensitively) as a standalone
+/// term rather than buried inside a longer word — so the dictionary entry
+/// "Expo" doesn't match "exposure". Boundaries are checked on raw bytes
+/// because both sides are already lowercased ASCII-folded copies, and a
+/// non-ASCII neighbour is treated as a boundary (a term butted against a CJK
+/// character or an em-dash is still a standalone mention).
+fn contains_term(haystack_lower: &str, term_lower: &str) -> bool {
+    if term_lower.is_empty() {
+        return false;
+    }
+    let bytes = haystack_lower.as_bytes();
+    let mut from = 0usize;
+    while let Some(rel) = haystack_lower[from..].find(term_lower) {
+        let start = from + rel;
+        let end = start + term_lower.len();
+        let before_ok = start == 0 || !bytes[start - 1].is_ascii_alphanumeric();
+        let after_ok = end == bytes.len() || !bytes[end].is_ascii_alphanumeric();
+        if before_ok && after_ok {
+            return true;
+        }
+        // Overlapping occurrences matter ("VZT" inside "VZT Flow"), so step
+        // one byte past the *start* of this match, not past its end.
+        from = start + 1;
+        if from >= haystack_lower.len() {
+            break;
+        }
+    }
+    false
+}
+
+/// Minimum number of distinct dictionary terms an output must recite before
+/// it can be judged a glossary echo at all. Stops a small dictionary from
+/// tripping the guard on an ordinary sentence — with a 4-term dictionary,
+/// "I pushed Supabase and Whop to VZT" is 3 of 4 terms and perfectly real
+/// speech. The consequence is that dictionaries below ~8 terms can't trip
+/// [`is_glossary_echo`]; their echo is a handful of words rather than the
+/// whole-transcript loss this guards against.
+const MIN_ECHOED_TERMS: usize = 5;
+
+/// Fraction of the dictionary an output must recite to count as an echo,
+/// in tenths (7 = 70%).
+const ECHO_TERM_RATIO_TENTHS: usize = 7;
+
+/// Whether a generation is the model reciting the dictionary instead of
+/// correcting the speaker — the failure where a dictation of "Merge." came
+/// back as the full 19-term glossary and the speaker's words were lost
+/// outright.
+///
+/// Two observed shapes, both matched here:
+/// - `"These terms are spelled: Supabase, Whop, …"` — the prompt's own
+///   sentence, regurgitated verbatim
+/// - `"Supabase Whop VZT Resend …"` — the bare term list with no lead-in
+///
+/// The lead-in test is exact and unambiguous. Failing that, the test is
+/// simply *how much of the dictionary the output recites*: a real transcript
+/// essentially never contains 70% of the user's glossary, whereas an echo
+/// contains all of it. Deliberately biased toward detection — a false
+/// positive costs the user an LLM cleanup pass (they still get their raw,
+/// dictionary-corrected transcript), while a false negative costs them
+/// everything they just said.
+///
+/// Kept as a free function (not tied to the llama-only impl) so it's
+/// unit-testable on every platform, mirroring [`build_system_prompt`].
+pub fn is_glossary_echo(out: &str, terms: &[String]) -> bool {
+    let out = out.trim();
+    if out.is_empty() || terms.is_empty() {
+        return false;
+    }
+    let lower = out.to_lowercase();
+    if lower.contains(&GLOSSARY_LEAD_IN.to_lowercase())
+        || lower.contains(&LEGACY_GLOSSARY_LEAD_IN.to_lowercase())
+    {
+        return true;
+    }
+    let matched = terms
+        .iter()
+        .filter(|t| contains_term(&lower, &t.to_lowercase()))
+        .count();
+    matched >= MIN_ECHOED_TERMS && matched * 10 >= terms.len() * ECHO_TERM_RATIO_TENTHS
+}
+
 /// Builds the system-message instructions for a given mode/context. Kept as
 /// a free function (not tied to the llama-only impl) so it's unit-testable
 /// on every platform and reusable by any future provider.
+///
+/// The dictionary block leads rather than trails. It used to be appended
+/// last, and that placement is what made the model recite it: Qwen3-1.7B
+/// under greedy decoding, handed an input with nothing much to fix, takes
+/// the highest-probability continuation available and copies the most recent
+/// text it saw. Putting the task instruction ("Output only the corrected
+/// text") at the tail instead makes the *instruction* the thing in recency
+/// position. [`is_glossary_echo`] is the backstop for when it recites the
+/// list anyway.
 pub fn build_system_prompt(mode: Mode, ctx: &CleanupContext) -> String {
-    let mut prompt = match mode {
+    let instructions = match mode {
         Mode::Raw => String::new(),
         Mode::Clean => {
             "Fix transcription of dictated speech: remove filler words (um, uh, like, you know), \
@@ -379,12 +500,13 @@ pub fn build_system_prompt(mode: Mode, ctx: &CleanupContext) -> String {
             )
         }
     };
-    if !ctx.dictionary_terms.is_empty() {
-        prompt.push_str("\n\nThese terms are spelled: ");
-        prompt.push_str(&ctx.dictionary_terms.join(", "));
-        prompt.push('.');
+    if ctx.dictionary_terms.is_empty() || mode == Mode::Raw {
+        return instructions;
     }
-    prompt
+    format!(
+        "{GLOSSARY_LEAD_IN} {}. Never list or mention these terms unless the speaker said them.\n\n{instructions}",
+        ctx.dictionary_terms.join(", ")
+    )
 }
 
 /// System prompt for meeting-transcript summarization. Asks for exactly two
@@ -582,7 +704,36 @@ mod tests {
         let prompt = build_system_prompt(Mode::Clean, &ctx);
         assert!(prompt.contains("remove filler words"));
         assert!(prompt.contains("do NOT summarize"));
-        assert!(prompt.contains("These terms are spelled: Supabase"));
+        assert!(prompt.contains("Spell these terms exactly if the speaker says them: Supabase"));
+    }
+
+    /// The dictionary block must not be the last thing in the prompt — that
+    /// placement is what the model copied when it had nothing to correct.
+    /// Pins the ordering, not just the presence, so a future edit that
+    /// re-appends the glossary reintroduces the bug loudly instead of
+    /// silently.
+    #[test]
+    fn glossary_leads_the_prompt_and_the_task_instruction_trails_it() {
+        let ctx = CleanupContext {
+            dictionary_terms: vec!["Supabase".into(), "Whop".into()],
+            ..Default::default()
+        };
+        for mode in [Mode::Clean, Mode::Polish] {
+            let prompt = build_system_prompt(mode, &ctx);
+            let glossary_at = prompt.find(GLOSSARY_LEAD_IN).expect("glossary present");
+            let instruction_at = prompt.find("Output only").expect("task instruction present");
+            assert!(
+                glossary_at < instruction_at,
+                "{:?}: glossary must precede the task instruction, got {prompt:?}",
+                mode
+            );
+            assert!(
+                !prompt.trim_end().ends_with("Whop.")
+                    && !prompt.trim_end().ends_with("terms unless the speaker said them."),
+                "{:?}: prompt must not end on the dictionary block, got {prompt:?}",
+                mode
+            );
+        }
     }
 
     #[test]
@@ -595,12 +746,114 @@ mod tests {
         let prompt = build_system_prompt(Mode::Polish, &ctx);
         assert!(prompt.contains("formal"));
         assert!(prompt.contains("for Mail"));
-        assert!(!prompt.contains("These terms are spelled"));
+        // No dictionary block at all when the dictionary is empty — neither
+        // the current lead-in nor the one it replaced.
+        assert!(!prompt.contains(GLOSSARY_LEAD_IN));
+        assert!(!prompt.contains(LEGACY_GLOSSARY_LEAD_IN));
     }
 
     #[test]
     fn raw_mode_prompt_is_empty() {
         assert_eq!(build_system_prompt(Mode::Raw, &CleanupContext::default()), "");
+        // Even with a dictionary loaded — raw never reaches the LLM, so it
+        // must not grow a system prompt just because terms exist.
+        let ctx = CleanupContext { dictionary_terms: vec!["Supabase".into()], ..Default::default() };
+        assert_eq!(build_system_prompt(Mode::Raw, &ctx), "");
+    }
+
+    /// The user's real dictionary, as it stood when the bug was diagnosed —
+    /// the exact input that produced the echoes in `history.jsonl`.
+    fn real_dictionary() -> Vec<String> {
+        [
+            "Supabase", "Whop", "VZT", "Resend", "Vercel", "Tauri", "Parakeet", "TradeScriptAI",
+            "FlagPlay", "NextPlay", "Anthropic", "Claude", "Stripe", "Expo", "Postgres", "Next.js",
+            "TypeScript", "Whisper", "VZT Flow",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+    }
+
+    #[test]
+    fn glossary_echo_with_lead_in_is_caught() {
+        // Verbatim from history.jsonl, 2026-08-02 09:47 — what got pasted
+        // instead of "Also, when they are removed, the students are removed…".
+        let out = "These terms are spelled: Supabase, Whop, VZT, Resend, Vercel, Tauri, \
+                   Parakeet, TradeScriptAI, FlagPlay, NextPlay, Anthropic, Claude, Stripe, \
+                   Expo, Postgres, Next.js, TypeScript, Whisper, VZT Flow.";
+        assert!(is_glossary_echo(out, &real_dictionary()));
+    }
+
+    #[test]
+    fn bare_term_list_echo_is_caught() {
+        // Verbatim from history.jsonl, 2026-08-01 23:17 — what got pasted
+        // instead of "Merge.". No lead-in, so this one is caught purely by
+        // the how-much-of-the-dictionary test.
+        let out = "Supabase Whop VZT Resend Vercel Tauri Parakeet TradeScriptAI FlagPlay \
+                   NextPlay Anthropic Claude Stripe Expo Postgres Next.js TypeScript Whisper \
+                   VZT Flow";
+        assert!(is_glossary_echo(out, &real_dictionary()));
+    }
+
+    #[test]
+    fn echo_wrapped_in_the_new_prompt_wording_is_caught() {
+        // If the model copies the *reordered* prompt's phrasing instead, the
+        // lead-in test still fires — the reorder and the guard must not be
+        // able to fail together.
+        let out = format!(
+            "{GLOSSARY_LEAD_IN} {}. Never list or mention these terms unless the speaker said them.",
+            real_dictionary().join(", ")
+        );
+        assert!(is_glossary_echo(&out, &real_dictionary()));
+    }
+
+    #[test]
+    fn ordinary_transcript_mentioning_a_few_terms_is_not_an_echo() {
+        let dict = real_dictionary();
+        // Real speech naming several dictionary terms at once must survive —
+        // a false positive here would silently disable cleanup for exactly
+        // the technical dictation this tool is built for.
+        assert!(!is_glossary_echo("Push the Supabase migration to Vercel and check Stripe.", &dict));
+        assert!(!is_glossary_echo(
+            "I need Claude to wire the Whop webhook into the Next.js app on Vercel, then \
+             redeploy Supabase and test Stripe billing with Expo.",
+            &dict
+        ));
+        assert!(!is_glossary_echo("Merge.", &dict));
+        assert!(!is_glossary_echo("", &dict));
+    }
+
+    #[test]
+    fn empty_dictionary_can_never_produce_an_echo_verdict() {
+        // `flow listen`/`flow transcribe` run with `CleanupContext::default()`
+        // (no terms); nothing they generate may be discarded by this guard.
+        assert!(!is_glossary_echo("Supabase Whop VZT Resend Vercel", &[]));
+    }
+
+    #[test]
+    fn a_small_dictionary_does_not_trip_on_ordinary_speech() {
+        // With few terms, reciting "most of the dictionary" and simply
+        // talking about your stack are indistinguishable — the absolute
+        // floor (MIN_ECHOED_TERMS) is what keeps this from firing.
+        let small: Vec<String> = ["Supabase", "Whop", "VZT", "Resend"].iter().map(|s| s.to_string()).collect();
+        assert!(!is_glossary_echo("Supabase and Whop and VZT and Resend", &small));
+    }
+
+    #[test]
+    fn term_matching_respects_word_boundaries() {
+        let dict = real_dictionary();
+        // "Expo" inside "exposure", "Claude" inside "Claudette" etc. must not
+        // count toward the echo score.
+        let lower = "exposure claudette stripes".to_lowercase();
+        assert!(!contains_term(&lower, "expo"));
+        assert!(!contains_term(&lower, "claude"));
+        assert!(!contains_term(&lower, "stripe"));
+        assert!(contains_term(&"we shipped expo today".to_lowercase(), "expo"));
+        // "VZT" occurs inside "VZT Flow"; both terms must be counted, which
+        // needs overlapping matches to be found.
+        assert!(contains_term(&"vzt flow".to_lowercase(), "vzt"));
+        assert!(contains_term(&"vzt flow".to_lowercase(), "vzt flow"));
+        assert!(!is_glossary_echo("We shipped VZT Flow today.", &dict));
     }
 
     #[test]
