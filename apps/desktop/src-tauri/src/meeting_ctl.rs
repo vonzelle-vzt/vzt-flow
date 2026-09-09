@@ -80,23 +80,19 @@ pub const EVENT_BIND: &str = "meeting://bind";
 pub const EVENT_STATE: &str = "meeting://state";
 pub const EVENT_LINE: &str = "meeting://line";
 pub const EVENT_TIP: &str = "meeting://tip";
-#[allow(dead_code)] // emitted by `save_notes` (a U11 seam).
 pub const EVENT_NOTES_STATUS: &str = "meeting://notes-status";
 
 /// Returned to the notepad when it asks to act on a session this process no
 /// longer holds (it was retired, or the window is bound to an older meeting).
-#[allow(dead_code)] // returned by the U11 seams below.
 pub const FOREIGN_SESSION: &str = "this window is bound to a finished session";
 
 /// Re-export rewrites the transcript in place (`notes::replace_notes_section`
 /// renames a new file over it), which would strand the capture writer's open
 /// file descriptor — so it is refused until the session has finalized.
-#[allow(dead_code)] // returned by `reexport` (a U11 seam).
 pub const STILL_RUNNING: &str = "this meeting is still running; stop it before re-exporting";
 
 /// Re-export renders over the PDF the finalize path wrote. Without one there
 /// is no filename to update (and no `chrono` in this crate to derive one).
-#[allow(dead_code)] // returned by `reexport` (a U11 seam).
 pub const NO_PDF_TO_UPDATE: &str =
     "no PDF was exported for this meeting; turn PDF export on before the next one";
 
@@ -134,7 +130,6 @@ pub struct StatePayload {
 
 /// `meeting://notes-status` — the result of one notes save.
 #[derive(Clone, Serialize)]
-#[allow(dead_code)] // constructed by `save_notes` (a U11 seam).
 pub struct NotesStatus {
     pub session_id: String,
     pub ok: bool,
@@ -207,7 +202,6 @@ fn emit_state(app: &AppHandle, session_id: &str, state: SessionState, outcome: O
 /// Looks a session up for a notepad-initiated action, refusing an id we no
 /// longer hold. Pure (takes the map, not the app), so the guard is testable
 /// without a Tauri runtime.
-#[allow(dead_code)] // used by the U11 seams below.
 fn slot_for<'a>(meetings: &'a mut Meetings, session_id: &str) -> Result<&'a mut SessionSlot, String> {
     meetings
         .get_mut(session_id)
@@ -221,12 +215,12 @@ fn slot_for<'a>(meetings: &'a mut Meetings, session_id: &str) -> Result<&'a mut 
 /// Whether a meeting is currently capturing audio. `Stopping`/`Finalizing`
 /// deliberately read as **not** active — the microphone is closed by then and
 /// the tray must not offer "stop" a second time.
+#[allow(dead_code)] // called by the launch-time preload on the fast-first-dictation branch (lib.rs)
 pub fn is_active(app: &AppHandle) -> bool {
     with_slot(app, None, |slot| slot.is_recording()).unwrap_or(false)
 }
 
 /// The id of the newest session, alive or finished.
-#[allow(dead_code)] // U12 (tray) / U11 seam.
 pub fn current_session_id(app: &AppHandle) -> Option<String> {
     with_slot(app, None, |slot| slot.session_id.clone())
 }
@@ -270,7 +264,6 @@ pub fn with_slot<R>(
 }
 
 /// The `meeting://bind` payload for a session, for U11's `notepad::open`.
-#[allow(dead_code)] // U11 (notepad::open) seam.
 pub fn bind_payload(app: &AppHandle, session_id: &str) -> Option<BindPayload> {
     with_slot(app, Some(session_id), |slot| BindPayload {
         session_id: slot.session_id.clone(),
@@ -564,11 +557,12 @@ fn maybe_open_notepad(app: &AppHandle, session_id: &str) {
         }
         slot.notepad_opened = true;
     }
-    // U11: open the notepad here — `crate::notepad::open(app, session_id)`.
-    // It must marshal every window operation through `run_on_main_thread`
-    // (gotcha (h)); this function is called from `start`, which the detector
-    // thread also calls. The `meeting://bind` payload is already emitted by
-    // `on_started`, and [`bind_payload`] rebuilds it for a re-open.
+    // `notepad::open` marshals every window operation through
+    // `run_on_main_thread` (gotcha (h)) — this function is called from
+    // `start`, which the detector thread also calls. The `meeting://bind`
+    // payload is already emitted by `on_started`, and [`bind_payload`]
+    // rebuilds it for a re-open.
+    crate::notepad::open(app, session_id);
 }
 
 // ---------------------------------------------------------------------------
@@ -750,7 +744,6 @@ pub fn toggle(app: &AppHandle) {
 /// move `notes_rev_used` (the exported files then visibly trail the sidecar
 /// until a re-export). The write happens **outside** the `meetings` lock: the
 /// session thread's `on_line` takes that lock on every transcript line.
-#[allow(dead_code)] // U11 (save_meeting_notes) seam.
 pub fn save_notes(app: &AppHandle, session_id: &str, text: &str) -> Result<u64, String> {
     let state = app.state::<AppState>();
     let path = {
@@ -791,7 +784,6 @@ pub fn save_notes(app: &AppHandle, session_id: &str, text: &str) -> Result<u64, 
 /// The slot's flag is the *same* `Arc<AtomicBool>` the running session reads,
 /// so this takes effect mid-meeting: the coach starts (or stops) answering
 /// questions and the `Them` silence hold tightens without a restart.
-#[allow(dead_code)] // U11 (set_interview_mode) / U12 seam.
 pub fn set_interview(app: &AppHandle, session_id: &str, on: bool) -> Result<(), String> {
     let state = app.state::<AppState>();
     {
@@ -817,7 +809,6 @@ pub fn set_interview(app: &AppHandle, session_id: &str, on: bool) -> Result<(), 
 /// Refused while the session is still running: `notes::replace_notes_section`
 /// publishes by rename, which would leave the capture writer appending to the
 /// replaced inode (flow-core's own merge runs only after the writer closes).
-#[allow(dead_code)] // U11 (reexport_meeting) seam.
 pub fn reexport(app: &AppHandle, session_id: &str) -> Result<PathBuf, String> {
     let state = app.state::<AppState>();
     let (transcript, notes_path, title, stored_summary, pdf_path, rev) = {
@@ -878,7 +869,6 @@ pub fn reexport(app: &AppHandle, session_id: &str) -> Result<PathBuf, String> {
 /// Deliberately not `pdf::write_atomic`, which reserves a *new* name with
 /// `create_new` (a re-export would pile up "… -2.pdf", "… -3.pdf"); a
 /// re-export updates the file the user already has.
-#[allow(dead_code)] // used by `reexport`.
 fn write_over_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
     use std::io::Write;
 
@@ -927,7 +917,6 @@ fn leading_timestamp(line: &str) -> Option<&str> {
 
 /// The timestamped transcript lines and the meeting length (the last
 /// timestamp seen), as the PDF body wants them.
-#[allow(dead_code)] // used by `reexport`.
 fn transcript_lines_and_duration(markdown: &str) -> (Vec<String>, String) {
     let mut lines = Vec::new();
     let mut duration = None;
@@ -941,7 +930,6 @@ fn transcript_lines_and_duration(markdown: &str) -> (Vec<String>, String) {
 }
 
 /// The date part of the `# Meeting: <title> — <datetime>` header.
-#[allow(dead_code)] // used by `reexport`.
 fn header_date(markdown: &str) -> Option<String> {
     markdown
         .lines()

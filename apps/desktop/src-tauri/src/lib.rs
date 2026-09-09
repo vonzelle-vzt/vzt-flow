@@ -1,7 +1,9 @@
 mod commands;
+mod commands_meeting;
 mod coordinator;
 mod daemon;
 mod meeting_ctl;
+mod notepad;
 mod overlay;
 mod settings;
 mod state;
@@ -77,6 +79,14 @@ pub fn run() {
             commands::test_overlay,
             commands::get_model_status,
             commands::start_model_download,
+            commands_meeting::get_meeting_snapshot,
+            commands_meeting::save_meeting_notes,
+            commands_meeting::set_interview_mode,
+            commands_meeting::open_meeting_notes,
+            commands_meeting::reexport_meeting,
+            commands_meeting::get_interview_context,
+            commands_meeting::set_interview_context,
+            commands_meeting::reveal_in_finder,
         ])
         .setup(|app| {
             let handle = app.handle().clone();
@@ -138,6 +148,11 @@ pub fn run() {
             // Pre-create (hidden) so the first `show_overlay` call has no
             // window-creation latency mid-recording.
             let _ = overlay::ensure_overlay(&handle);
+
+            // Pre-create the hidden notepad window too, so the first
+            // `notepad::open` (a meeting starting, or the tray's "Open
+            // meeting notes") has no window-creation latency.
+            let _ = notepad::ensure_window(&handle);
 
             // Background meeting auto-detector (Zoom/Meet/Teams). Always
             // spawned; it no-ops when `meeting_auto = "off"` and reads the
