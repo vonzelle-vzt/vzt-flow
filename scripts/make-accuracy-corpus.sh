@@ -54,11 +54,12 @@ code.voice=$accuracy_irish
 quiet.voice=Samantha
 seam.voice=Samantha
 blips.voice=$accuracy_irish
-them.voice=Samantha
-me.interjection.voice=Daniel
+echo.them.voice=Samantha
+echo.me.interjection.voice=Daniel
 quiet.filter=volume=0.08
-me.echo.filter=adelay=350|350,volume=0.25
-me.ref=only the genuine interjection; delayed speaker bleed is not new speech
+echo.me.filter=adelay=350|350,volume=0.25
+echo.files=echo.them.wav,echo.me.wav
+echo.ref=Them sentence followed by genuine Daniel interjection on its own line; speaker bleed excluded
 comparison=absolute WER includes TTS artefacts; only relative pipeline WER is claimed
 META
 
@@ -146,13 +147,30 @@ ff -i "$accuracy_tmp/them.wav" -i "$accuracy_tmp/me.wav" \
   -map '[out]' -ar 16000 -ac 1 -c:a pcm_s16le "$accuracy_tmp/me-mixed.wav"
 mv "$accuracy_tmp/me-mixed.wav" "$accuracy_tmp/me.wav"
 
-# Publish only the eight final wav/ref pairs (seven cases: echo has two sources).
+# One reference for the merged dual-source case: retain the Them sentence and
+# the genuine interjection exactly once. The mic copy is speaker bleed.
+cat "$accuracy_tmp/them.ref.txt" "$accuracy_tmp/me.ref.txt" > "$accuracy_tmp/echo.ref.txt"
+mv "$accuracy_tmp/them.wav" "$accuracy_tmp/echo.them.wav"
+mv "$accuracy_tmp/me.wav" "$accuracy_tmp/echo.me.wav"
+
+# Migrate the previous generator layout without leaving phantom single-source
+# cases. Keep the old generated fixtures in a subdirectory outside discovery.
+for accuracy_legacy in them.wav me.wav them.ref.txt me.ref.txt; do
+  if [[ -e "$accuracy_out/$accuracy_legacy" ]]; then
+    mkdir -p "$accuracy_out/legacy-standalone-echo"
+    mv "$accuracy_out/$accuracy_legacy" "$accuracy_out/legacy-standalone-echo/$accuracy_legacy"
+  fi
+done
+
+# Seven cases, eight WAVs: echo is a pair discovered from echo.ref.txt.
 # AIFFs and filter intermediates stay in the temporary build directory.
-for accuracy_case in names numbers code quiet seam blips them me; do
-  mv "$accuracy_tmp/$accuracy_case.wav" "$accuracy_out/$accuracy_case.wav"
+for accuracy_case in names numbers code quiet seam blips echo; do
   mv "$accuracy_tmp/$accuracy_case.ref.txt" "$accuracy_out/$accuracy_case.ref.txt"
-  accuracy_duration=$(duration "$accuracy_out/$accuracy_case.wav")
-  accuracy_peak=$(ffmpeg -hide_banner -nostdin -i "$accuracy_out/$accuracy_case.wav" -af volumedetect -f null - 2>&1 | awk '/max_volume:/ { print $(NF-1), $NF }')
-  printf '%s.wav duration=%ss peak=%s\n' "$accuracy_case" "$accuracy_duration" "$accuracy_peak"
+done
+for accuracy_audio in names numbers code quiet seam blips echo.them echo.me; do
+  mv "$accuracy_tmp/$accuracy_audio.wav" "$accuracy_out/$accuracy_audio.wav"
+  accuracy_duration=$(duration "$accuracy_out/$accuracy_audio.wav")
+  accuracy_peak=$(ffmpeg -hide_banner -nostdin -i "$accuracy_out/$accuracy_audio.wav" -af volumedetect -f null - 2>&1 | awk '/max_volume:/ { print $(NF-1), $NF }')
+  printf '%s.wav duration=%ss peak=%s\n' "$accuracy_audio" "$accuracy_duration" "$accuracy_peak"
 done
 mv "$accuracy_tmp/corpus.meta" "$accuracy_out/corpus.meta"
