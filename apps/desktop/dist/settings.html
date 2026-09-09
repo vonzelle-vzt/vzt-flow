@@ -103,6 +103,30 @@
     opacity: 0.7;
     word-break: break-all;
   }
+  #interview-context {
+    width: 100%;
+    box-sizing: border-box;
+    margin-top: 6px;
+    padding: 8px;
+    font: inherit;
+    line-height: 1.5;
+    resize: vertical;
+    border: 1px solid #c8c8cc;
+    border-radius: 6px;
+    background: white;
+    color: inherit;
+  }
+  .field-help { font-size: 11px; opacity: 0.7; line-height: 1.5; margin: 8px 0; }
+  .field-help code { overflow-wrap: anywhere; }
+  .save-indicator { font-size: 11px; color: #666; min-height: 16px; }
+  .save-indicator.error { color: #b42318; }
+  #meeting-pdf-dir { width: 100%; min-width: 0; padding: 6px 8px; border: 1px solid #c8c8cc; border-radius: 6px; font: inherit; }
+  .field-column { display: flex; flex-direction: column; align-items: stretch; gap: 6px; }
+  @media (prefers-color-scheme: dark) {
+    #interview-context { background: #1c1c1e; color: #f0f0f2; border-color: #444; }
+    .save-indicator { color: #aaa; }
+    .save-indicator.error { color: #ff9b92; }
+  }
 </style>
 </head>
 <body>
@@ -201,6 +225,28 @@
   <div class="card">
     <div style="opacity:0.75;">Bundle-id &rarr; mode/tone rules. Edit the file directly, then restart:</div>
     <div id="profiles-path" style="margin-top:4px;">(loading…)</div>
+  </div>
+
+  <h2>Interview mode</h2>
+  <div class="card">
+    <label for="interview-context">Interview context</label>
+    <textarea id="interview-context" rows="12" aria-describedby="interview-context-help interview-context-status" disabled></textarea>
+    <p id="interview-context-help" class="field-help">Paste your resume, the job description and talking points; used only by the local model, never sent anywhere.
+      Saved in <code>~/.config/vzt-flow/interview.md</code>.</p>
+    <div id="interview-context-status" class="save-indicator" role="status" aria-live="polite">Loading…</div>
+  </div>
+
+  <h2>Meetings</h2>
+  <div class="card">
+    <div class="row"><label class="checkbox"><input id="meeting-notepad" type="checkbox" disabled /> Open the notes window when a meeting starts</label></div>
+    <div class="row"><label class="checkbox"><input id="meeting-pdf" type="checkbox" disabled /> Write a PDF summary to the Desktop when a meeting ends</label></div>
+    <div class="row"><label class="checkbox"><input id="meeting-interview" type="checkbox" disabled /> Start meetings with interview coaching on</label></div>
+    <div class="row field-column">
+      <label for="meeting-pdf-dir">PDF folder</label>
+      <input id="meeting-pdf-dir" type="text" placeholder="Desktop" aria-describedby="meeting-pdf-dir-help" disabled />
+      <span id="meeting-pdf-dir-help" class="field-help">Leave blank to use the Desktop, or enter a different folder path.</span>
+    </div>
+    <div id="meeting-settings-status" class="save-indicator" role="status" aria-live="polite">Loading…</div>
   </div>
 
   <h2>History</h2>
