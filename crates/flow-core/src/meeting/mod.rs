@@ -11,8 +11,15 @@
 
 pub mod dedup;
 pub mod detect;
+pub mod events;
+pub mod interview;
+pub mod notes;
+pub mod pdf;
 pub mod pipeline;
+pub mod summary;
 pub mod transcriber;
+
+pub use events::*;
 
 #[cfg(target_os = "macos")]
 mod syscapture;
