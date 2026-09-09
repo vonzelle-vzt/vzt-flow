@@ -100,14 +100,42 @@ pub fn should_flush_chunk(
     has_speech: bool,
     trailing_silence_samples: usize,
     sample_rate: u32,
+    hold_secs: f32,
 ) -> bool {
     let sr = sample_rate.max(1) as f32;
     let max_samples = (CHUNK_MAX_SECS * sr) as usize;
     if buffered_samples >= max_samples {
         return true;
     }
-    let hold_samples = (SILENCE_HOLD_SECS * sr) as usize;
+    let hold_samples = (hold_secs * sr) as usize;
     has_speech && trailing_silence_samples >= hold_samples
+}
+
+/// Splits `body` into windows of at most `window_chars` characters for the
+/// hierarchical summarizer, splitting only on line boundaries so a single
+/// `Them:`/`Me:` line is never cut in half. A line longer than the window on
+/// its own becomes its own (over-budget) window rather than being split
+/// mid-line. Empty input yields an empty vec.
+pub fn split_for_summary(body: &str, window_chars: usize) -> Vec<String> {
+    let window_chars = window_chars.max(1);
+    let mut windows = Vec::new();
+    let mut current = String::new();
+
+    for line in body.lines() {
+        let line_len = line.chars().count();
+        let sep_len = if current.is_empty() { 0 } else { 1 };
+        if !current.is_empty() && current.chars().count() + sep_len + line_len > window_chars {
+            windows.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() {
+            current.push('\n');
+        }
+        current.push_str(line);
+    }
+    if !current.is_empty() {
+        windows.push(current);
+    }
+    windows
 }
 
 /// Returns the tail of `transcript` to feed the summarizer, plus whether it
@@ -159,6 +187,10 @@ pub struct StreamingChunker {
     /// leading silence that precedes speech so the timestamp marks when the
     /// speaker actually started, not when the buffer opened.
     chunk_start_offset: f32,
+    /// Trailing near-silence required to close a chunk at a natural pause,
+    /// per source. Defaults to [`SILENCE_HOLD_SECS`]; see
+    /// [`Self::set_silence_hold_secs`].
+    silence_hold_secs: f32,
 }
 
 impl StreamingChunker {
@@ -174,7 +206,16 @@ impl StreamingChunker {
             trailing_silence: 0,
             elapsed_samples: 0,
             chunk_start_offset: 0.0,
+            silence_hold_secs: SILENCE_HOLD_SECS,
         }
+    }
+
+    /// Overrides this chunker's trailing-silence hold, clamped to
+    /// `0.3..=3.0` seconds. Lets a per-source policy (e.g. a chattier
+    /// microphone vs. a system-audio feed with cross-talk) diverge from the
+    /// documented default without touching it for every caller.
+    pub fn set_silence_hold_secs(&mut self, secs: f32) {
+        self.silence_hold_secs = secs.clamp(0.3, 3.0);
     }
 
     /// Feeds a block of native-rate mono samples. Returns any chunks that
@@ -218,7 +259,13 @@ impl StreamingChunker {
         // Frames between the two thresholds neither arm speech nor extend the
         // silence run (hysteresis dead-band): they're just buffered.
 
-        if should_flush_chunk(self.buffer.len(), self.has_speech, self.trailing_silence, self.sample_rate) {
+        if should_flush_chunk(
+            self.buffer.len(),
+            self.has_speech,
+            self.trailing_silence,
+            self.sample_rate,
+            self.silence_hold_secs,
+        ) {
             return Some(self.take_chunk());
         }
         None
@@ -267,8 +314,8 @@ mod tests {
         // 1.2s of silence at 16kHz = 19200 samples; just at the bar flushes.
         let sr = 16_000;
         let hold = (SILENCE_HOLD_SECS * sr as f32) as usize;
-        assert!(should_flush_chunk(hold + 1000, true, hold, sr));
-        assert!(!should_flush_chunk(hold + 1000, true, hold - 1, sr)); // one sample short
+        assert!(should_flush_chunk(hold + 1000, true, hold, sr, SILENCE_HOLD_SECS));
+        assert!(!should_flush_chunk(hold + 1000, true, hold - 1, sr, SILENCE_HOLD_SECS)); // one sample short
     }
 
     #[test]
@@ -276,7 +323,7 @@ mod tests {
         let sr = 16_000;
         let hold = (SILENCE_HOLD_SECS * sr as f32) as usize;
         // Long silence run but no speech ever heard -> must not flush.
-        assert!(!should_flush_chunk(hold * 10, false, hold * 10, sr));
+        assert!(!should_flush_chunk(hold * 10, false, hold * 10, sr, SILENCE_HOLD_SECS));
     }
 
     #[test]
@@ -284,8 +331,8 @@ mod tests {
         let sr = 16_000;
         let max = (CHUNK_MAX_SECS * sr as f32) as usize;
         // No trailing silence, still speaking, but 30s buffered -> cap flush.
-        assert!(should_flush_chunk(max, true, 0, sr));
-        assert!(!should_flush_chunk(max - 1, true, 0, sr));
+        assert!(should_flush_chunk(max, true, 0, sr, SILENCE_HOLD_SECS));
+        assert!(!should_flush_chunk(max - 1, true, 0, sr, SILENCE_HOLD_SECS));
     }
 
     #[test]
@@ -368,5 +415,57 @@ mod tests {
         // ~2.3s of audio buffered (1s speech + 1.3s trailing silence).
         let dur = chunk.end_offset() - chunk.start_offset;
         assert!(dur > 2.0 && dur < 2.6, "duration {dur}");
+    }
+
+    #[test]
+    fn flush_hold_is_parameterised() {
+        let sr = 16_000;
+        let hold_at_0_8s = (0.8 * sr as f32) as usize;
+        assert!(should_flush_chunk(hold_at_0_8s + 1000, true, hold_at_0_8s, sr, 0.8));
+        assert!(!should_flush_chunk(hold_at_0_8s + 1000, true, hold_at_0_8s, sr, 1.2));
+    }
+
+    #[test]
+    fn default_hold_matches_the_documented_constant() {
+        let sr = 16_000;
+        let hold = (SILENCE_HOLD_SECS * sr as f32) as usize;
+        assert!(should_flush_chunk(hold, true, hold, sr, SILENCE_HOLD_SECS));
+        assert!(!should_flush_chunk(hold, true, hold - 1, sr, SILENCE_HOLD_SECS));
+    }
+
+    #[test]
+    fn split_never_breaks_a_line() {
+        let body = "Them: line one\nMe: line two\nThem: line three\n";
+        // Force a window small enough that each line must be its own window.
+        let windows = split_for_summary(body, 15);
+        for w in &windows {
+            for line in body.lines() {
+                if w.contains(line) {
+                    // The full line must appear intact, not a fragment of it.
+                    assert!(w.lines().any(|l| l == line), "line split: {w:?}");
+                }
+            }
+        }
+        // Reassembling the windows' lines in order reproduces every line.
+        let reassembled: Vec<&str> = windows.iter().flat_map(|w| w.lines()).collect();
+        let original: Vec<&str> = body.lines().collect();
+        assert_eq!(reassembled, original);
+    }
+
+    #[test]
+    fn split_returns_one_window_for_short_bodies() {
+        let body = "Them: hi\nMe: hello\n";
+        let windows = split_for_summary(body, 6_000);
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0], "Them: hi\nMe: hello");
+    }
+
+    #[test]
+    fn split_puts_an_over_long_line_in_its_own_window() {
+        let long_line = "Them: ".to_string() + &"x".repeat(100);
+        let body = format!("Me: short\n{long_line}\nMe: another short line");
+        let windows = split_for_summary(&body, 20);
+        // The over-long line must appear whole, in a window by itself.
+        assert!(windows.iter().any(|w| w == &long_line));
     }
 }
