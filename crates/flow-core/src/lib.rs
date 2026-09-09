@@ -6,6 +6,7 @@ pub mod codemode;
 pub mod config;
 pub mod dictionary;
 pub mod engine;
+pub mod eval;
 pub mod history;
 pub mod hotkey;
 pub mod insert;
