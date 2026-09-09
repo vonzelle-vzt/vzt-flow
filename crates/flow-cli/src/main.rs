@@ -42,6 +42,22 @@ enum Commands {
         /// Output directory. Defaults to ~/Documents/vzt-flow/meetings/.
         #[arg(long)]
         out: Option<std::path::PathBuf>,
+        /// Enable the live interview coach (question-triggered talking-point
+        /// tips on stderr). Defaults to the config's `meeting_interview`.
+        #[arg(long)]
+        interview: bool,
+        /// Seed the live notes sidecar from an existing text file before the
+        /// session starts; its contents are merged into the transcript on stop.
+        #[arg(long)]
+        notes: Option<std::path::PathBuf>,
+        /// Skip the end-of-meeting PDF export, overriding the config's
+        /// `meeting_pdf`.
+        #[arg(long)]
+        no_pdf: bool,
+        /// Directory the PDF is written to. Defaults to the config's
+        /// `meeting_pdf_dir` (or the Desktop when that's unset).
+        #[arg(long)]
+        pdf_dir: Option<std::path::PathBuf>,
         #[command(subcommand)]
         action: Option<MeetingAction>,
     },
@@ -133,9 +149,9 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         Commands::Listen { mode, max_secs } => commands::listen::run(mode, max_secs),
         Commands::Transcribe { file, mode } => commands::transcribe::run(&file, mode.as_deref()),
-        Commands::Meeting { title, out, action } => match action {
+        Commands::Meeting { title, out, interview, notes, no_pdf, pdf_dir, action } => match action {
             Some(MeetingAction::List { n }) => commands::meeting::list(n),
-            None => commands::meeting::run(title, out),
+            None => commands::meeting::run(title, out, interview, notes, no_pdf, pdf_dir),
         },
         Commands::Models { action } => match action {
             ModelsAction::Download { model, force } => commands::models::download(&model, force),
@@ -150,6 +166,44 @@ fn main() -> anyhow::Result<()> {
         Commands::CodeTest { text } => commands::code_test::run(&text),
         Commands::RollingTest { file, speed, skip_batch } => {
             commands::rolling_test::run(&file, speed, skip_batch)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// Catches clap definition errors (conflicting args, bad defaults, etc.)
+    /// at test time rather than only when a user hits the broken path.
+    #[test]
+    fn cli_definition_is_valid() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn meeting_companion_flags_parse() {
+        let cli = Cli::try_parse_from([
+            "flow",
+            "meeting",
+            "--interview",
+            "--no-pdf",
+            "--pdf-dir",
+            "/tmp",
+            "--notes",
+            "/tmp/x",
+        ])
+        .expect("flags should parse");
+
+        match cli.command {
+            Commands::Meeting { interview, no_pdf, pdf_dir, notes, .. } => {
+                assert!(interview);
+                assert!(no_pdf);
+                assert_eq!(pdf_dir, Some(std::path::PathBuf::from("/tmp")));
+                assert_eq!(notes, Some(std::path::PathBuf::from("/tmp/x")));
+            }
+            _ => panic!("expected Commands::Meeting"),
         }
     }
 }
