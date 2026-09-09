@@ -17,8 +17,11 @@
 //! Usage:
 //!
 //! ```text
-//! cargo run --release --example meeting_replay -- --corpus <dir> [--json]
+//! cargo run --release --example meeting_replay -- --corpus <dir> [--legacy | --enable <names> | --disable <names>] [--emit-hyp <dir>] [--json]
 //! ```
+//!
+//! Legacy disables pipeline accuracy options, but still uses the B1 chunker.
+//! Emitted hypotheses include LineBuffer hold/release and late-Them vetoes.
 //!
 //! `<dir>` contains, per case, either:
 //!   - `<name>.wav` + `<name>.ref.txt` (single-source case), or
@@ -42,7 +45,7 @@ use anyhow::{Context, Result};
 use flow_core::dictionary;
 use flow_core::engine::{ParakeetTranscriber, Transcriber};
 use flow_core::eval;
-use flow_core::meeting::pipeline::{ChunkPipeline, Decision, SkipReason};
+use flow_core::meeting::pipeline::{ChunkPipeline, Decision, LineBuffer, PipelineOptions, SkipReason};
 use flow_core::meeting::transcriber::{Source, StreamingChunker};
 use flow_core::models;
 
@@ -178,6 +181,7 @@ fn run_case(
     case: &Case,
     transcriber: &mut ParakeetTranscriber,
     dict: &Arc<Vec<dictionary::DictionaryTerm>>,
+    opts: PipelineOptions,
 ) -> Result<CaseResult> {
     // Gather every chunk this case will feed the pipeline, in the order the
     // pipeline should see them.
@@ -215,7 +219,9 @@ fn run_case(
         }
     }
 
-    let mut pipeline = ChunkPipeline::new(Arc::clone(dict));
+    let mut pipeline = ChunkPipeline::with_options(Arc::clone(dict), opts);
+    let mut buffer = LineBuffer::new(opts);
+    let mut emitted_before_buffer = 0usize;
     let mut lines: Vec<Line> = Vec::new();
     let mut dropped_echo = 0usize;
     let mut skipped = 0usize;
@@ -224,11 +230,8 @@ fn run_case(
         let decision = pipeline.process(chunk, |samples| {
             transcriber.transcribe(samples).map(|t| t.text)
         });
-        match decision {
-            Decision::Emit { start, source, text } => {
-                println!("  [{start:>7.2}s {}] {text}", source.label());
-                lines.push(Line { start, source, text });
-            }
+        match &decision {
+            Decision::Emit { .. } => emitted_before_buffer += 1,
             Decision::DroppedEcho(text) => {
                 println!("  [dropped echo] {text}");
                 dropped_echo += 1;
@@ -238,6 +241,8 @@ fn run_case(
                     SkipReason::NoSpeech => "no-speech",
                     SkipReason::EmptySamples => "empty-samples",
                     SkipReason::EmptyText => "empty-text",
+                    SkipReason::TooShort => "too-short",
+                    SkipReason::LowInformation => "low-information",
                 };
                 println!("  [skipped: {why}]");
                 skipped += 1;
@@ -247,6 +252,19 @@ fn run_case(
                 skipped += 1;
             }
         }
+        let now_offset = chunk.start_offset + chunk.samples.len() as f32 / chunk.sample_rate as f32;
+        lines.extend(buffer.push(decision, now_offset).into_iter()
+            .map(|(start, source, text)| Line { start, source, text }));
+    }
+    lines.extend(buffer.drain_all().into_iter()
+        .map(|(start, source, text)| Line { start, source, text }));
+    let late_dropped = emitted_before_buffer - lines.len();
+    dropped_echo += late_dropped;
+    if late_dropped > 0 {
+        println!("  [late-Them veto] dropped_echo={late_dropped}");
+    }
+    for line in &lines {
+        println!("  [{:>7.2}s {}] {}", line.start, line.source.label(), line.text);
     }
 
     let hypothesis = lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join(" ");
@@ -255,24 +273,66 @@ fn run_case(
     Ok(CaseResult { report, lines: lines.len(), dropped_echo, skipped, hypothesis })
 }
 
-fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().collect();
-    let mut corpus_dir: Option<PathBuf> = None;
+struct Args {
+    corpus_dir: PathBuf,
+    json: bool,
+    emit_hyp: Option<PathBuf>,
+    opts: PipelineOptions,
+}
+
+fn set_option(opts: &mut PipelineOptions, name: &str, on: bool) -> Result<()> {
+    match name {
+        "min_speech" => opts.min_speech = on,
+        "normalize" => opts.normalize = on,
+        "seam_dedup" => opts.seam_dedup = on,
+        "low_information" => opts.low_information = on,
+        "echo_tolerance" => opts.echo_tolerance = on,
+        "echo_containment" => opts.echo_containment = on,
+        "echo_fuzzy" => opts.echo_fuzzy = on,
+        _ => anyhow::bail!("unknown pipeline option: {name}"),
+    }
+    Ok(())
+}
+
+fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args> {
+    let mut args = args.into_iter();
+    let mut corpus_dir = None;
+    let mut emit_hyp = None;
     let mut json = false;
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--corpus" => {
-                i += 1;
-                corpus_dir = args.get(i).map(PathBuf::from);
-            }
+    let mut legacy = false;
+    let mut enabled = Vec::new();
+    let mut disabled = Vec::new();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--corpus" => corpus_dir = Some(PathBuf::from(args.next().context("--corpus needs a directory")?)),
+            "--emit-hyp" => emit_hyp = Some(PathBuf::from(args.next().context("--emit-hyp needs a directory")?)),
             "--json" => json = true,
+            "--legacy" => legacy = true,
+            "--enable" | "--disable" => {
+                let names = args.next().with_context(|| format!("{arg} needs option names"))?;
+                let target = if arg == "--enable" { &mut enabled } else { &mut disabled };
+                target.extend(names.split(',').map(str::to_owned));
+            }
             other => anyhow::bail!("unrecognized argument: {other}"),
         }
-        i += 1;
     }
-    let corpus_dir = corpus_dir
-        .context("usage: cargo run --release --example meeting_replay -- --corpus <dir> [--json]")?;
+    anyhow::ensure!(disabled.is_empty() || (!legacy && enabled.is_empty()),
+        "--disable uses defaults; cannot combine with --legacy or --enable");
+    let mut opts = if legacy || !enabled.is_empty() { PipelineOptions::legacy() } else { PipelineOptions::default() };
+    for name in enabled { set_option(&mut opts, &name, true)?; }
+    for name in disabled { set_option(&mut opts, &name, false)?; }
+    Ok(Args {
+        corpus_dir: corpus_dir.context("usage: meeting_replay --corpus <dir> [--legacy | --enable <names> | --disable <names>] [--emit-hyp <dir>] [--json]")?,
+        json, emit_hyp, opts,
+    })
+}
+
+fn main() -> Result<()> {
+    let Args { corpus_dir, json, emit_hyp, opts } = parse_args(std::env::args().skip(1))?;
+    println!("# meeting_replay chunker=B1 (not toggleable) min_speech={} normalize={} seam_dedup={} low_information={} echo_tolerance={} echo_containment={} echo_fuzzy={}",
+        opts.min_speech, opts.normalize, opts.seam_dedup, opts.low_information,
+        opts.echo_tolerance, opts.echo_containment, opts.echo_fuzzy);
+    if let Some(dir) = &emit_hyp { std::fs::create_dir_all(dir)?; }
 
     let dict = Arc::new(dictionary::load_or_seed().unwrap_or_default());
     eprintln!("dictionary  : {} terms", dict.len());
@@ -294,7 +354,10 @@ fn main() -> Result<()> {
 
     for case in &cases {
         println!("=== {} ===", case.name);
-        let result = run_case(case, &mut transcriber, &dict)?;
+        let result = run_case(case, &mut transcriber, &dict, opts)?;
+        if let Some(dir) = &emit_hyp {
+            std::fs::write(dir.join(format!("{}.hyp.txt", case.name)), format!("{}\n", result.hypothesis))?;
+        }
         let wer = result.report.wer();
 
         println!(
@@ -355,4 +418,38 @@ fn main() -> Result<()> {
     // normally rather than via process exit.
     drop(transcriber);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(flags: &[&str]) -> Result<Args> {
+        parse_args(["--corpus", "/tmp/corpus"].into_iter().chain(flags.iter().copied()).map(str::to_owned))
+    }
+
+    #[test]
+    fn enable_starts_from_legacy_and_is_independent_of_flag_order() {
+        for flags in [vec!["--enable", "normalize,echo_fuzzy", "--legacy"], vec!["--enable", "normalize,echo_fuzzy"]] {
+            let opts = args(&flags).unwrap().opts;
+            assert!(opts.normalize && opts.echo_fuzzy);
+            assert!(!opts.min_speech && !opts.seam_dedup && !opts.low_information && !opts.echo_tolerance && !opts.echo_containment);
+        }
+    }
+
+    #[test]
+    fn disable_starts_from_defaults() {
+        let opts = args(&["--disable", "echo_fuzzy"]).unwrap().opts;
+        assert!(!opts.echo_fuzzy);
+        assert!(opts.min_speech && opts.normalize && opts.seam_dedup && opts.low_information && opts.echo_tolerance && opts.echo_containment);
+    }
+
+    #[test]
+    fn ambiguous_or_invalid_flags_are_rejected() {
+        assert!(args(&["--enable", "typo"]).is_err());
+        assert!(args(&["--legacy", "--disable", "normalize"]).is_err());
+        assert!(args(&["--enable", "normalize", "--disable", "echo_fuzzy"]).is_err());
+        assert!(args(&["--emit-hyp"]).is_err());
+        assert!(args(&["--enable", ""]).is_err());
+    }
 }
