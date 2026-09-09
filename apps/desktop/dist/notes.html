@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>VZT Flow — Meeting notes</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
+    font-size: 13px;
+    color: #1c1c1e;
+    background: #f2f2f5;
+    padding: 16px;
+    height: 100vh;
+    box-sizing: border-box;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    overflow: auto;
+  }
+  @media (prefers-color-scheme: dark) {
+    body { color: #f0f0f2; background: #1c1c1e; }
+    .card { background: #2a2a2d !important; border-color: #3a3a3d !important; }
+    input, select { background: #1c1c1e !important; color: #f0f0f2 !important; border-color: #444 !important; }
+  }
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  header { display: flex; align-items: flex-start; gap: 12px; }
+  .meeting { flex: 1; min-width: 0; }
+  h1 { font-size: 15px; margin: 0 0 8px; overflow-wrap: anywhere; }
+  .meta { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; font-size: 11px; }
+  #elapsed { font-variant-numeric: tabular-nums; }
+  #state { border-radius: 20px; padding: 3px 8px; background: rgba(128,128,128,.14); }
+  #state[data-kind="recording"] { color: #a12b20; background: rgba(255,69,58,.12); }
+  .toggle { display: flex; align-items: center; gap: 5px; white-space: nowrap; }
+  .card { background: white; border: 1px solid #e0e0e3; border-radius: 10px; padding: 12px 14px; }
+  #tips { max-height: 32vh; overflow: auto; flex-shrink: 0; }
+  #tips.stale { opacity: .5; }
+  h2 { font-size: 12px; margin: 0 0 8px; }
+  #tip-headline { margin: 0; font-weight: 600; overflow-wrap: anywhere; }
+  #tip-bullets { padding-left: 18px; margin: 8px 0; }
+  #tip-bullets li { margin: 5px 0; overflow-wrap: anywhere; }
+  #tip-freshness { font-size: 11px; opacity: .7; margin: 8px 0 0; }
+  .editor { flex: 1; min-height: 140px; display: flex; flex-direction: column; gap: 6px; }
+  .editor label { font-size: 12px; font-weight: 600; }
+  textarea { flex: 1; min-height: 110px; width: 100%; resize: none; border: 1px solid #e0e0e3; border-radius: 10px; padding: 12px; font: inherit; line-height: 1.5; color: inherit; background: white; }
+  textarea:focus-visible, button:focus-visible, input:focus-visible, summary:focus-visible { outline: 2px solid #147bd1; outline-offset: 2px; }
+  details { flex-shrink: 0; }
+  summary { cursor: pointer; font-size: 12px; }
+  #transcript { max-height: 120px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; line-height: 1.5; margin-top: 8px; }
+  footer { flex-shrink: 0; font-size: 11px; }
+  #save-row { display: flex; align-items: center; gap: 8px; }
+  #save-status { flex: 1; color: #666; overflow-wrap: anywhere; }
+  #save-status.error, #operation-error { color: #b42318; }
+  #save-status.edited { color: #8a5300; }
+  #operation-error { margin: 6px 0; overflow-wrap: anywhere; }
+  #files { display: flex; gap: 12px; margin-top: 8px; flex-wrap: wrap; }
+  button { font: inherit; border: 1px solid #c8c8cc; border-radius: 6px; padding: 5px 10px; background: #fafafa; cursor: pointer; }
+  button:disabled { cursor: default; opacity: .5; }
+  .link { background: none; color: #086bb9; border: 0; padding: 2px 0; text-decoration: underline; }
+  @media (prefers-color-scheme: dark) {
+    textarea { background: #2a2a2d; border-color: #444; }
+    button { background: #333; color: #eee; border-color: #555; }
+    .link { background: none; color: #81bcff; }
+    #save-status { color: #aaa; }
+    #save-status.error, #operation-error { color: #ff9b92; }
+    #save-status.edited { color: #ffd18b; }
+    #state[data-kind="recording"] { color: #ff9b92; }
+  }
+</style>
+</head>
+<body>
+  <header>
+    <div class="meeting"><h1 id="title">Meeting notes</h1><div class="meta"><span id="elapsed">00:00</span><span id="state" role="status">Waiting for a meeting</span></div></div>
+    <label class="toggle"><input id="interview" type="checkbox" role="switch" disabled /> Interview</label>
+  </header>
+  <section id="tips" class="card" aria-label="Interview coaching" hidden>
+    <h2>Interview coach</h2><p id="tip-headline">Tips will appear after a question.</p><ul id="tip-bullets"></ul><p id="tip-freshness"></p>
+  </section>
+  <div class="editor"><label for="notes">Your notes</label><textarea id="notes" placeholder="Capture decisions, questions, and next steps…" disabled></textarea></div>
+  <details><summary>Live transcript</summary><div id="transcript">No transcript yet.</div></details>
+  <footer>
+    <div id="save-row"><span id="save-status" role="status" aria-live="polite">Waiting for a meeting</span><button id="update-files" hidden>Update files</button></div>
+    <p id="operation-error" role="alert" hidden></p>
+    <div id="files" hidden><button id="open-transcript" class="link" hidden>Open transcript</button><button id="open-pdf" class="link" hidden>Open PDF</button></div>
+  </footer>
+  <script src="notes.js"></script>
+</body>
+</html>
