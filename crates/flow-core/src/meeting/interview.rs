@@ -324,9 +324,9 @@ pub struct CoachConfig {
 impl Default for CoachConfig {
     fn default() -> Self {
         Self {
-            timeout_ms: 3500,
+            timeout_ms: 5000,
             max_new_tokens: 90,
-            context_max_chars: 4800,
+            context_max_chars: 2400,
             history_them: 3,
             history_me: 2,
         }
