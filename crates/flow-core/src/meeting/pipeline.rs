@@ -147,6 +147,7 @@ mod tests {
             sample_rate,
             start_offset: start,
             has_speech: true,
+            ..Default::default()
         }
     }
 

@@ -6,8 +6,11 @@
 //! Each capture source (system audio, microphone) owns its own
 //! [`StreamingChunker`], fed blocks of native-rate mono `f32` as they arrive.
 //! The chunker decides when a contiguous span of speech has ended — a
-//! trailing run of near-silence, or a hard 30s cap — and emits it as a
-//! [`Chunk`] to be transcribed. Working at the source's native sample rate
+//! trailing run of near-silence, or the hard 30s cap — and emits it as a
+//! [`Chunk`] to be transcribed. At the cap the cut lands at the quietest
+//! frame of the last few seconds ([`plan_cap_cut`]) rather than exactly on
+//! the boundary, and the audio after that cut is *retained* for the next
+//! chunk instead of dropped. Working at the source's native sample rate
 //! (rather than resampling every incoming block) keeps the audio path free of
 //! per-block resampling artifacts; the flushed chunk is resampled to 16 kHz
 //! once, by the caller, right before it goes to Parakeet.
@@ -36,6 +39,22 @@ pub const SILENCE_RMS_THRESHOLD: f32 = 0.006;
 /// Frame granularity for RMS analysis (~100ms), matching the dictation
 /// path's VAD frame size in `audio.rs`.
 pub const FRAME_SECS: f32 = 0.1;
+
+/// Offset from a chunk's start at which the cap-cut search window opens.
+/// Mirrors `chunking::CUT_WINDOW_MIN_SECS`'s role for the batch path: at the
+/// 30s cap we would rather cut at the quietest moment of the last ~6s than
+/// exactly on the boundary, which lands mid-word.
+pub const CHUNK_CUT_WINDOW_MIN_SECS: f32 = 24.0;
+
+/// Overlap re-fed into the next chunk after a hard (no-quiet-frame) cap cut,
+/// so a word straddling the boundary is captured whole by one side. The
+/// repeated words are removed with `chunking::dedup_seam`.
+pub const CHUNK_OVERLAP_SECS: f32 = 1.0;
+
+/// Minimum above-threshold speech in a chunk before it is worth transcribing.
+/// A sub-0.3s blip (door, keyboard, mouse click) is not a word, and Parakeet
+/// answers noise with hallucinated filler.
+pub const MIN_SPEECH_SECS: f32 = 0.3;
 
 /// Which capture source a chunk came from — labels the transcript line and
 /// selects the dedup direction (only `Me` chunks are ever dropped as echoes).
@@ -74,6 +93,32 @@ pub struct Chunk {
     /// flushed purely by the 30s cap during dead air carries `false`, and the
     /// worker skips transcribing it rather than emit an empty line.
     pub has_speech: bool,
+    /// Total duration (seconds) of frames that cleared the speech threshold.
+    /// `has_speech == speech_secs > 0.0` — kept as a separate field so the
+    /// caller can apply a minimum-length gate ([`MIN_SPEECH_SECS`]) without
+    /// re-analysing audio.
+    pub speech_secs: f32,
+    /// Whether this chunk's leading words duplicate the previous chunk's
+    /// trailing words (it began inside a hard cap cut's overlap) and must be
+    /// seam-deduped against them with `chunking::dedup_seam`.
+    pub seam_dedup: bool,
+}
+
+impl Default for Chunk {
+    /// An empty `Them` chunk at 16 kHz. Exists so a caller can construct one
+    /// with `..Default::default()` and keep compiling as fields are added —
+    /// `speech_secs` and `seam_dedup` arrived after the first consumers.
+    fn default() -> Self {
+        Self {
+            source: Source::Them,
+            samples: Vec::new(),
+            sample_rate: 16_000,
+            start_offset: 0.0,
+            has_speech: false,
+            speech_secs: 0.0,
+            seam_dedup: false,
+        }
+    }
 }
 
 impl Chunk {
@@ -109,6 +154,52 @@ pub fn should_flush_chunk(
     }
     let hold_samples = (hold_secs * sr) as usize;
     has_speech && trailing_silence_samples >= hold_samples
+}
+
+/// Whether a cap cut landed in silence (the chunks concatenate cleanly) or
+/// mid-speech (the next chunk overlaps and must be seam-deduped). Mirrors
+/// `chunking::CutKind` for the streaming path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapCut {
+    /// Cut just after a quiet frame — nothing is repeated across the seam.
+    Silence,
+    /// No quiet frame in the window: cut at the cap, hand the following chunk
+    /// a [`CHUNK_OVERLAP_SECS`] overlap and let `dedup_seam` clean it up.
+    Hard,
+}
+
+/// Where a capped chunk should end, given one energy value per ~100ms frame.
+/// Scans frames from [`CHUNK_CUT_WINDOW_MIN_SECS`] onward for the quietest; if
+/// it is below [`SILENCE_RMS_THRESHOLD`] the cut lands just after it
+/// ([`CapCut::Silence`], clean concatenation), otherwise the window is
+/// continuous speech and we cut at the cap with an overlap ([`CapCut::Hard`]).
+/// Pure, so the policy is testable with synthetic energy profiles — the same
+/// separation `chunking::plan_cut` uses.
+pub fn plan_cap_cut(frame_energies: &[f32]) -> (usize, CapCut) {
+    let hard_cut = frame_energies.len();
+    let win_start = (CHUNK_CUT_WINDOW_MIN_SECS / FRAME_SECS) as usize;
+    if win_start >= hard_cut {
+        // Shorter than the search window (only reachable if the cap itself is
+        // reduced) — there is nowhere to look, so cut at the end.
+        return (hard_cut, CapCut::Hard);
+    }
+
+    let mut best_rms = f32::INFINITY;
+    let mut best_at = hard_cut;
+    for (idx, &energy) in frame_energies.iter().enumerate().skip(win_start) {
+        if energy < best_rms {
+            best_rms = energy;
+            // Cut *after* the quiet frame so the silence closes the emitted
+            // chunk rather than opening the next one.
+            best_at = idx + 1;
+        }
+    }
+
+    if best_rms < SILENCE_RMS_THRESHOLD {
+        (best_at, CapCut::Silence)
+    } else {
+        (hard_cut, CapCut::Hard)
+    }
 }
 
 /// Splits `body` into windows of at most `window_chars` characters for the
@@ -191,6 +282,18 @@ pub struct StreamingChunker {
     /// per source. Defaults to [`SILENCE_HOLD_SECS`]; see
     /// [`Self::set_silence_hold_secs`].
     silence_hold_secs: f32,
+    /// RMS of every buffered frame, in order — `buffer` is exactly
+    /// `frame_energies.len() * frame_samples` samples long. Stored so the cap
+    /// cut is a pure decision over energies ([`plan_cap_cut`]) and so the
+    /// retained tail's `has_speech` / `trailing_silence` can be re-derived
+    /// without re-analysing audio.
+    frame_energies: Vec<f32>,
+    /// How many buffered frames cleared [`SPEECH_RMS_THRESHOLD`] — the
+    /// numerator of [`Chunk::speech_secs`].
+    speech_frames: usize,
+    /// Whether the *next* emitted chunk begins inside the previous chunk's
+    /// hard-cut overlap and therefore needs a seam dedup.
+    pending_seam_dedup: bool,
 }
 
 impl StreamingChunker {
@@ -207,6 +310,9 @@ impl StreamingChunker {
             elapsed_samples: 0,
             chunk_start_offset: 0.0,
             silence_hold_secs: SILENCE_HOLD_SECS,
+            frame_energies: Vec::new(),
+            speech_frames: 0,
+            pending_seam_dedup: false,
         }
     }
 
@@ -248,10 +354,12 @@ impl StreamingChunker {
         }
 
         self.buffer.extend_from_slice(frame);
+        self.frame_energies.push(energy);
         self.elapsed_samples += frame.len() as u64;
 
         if is_speech {
             self.has_speech = true;
+            self.speech_frames += 1;
             self.trailing_silence = 0;
         } else if energy < SILENCE_RMS_THRESHOLD {
             self.trailing_silence += frame.len();
@@ -266,7 +374,15 @@ impl StreamingChunker {
             self.sample_rate,
             self.silence_hold_secs,
         ) {
-            return Some(self.take_chunk());
+            // `should_flush_chunk` decides *whether* to close the chunk; at the
+            // cap, `plan_cap_cut` decides *where*.
+            let at_cap = self.buffer.len()
+                >= (CHUNK_MAX_SECS * self.sample_rate as f32) as usize;
+            return Some(if at_cap {
+                self.take_capped_chunk()
+            } else {
+                self.take_chunk()
+            });
         }
         None
     }
@@ -280,20 +396,129 @@ impl StreamingChunker {
         Some(self.take_chunk())
     }
 
+    /// Emits the whole buffer — the natural-pause and end-of-meeting path,
+    /// where nothing is retained.
     fn take_chunk(&mut self) -> Chunk {
         let samples = std::mem::take(&mut self.buffer);
+        let speech_secs = self.frames_to_secs(self.speech_frames);
         let chunk = Chunk {
             source: self.source,
             samples,
             sample_rate: self.sample_rate,
             start_offset: self.chunk_start_offset,
             has_speech: self.has_speech,
+            speech_secs,
+            seam_dedup: self.pending_seam_dedup,
         };
         // Reset for the next span; the next buffered sample sets the offset.
+        self.frame_energies.clear();
+        self.speech_frames = 0;
+        self.pending_seam_dedup = false;
         self.has_speech = false;
         self.trailing_silence = 0;
         self.chunk_start_offset = self.elapsed_samples as f32 / self.sample_rate as f32;
         chunk
+    }
+
+    /// Emits a chunk at the 30s cap, cutting at the quietest frame of the
+    /// search window instead of exactly on the boundary and *retaining* the
+    /// audio past the cut for the next chunk (plus a [`CHUNK_OVERLAP_SECS`]
+    /// overlap when there was no quiet frame to cut at).
+    ///
+    /// The offset arithmetic is the load-bearing part: `chunk_start_offset`
+    /// must stay the true meeting offset of `buffer[0]`, so it advances by
+    /// exactly the frames that leave the buffer — the ones before the retain
+    /// point, then any leading silence trimmed off the retained tail.
+    fn take_capped_chunk(&mut self) -> Chunk {
+        if self.frame_energies.is_empty() {
+            // Unreachable with real capture (the cap needs 30s of frames
+            // buffered) — fall back rather than index into nothing.
+            return self.take_chunk();
+        }
+
+        let (cut_frame, kind) = plan_cap_cut(&self.frame_energies);
+        let cut_frame = cut_frame.clamp(1, self.frame_energies.len());
+        let overlap_frames = match kind {
+            // A silence cut concatenates cleanly: nothing to repeat.
+            CapCut::Silence => 0,
+            CapCut::Hard => {
+                ((CHUNK_OVERLAP_SECS / FRAME_SECS).round() as usize).min(cut_frame)
+            }
+        };
+        let retain_from = cut_frame - overlap_frames;
+
+        // What goes out: everything up to the cut. `has_speech` and
+        // `speech_secs` describe the *emitted* frames, not the buffer.
+        let emitted_speech = self.frame_energies[..cut_frame]
+            .iter()
+            .filter(|e| **e >= SPEECH_RMS_THRESHOLD)
+            .count();
+        let speech_secs = self.frames_to_secs(emitted_speech);
+        let chunk = Chunk {
+            source: self.source,
+            samples: self.buffer[..cut_frame * self.frame_samples].to_vec(),
+            sample_rate: self.sample_rate,
+            start_offset: self.chunk_start_offset,
+            has_speech: emitted_speech > 0,
+            speech_secs,
+            seam_dedup: self.pending_seam_dedup,
+        };
+
+        // What stays: the tail from `retain_from` on (the overlap included).
+        self.buffer.drain(..retain_from * self.frame_samples);
+        self.frame_energies.drain(..retain_from);
+        self.chunk_start_offset += self.frames_to_secs(retain_from);
+
+        // Normalise the retained tail with the same leading-silence rule
+        // `push_frame` applies to a fresh buffer: the offset marks speech
+        // onset, not when the buffer happened to open.
+        match self
+            .frame_energies
+            .iter()
+            .position(|e| *e >= SPEECH_RMS_THRESHOLD)
+        {
+            Some(first_speech) => {
+                self.buffer.drain(..first_speech * self.frame_samples);
+                self.frame_energies.drain(..first_speech);
+                self.chunk_start_offset += self.frames_to_secs(first_speech);
+            }
+            None => {
+                // Nothing but silence after the cut — retaining it would only
+                // pin the next chunk's timestamp back here. Drop it and reopen
+                // at "now", exactly as the leading-silence arm does.
+                self.buffer.clear();
+                self.frame_energies.clear();
+                self.chunk_start_offset =
+                    self.elapsed_samples as f32 / self.sample_rate as f32;
+            }
+        }
+
+        // Re-derive the running state from the retained energies (no re-RMS),
+        // replaying `push_frame`'s rules: speech resets the silence run, a
+        // dead-band frame leaves it alone.
+        let mut speech_frames = 0usize;
+        let mut trailing_silence = 0usize;
+        for &energy in &self.frame_energies {
+            if energy >= SPEECH_RMS_THRESHOLD {
+                speech_frames += 1;
+                trailing_silence = 0;
+            } else if energy < SILENCE_RMS_THRESHOLD {
+                trailing_silence += self.frame_samples;
+            }
+        }
+        self.speech_frames = speech_frames;
+        self.has_speech = speech_frames > 0;
+        self.trailing_silence = trailing_silence;
+        self.pending_seam_dedup = matches!(kind, CapCut::Hard);
+
+        chunk
+    }
+
+    /// Duration of `frames` whole analysis frames. Derived from the frame's
+    /// real sample count rather than [`FRAME_SECS`] so the offset arithmetic
+    /// stays exact at capture rates where `FRAME_SECS * sample_rate` truncates.
+    fn frames_to_secs(&self, frames: usize) -> f32 {
+        (frames * self.frame_samples) as f32 / self.sample_rate as f32
     }
 }
 
@@ -467,5 +692,188 @@ mod tests {
         let windows = split_for_summary(&body, 20);
         // The over-long line must appear whole, in a window by itself.
         assert!(windows.iter().any(|w| w == &long_line));
+    }
+
+    #[test]
+    fn plan_cap_cut_picks_the_quiet_frame_in_the_window() {
+        // 30s of loud frames with one quiet frame at 27.0s — inside the window.
+        let mut energies = vec![0.3_f32; 300];
+        energies[270] = 0.001;
+        let (cut, kind) = plan_cap_cut(&energies);
+        assert_eq!(kind, CapCut::Silence);
+        assert_eq!(cut, 271, "the cut lands just after the quiet frame");
+    }
+
+    #[test]
+    fn plan_cap_cut_ignores_a_quiet_frame_before_the_window() {
+        // The only quiet frame is at 10.0s: cutting there would throw away 20s
+        // of speech, so the window (24s+) must not see it.
+        let mut energies = vec![0.3_f32; 300];
+        energies[100] = 0.001;
+        let (cut, kind) = plan_cap_cut(&energies);
+        assert_eq!(kind, CapCut::Hard);
+        assert_eq!(cut, energies.len());
+    }
+
+    #[test]
+    fn plan_cap_cut_hard_cuts_continuous_speech() {
+        let energies = vec![0.3_f32; 300];
+        let (cut, kind) = plan_cap_cut(&energies);
+        assert_eq!(kind, CapCut::Hard);
+        assert_eq!(cut, 300);
+    }
+
+    #[test]
+    fn cap_cut_at_a_pause_retains_the_tail_and_keeps_offsets_monotonic() {
+        let mut c = StreamingChunker::new(Source::Them, 16_000);
+        // 27s of speech, a 0.3s breath (far short of the 1.2s hold), then more
+        // speech — so the 30s cap, not the pause, closes the chunk.
+        assert!(c.push(&block(27.0, 0.3)).is_empty());
+        assert!(c.push(&block(0.3, 0.0)).is_empty());
+        let chunks = c.push(&block(5.0, 0.3));
+        assert_eq!(chunks.len(), 1);
+
+        let first = &chunks[0];
+        let dur = first.end_offset() - first.start_offset;
+        // Cut at the breath (~27.1s), not mid-word on the 30s boundary.
+        assert!((27.0..27.5).contains(&dur), "duration {dur}");
+        assert!(!first.seam_dedup, "a silence cut repeats nothing");
+
+        // The retained tail keeps the clock exact: the next chunk starts where
+        // speech resumed after the breath, ~27.3s in.
+        let tail = c.flush().expect("the retained tail should flush at stop");
+        assert!(
+            tail.start_offset >= first.start_offset,
+            "start offsets went backwards: {} after {}",
+            tail.start_offset,
+            first.start_offset
+        );
+        assert!(
+            (tail.start_offset - 27.3).abs() < 0.15,
+            "start offset {}",
+            tail.start_offset
+        );
+        assert!(!tail.seam_dedup);
+    }
+
+    #[test]
+    fn hard_cap_cut_overlaps_and_flags_the_next_chunk() {
+        let mut c = StreamingChunker::new(Source::Me, 16_000);
+        // 60s without a single quiet frame: both caps must hard-cut.
+        let chunks = c.push(&block(60.0, 0.3));
+        assert_eq!(chunks.len(), 2, "expected two capped chunks");
+        assert!(!chunks[0].seam_dedup, "the first chunk overlaps nothing");
+        assert!(
+            chunks[1].seam_dedup,
+            "a hard cut hands its overlap to the next chunk"
+        );
+        // The second chunk re-reads the last second of the first.
+        let expected = chunks[0].end_offset() - CHUNK_OVERLAP_SECS;
+        assert!(
+            (chunks[1].start_offset - expected).abs() < 0.05,
+            "start offset {} expected {expected}",
+            chunks[1].start_offset
+        );
+    }
+
+    #[test]
+    fn chunk_reports_speech_seconds() {
+        let mut c = StreamingChunker::new(Source::Them, 16_000);
+        c.push(&block(1.0, 0.3));
+        let chunks = c.push(&block(1.3, 0.0));
+        assert_eq!(chunks.len(), 1);
+        let speech = chunks[0].speech_secs;
+        assert!((0.9..=1.1).contains(&speech), "speech_secs {speech}");
+        // The 1.3s of trailing silence is in the chunk but is not speech.
+        let dur = chunks[0].end_offset() - chunks[0].start_offset;
+        assert!(speech < dur, "speech {speech} should be under duration {dur}");
+        assert!(chunks[0].has_speech);
+
+        // A 0.1s blip arms a chunk but falls under the transcribe-it bar.
+        c.push(&block(0.1, 0.3));
+        let blip = c.push(&block(1.3, 0.0));
+        assert_eq!(blip.len(), 1);
+        assert!(
+            blip[0].speech_secs < MIN_SPEECH_SECS,
+            "blip speech_secs {}",
+            blip[0].speech_secs
+        );
+
+        // Pure silence never arms a chunk at all, so there is nothing to
+        // report: no zero-speech chunk is ever emitted.
+        assert!(c.push(&block(2.0, 0.0)).is_empty());
+        assert!(c.flush().is_none());
+    }
+
+    #[test]
+    fn a_retained_tail_of_pure_silence_is_dropped_and_the_offset_jumps() {
+        let mut c = StreamingChunker::new(Source::Them, 16_000);
+        assert!(c.push(&block(29.5, 0.3)).is_empty());
+        // Dead air from 29.5s on: the cap fires at 30s, the quiet frame at
+        // 29.5s wins the window, and the 0.5s tail it would retain is silence.
+        let chunks = c.push(&block(3.0, 0.0));
+        assert_eq!(chunks.len(), 1);
+        let dur = chunks[0].end_offset() - chunks[0].start_offset;
+        assert!((29.4..29.8).contains(&dur), "duration {dur}");
+
+        // Speech resumes at 32.5s and the next chunk says so — the dropped
+        // tail did not pin the timestamp back at 29.6s.
+        assert!(c.push(&block(1.0, 0.3)).is_empty());
+        let next = c.push(&block(1.3, 0.0));
+        assert_eq!(next.len(), 1);
+        assert!(
+            (next[0].start_offset - 32.5).abs() < 0.15,
+            "start offset {}",
+            next[0].start_offset
+        );
+    }
+
+    #[test]
+    fn start_offsets_are_monotonic_over_ninety_seconds() {
+        let mut c = StreamingChunker::new(Source::Them, 16_000);
+        // A mixed 90s profile: gaps long enough to close a chunk, pauses too
+        // short to, and monologues long enough to hit the cap twice.
+        let profile: [(f32, f32); 8] = [
+            (7.0, 0.3),
+            (1.5, 0.0),
+            (22.0, 0.3),
+            (0.4, 0.0),
+            (40.0, 0.3),
+            (2.0, 0.0),
+            (14.0, 0.3),
+            (3.1, 0.0),
+        ];
+        let mut chunks = Vec::new();
+        let mut pushed = 0.0_f32;
+        for (secs, amp) in profile {
+            let secs = secs.min(90.0 - pushed);
+            if secs <= 0.0 {
+                break;
+            }
+            chunks.extend(c.push(&block(secs, amp)));
+            pushed += secs;
+        }
+        chunks.extend(c.flush());
+
+        assert!(chunks.len() >= 3, "expected several chunks, got {}", chunks.len());
+        let mut prev_start = f32::NEG_INFINITY;
+        for chunk in &chunks {
+            assert!(
+                chunk.start_offset >= prev_start,
+                "start offsets went backwards: {} after {prev_start}",
+                chunk.start_offset
+            );
+            prev_start = chunk.start_offset;
+            let dur = chunk.end_offset() - chunk.start_offset;
+            assert!(
+                dur <= CHUNK_MAX_SECS + FRAME_SECS,
+                "chunk of {dur}s exceeds the cap"
+            );
+            assert!(
+                chunk.start_offset <= pushed,
+                "start offset {} past the {pushed}s of audio",
+                chunk.start_offset
+            );
+        }
     }
 }
