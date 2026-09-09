@@ -4,25 +4,47 @@
 //! to a shared Parakeet engine, and writing a timestamped, speaker-labelled
 //! transcript that is summarized on stop.
 //!
-//! Only the pure sub-modules ([`dedup`], [`transcriber`]) and the listing /
-//! path helpers below compile on every platform. The live session ([`run`])
-//! and system-audio capture depend on ScreenCaptureKit and are macOS-only;
-//! off macOS `run` returns a clear error.
+//! Two entry points, one engine:
+//!
+//! * [`run`] / [`start`] — the legacy shapes the CLI and the desktop tray have
+//!   always used. Thin wrappers over the `_with` forms.
+//! * [`run_with`] / [`start_with`] — the full session: live line/state/tip
+//!   observers, a typed [`MeetingOutcome`], a notes sidecar merged on stop, a
+//!   hierarchical summary and a PDF export. [`start_with`] reserves the
+//!   transcript file on the **caller's** thread, so the session id and the
+//!   notes path are known before any capture starts.
+//!
+//! Only the pure sub-modules ([`dedup`], [`transcriber`], [`events`],
+//! [`notes`], [`summary`], [`pdf`], [`interview`]), the listing/path helpers
+//! and the finalize path below compile on every platform. Live capture
+//! depends on ScreenCaptureKit and is macOS-only; off macOS [`run_with`]
+//! returns a clear error.
 
 pub mod dedup;
 pub mod detect;
+pub mod events;
+pub mod interview;
+pub mod notes;
+pub mod pdf;
+pub mod pipeline;
+pub mod summary;
 pub mod transcriber;
+
+pub use events::*;
 
 #[cfg(target_os = "macos")]
 mod syscapture;
 
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use anyhow::{Context, Result};
+
+use crate::llm::TextGenerator;
 
 /// Default directory meeting transcripts are written to when `--out` isn't
 /// given: `~/Documents/vzt-flow/meetings/`.
@@ -74,6 +96,10 @@ pub struct MeetingSummary {
 /// Lists the most recent `limit` meeting transcripts in `dir`, newest first
 /// (by file modified time). Returns an empty vec if the directory doesn't
 /// exist yet.
+///
+/// Only `.md` files count, which is why the live-notes sidecar is
+/// `.notes.txt` (see [`notes`]) — a markdown sidecar would show up here as a
+/// phantom meeting.
 pub fn list_meetings(dir: &Path, limit: usize) -> Result<Vec<MeetingSummary>> {
     if !dir.exists() {
         return Ok(Vec::new());
@@ -111,7 +137,8 @@ fn summarize_file(path: &Path) -> MeetingSummary {
 
     for line in content.lines() {
         if let Some(header) = line.strip_prefix("# Meeting: ") {
-            // "<title> — <datetime>" (em dash separator written by run()).
+            // "<title> — <datetime>" (em dash separator written by
+            // reserve_transcript_path).
             if let Some((t, dt)) = header.split_once(" — ") {
                 title = t.trim().to_string();
                 datetime = dt.trim().to_string();
@@ -142,16 +169,510 @@ fn parse_leading_timestamp(line: &str) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
+// Session options and observers.
+// ---------------------------------------------------------------------------
+
+/// Called once, synchronously, when a session's files are reserved.
+pub type StartedObserver = Arc<dyn Fn(&SessionStarted) + Send + Sync>;
+/// Called for every recognized transcript line, *after* it is on disk.
+pub type LineObserver = Arc<dyn Fn(&TranscriptLine) + Send + Sync>;
+/// Called on every lifecycle transition (`Recording` → … → `Completed`).
+pub type StateObserver = Arc<dyn Fn(&SessionState) + Send + Sync>;
+/// Called for every interview-coaching tip.
+pub type TipObserver = Arc<dyn Fn(&InterviewTip) + Send + Sync>;
+
+/// Everything a session needs beyond "where do I write". Every field has a
+/// `Default`, so the legacy [`run`]/[`start`] shapes are `MeetingOptions {
+/// title, out_dir, ..Default::default() }`.
+///
+/// **Observers run on session threads**, never the main thread: `on_line`
+/// and `on_state` on the transcription worker / session thread, `on_tip` on
+/// the coach thread. A UI observer must marshal to the main thread itself
+/// (CLAUDE.md gotcha (h)). A panicking observer is contained — it costs its
+/// own notification, never the session.
+///
+/// **Line mirroring is still done by flow-core**: every line is echoed to
+/// stderr by the transcript writer exactly as before, so an `on_line` that
+/// also prints would double up.
+#[derive(Default)]
+pub struct MeetingOptions {
+    /// Meeting title; seeds the header, the filename slug and the PDF name.
+    pub title: Option<String>,
+    /// Output directory; defaults to [`default_meetings_dir`].
+    pub out_dir: Option<PathBuf>,
+    /// Pre-reserved transcript path (set by [`start_with`]). When `None` the
+    /// session reserves its own on the session thread.
+    pub transcript_path: Option<PathBuf>,
+    pub on_started: Option<StartedObserver>,
+    pub on_line: Option<LineObserver>,
+    pub on_state: Option<StateObserver>,
+    /// Set this to enable the interview coach; `None` means no coach thread
+    /// is spawned at all.
+    pub on_tip: Option<TipObserver>,
+    /// The process-wide resident model. `None` makes the session build its
+    /// own [`crate::llm::LocalGenerator`], which is what the CLI wants; the
+    /// desktop passes its [`crate::llm::ManagerGenerator`] so there is still
+    /// exactly one model in the process.
+    pub generator: Option<Arc<dyn TextGenerator>>,
+    /// Live-togglable mid-meeting: gates coaching and the tighter `Them`
+    /// silence hold.
+    pub interview: Arc<AtomicBool>,
+    /// Candidate context for the coach; `None` reads
+    /// [`interview::load_context`].
+    pub interview_context: Option<String>,
+    /// `None` (or `enabled: false`) means no PDF is exported.
+    pub pdf: Option<pdf::PdfOptions>,
+    pub summary: summary::SummaryOptions,
+}
+
+/// Calls one observer with a panic guard.
+///
+/// The observer belongs to the caller (a Tauri `emit_to`, a CLI print), so a
+/// panic in it must not take the session thread with it — whatever it is
+/// being told about is already persisted by the time it runs.
+fn notify<T>(observer: Option<&Arc<dyn Fn(&T) + Send + Sync>>, value: &T) {
+    if let Some(cb) = observer {
+        let cb = Arc::clone(cb);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || cb(value)));
+    }
+}
+
+/// The session id for a reserved transcript: its file **stem**, e.g.
+/// `2026-09-08-zoom-meeting-141203`. Immutable for the life of the session.
+fn session_id_for(transcript: &Path) -> String {
+    transcript
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "meeting".to_string())
+}
+
+/// How many name candidates `reserve_transcript_path` tries before giving up.
+const MAX_RESERVE_ATTEMPTS: usize = 1_000;
+
+/// Reserves `<out>/<date>-<slug>.md`, falling back to `-HHMMSS`, then
+/// `-HHMMSS-2`, `-3`, … until one name is **created** rather than merely
+/// found absent, and writes the `# Meeting:` header into it.
+///
+/// The creation is `create_new(true)`, so two sessions started in the same
+/// second (or in two processes) can never be handed the same path — the
+/// exists-then-open shape this replaces could hand both the same name.
+///
+/// Called on the caller's thread by [`start_with`], which is what makes the
+/// session id and the notes path available synchronously, before any capture
+/// thread exists.
+pub fn reserve_transcript_path(
+    out_dir: &Path,
+    now: &chrono::DateTime<chrono::Local>,
+    title: &str,
+) -> Result<PathBuf> {
+    fs::create_dir_all(out_dir)
+        .with_context(|| format!("failed to create meetings directory {}", out_dir.display()))?;
+
+    let date = now.format("%Y-%m-%d");
+    let time = now.format("%H%M%S");
+    let slug = slug_title(title);
+
+    for attempt in 0..MAX_RESERVE_ATTEMPTS {
+        let name = match attempt {
+            0 => format!("{date}-{slug}.md"),
+            1 => format!("{date}-{slug}-{time}.md"),
+            n => format!("{date}-{slug}-{time}-{n}.md"),
+        };
+        let path = out_dir.join(name);
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut file) => {
+                writeln!(file, "# Meeting: {} — {}\n", title, now.format("%Y-%m-%d %H:%M"))
+                    .with_context(|| format!("failed to write transcript header to {}", path.display()))?;
+                file.flush().ok();
+                return Ok(path);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("failed to create transcript file {}", path.display()))
+            }
+        }
+    }
+    anyhow::bail!(
+        "could not reserve a transcript name in {} after {MAX_RESERVE_ATTEMPTS} attempts",
+        out_dir.display()
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Transcript writer (persist first, notify second).
+// ---------------------------------------------------------------------------
+
+/// Line-buffered, crash-safe transcript writer. Every line is flushed to disk
+/// immediately (so a crash mid-meeting keeps everything written so far),
+/// mirrored to stderr (so stdout stays clean for piping), and only *then*
+/// fanned out to the live observers.
+///
+/// That order is the crash-safety property: an observer panic costs the
+/// notification, never the line.
+#[cfg(any(target_os = "macos", test))]
+struct TranscriptWriter {
+    file: fs::File,
+    /// Plain `Speaker: text` lines accumulated for the summarizer.
+    body: Vec<String>,
+    /// Sequence numbering + live observers, shared with nothing else.
+    fanout: LineFanout,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl TranscriptWriter {
+    fn new(file: fs::File, fanout: LineFanout) -> Self {
+        Self { file, body: Vec::new(), fanout }
+    }
+
+    /// Persists one recognized line, then notifies the observers.
+    ///
+    /// Returns the fanned-out [`TranscriptLine`], or `None` when an observer
+    /// panicked — the line is on disk either way, but its sequence number
+    /// reached only the observers registered before the one that panicked,
+    /// so the caller must not treat it as fully delivered (the interview
+    /// coach skips it rather than coaching on a half-delivered line).
+    fn append_line(
+        &mut self,
+        offset_secs: f32,
+        source: transcriber::Source,
+        text: &str,
+    ) -> Option<TranscriptLine> {
+        let line = format!(
+            "[{}] {}: {}",
+            transcriber::format_offset(offset_secs as u64),
+            source.label(),
+            text
+        );
+        // Mirror live to stderr.
+        eprintln!("{line}");
+        // Persist immediately, line-buffered + fsync-lite via flush.
+        let _ = writeln!(self.file, "{line}");
+        let _ = self.file.flush();
+        self.body.push(format!("{}: {}", source.label(), text));
+
+        // Notified only after the line is durable. `LineFanout` calls its
+        // observers inline, so this catches a panicking observer here rather
+        // than letting it unwind the transcription worker and silently end
+        // the meeting (cf. CLAUDE.md gotcha (i)).
+        let fanout = &self.fanout;
+        let text = text.to_string();
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            fanout.push(source, offset_secs, text)
+        }))
+        .ok()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Finalize: stop -> merge notes -> summarize -> PDF.
+// ---------------------------------------------------------------------------
+
+/// Idle timeout for a session-owned [`crate::llm::LocalGenerator`]. Long
+/// enough that the coach and the end-of-meeting summary share one load, short
+/// enough that a CLI session doesn't sit on a resident model afterwards.
+#[cfg(any(target_os = "macos", test))]
+const GENERATOR_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Resolves the generator for a session: the caller's if it supplied one,
+/// else a lazily-loading local one, else nothing at all.
+///
+/// Returns the note to append to the summary's coverage line when there is no
+/// model to summarize with.
+#[cfg(any(target_os = "macos", test))]
+fn build_generator(opts: &MeetingOptions) -> (Arc<dyn TextGenerator>, Option<String>) {
+    if let Some(g) = &opts.generator {
+        return (Arc::clone(g), None);
+    }
+    match crate::models::cleanup_model_path() {
+        Ok(p) if p.exists() => (
+            Arc::new(crate::llm::LocalGenerator::new(p, GENERATOR_IDLE_TIMEOUT)),
+            None,
+        ),
+        _ => (
+            Arc::new(crate::llm::NullGenerator),
+            Some("No cleanup model is installed, so no summary was generated.".to_string()),
+        ),
+    }
+}
+
+/// Everything [`finalize`] needs that isn't produced by the teardown itself.
+#[cfg(any(target_os = "macos", test))]
+struct FinalizeRequest<'a> {
+    session_id: &'a str,
+    title: &'a str,
+    started_at: chrono::DateTime<chrono::Local>,
+    transcript: &'a Path,
+    notes_path: &'a Path,
+    generator: &'a dyn TextGenerator,
+    summary: &'a summary::SummaryOptions,
+    /// `None` (or `enabled: false`) skips the PDF step entirely.
+    pdf: Option<&'a pdf::PdfOptions>,
+    on_state: Option<&'a StateObserver>,
+    /// Appended to the coverage line (e.g. "no cleanup model installed").
+    model_note: Option<&'a str>,
+}
+
+/// The stop → finalize state machine, factored out of the live session so it
+/// is testable with no microphone, no ScreenCaptureKit and no model.
+///
+/// `stop_capture` performs the teardown — flush tails, join the capture and
+/// worker threads, shut the coach down — and returns the transcript body it
+/// collected. It runs *after* `Stopping` is emitted, so the UI reflects the
+/// wait for the final chunk rather than still claiming to be recording.
+///
+/// Nothing here fails the meeting: the transcript is already on disk, so a
+/// missing model, an unusable notes sidecar or an unwritable PDF directory is
+/// recorded in the [`MeetingOutcome`] and the session still completes.
+/// `Failed` is emitted only when the transcript itself could not be written.
+#[cfg(any(target_os = "macos", test))]
+fn finalize(req: FinalizeRequest<'_>, stop_capture: impl FnOnce() -> Vec<String>) -> MeetingOutcome {
+    let on_state = req.on_state;
+    let emit = move |state: SessionState| notify(on_state, &state);
+
+    emit(SessionState::Stopping);
+    let body_lines = stop_capture();
+
+    let mut outcome = MeetingOutcome {
+        session_id: req.session_id.to_string(),
+        transcript: req.transcript.to_path_buf(),
+        pdf: None,
+        pdf_error: None,
+        notes_merged: false,
+        // flow-core has no notes revision counter — the notepad owner (the
+        // desktop `SessionSlot`) is the only thing that knows which revision
+        // it last saved, so it overwrites this with its own `notes_rev`.
+        notes_rev_used: 0,
+        summary_sections: 0,
+        summary_complete: false,
+    };
+
+    // --- notes -------------------------------------------------------------
+    // Read once, here: this snapshot is both what gets merged into the
+    // transcript and what the summarizer sees, so the two can't disagree.
+    emit(SessionState::Finalizing { step: "merging notes".to_string() });
+    let notes = notes::read(req.notes_path);
+    match notes::merge_into_transcript(req.transcript, &notes) {
+        Ok(merged) => outcome.notes_merged = merged,
+        Err(e) => eprintln!("[vzt-flow] could not merge meeting notes: {e}"),
+    }
+
+    // --- summary -----------------------------------------------------------
+    // The merge rewrote the transcript via rename, so every write from here
+    // on re-opens it by path; any handle taken before the merge points at the
+    // replaced inode.
+    let mut summary_input = body_lines;
+    summary_input.extend(notes::as_summary_lines(&notes));
+    let body = summary_input.join("\n");
+
+    let mut summary_md: Option<String> = None;
+    let mut coverage: Option<String> = None;
+    let mut transcript_error: Option<String> = None;
+
+    if body.trim().is_empty() {
+        eprintln!("[vzt-flow] nothing was transcribed; skipping summary");
+    } else {
+        let progress = |i: usize, n: usize| {
+            emit(SessionState::Finalizing { step: format!("summarizing {i}/{n}") })
+        };
+        let result = summary::summarize(&body, req.generator, req.summary, &progress);
+
+        let markdown = result.markdown.trim().to_string();
+        outcome.summary_sections = result.sections;
+        outcome.summary_complete = result.complete && !markdown.is_empty();
+
+        let mut note = result.coverage_note.clone();
+        if let Some(extra) = req.model_note {
+            note.push(' ');
+            note.push_str(extra);
+        }
+
+        // An empty summary gets a line only when we can say *why* there
+        // isn't one — a bare coverage note would claim coverage of a summary
+        // that does not exist.
+        let appended = if markdown.is_empty() {
+            eprintln!("[vzt-flow] summary generation produced no text; leaving transcript as-is");
+            match req.model_note {
+                Some(reason) => Some(("".to_string(), reason.to_string())),
+                None => None,
+            }
+        } else {
+            Some((markdown, note))
+        };
+
+        if let Some((markdown, note)) = appended {
+            match append_summary(req.transcript, &markdown, &note) {
+                Ok(()) => {
+                    if !markdown.is_empty() {
+                        summary_md = Some(markdown);
+                    }
+                    coverage = Some(note);
+                }
+                Err(e) => {
+                    eprintln!("[vzt-flow] could not append the summary to the transcript: {e}");
+                    outcome.summary_complete = false;
+                    transcript_error = Some(e.to_string());
+                }
+            }
+        }
+    }
+
+    // --- pdf ---------------------------------------------------------------
+    if let Some(pdf_opts) = req.pdf.filter(|p| p.enabled) {
+        emit(SessionState::Finalizing { step: "writing pdf".to_string() });
+        let (transcript_lines, duration) = transcript_lines_and_duration(req.transcript);
+        let doc = pdf::MeetingDoc {
+            title: req.title.to_string(),
+            date_line: req.started_at.format("%Y-%m-%d %H:%M").to_string(),
+            duration,
+            summary_md,
+            notes: (!notes.trim().is_empty()).then(|| notes.clone()),
+            transcript_lines,
+            coverage_note: coverage,
+            source_path: req.transcript.to_path_buf(),
+        };
+        let stem = pdf::pdf_file_stem(req.title, &req.started_at);
+        let dir = pdf_opts.dir.clone();
+        // The renderer is pure but total: a panic in it would otherwise
+        // unwind a session whose transcript is already complete on disk.
+        let written = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let bytes = pdf::render(&doc);
+            pdf::write_atomic(&bytes, &dir, &stem)
+        }));
+        match written {
+            Ok(Ok(path)) => outcome.pdf = Some(path),
+            Ok(Err(e)) => {
+                eprintln!("[vzt-flow] PDF export failed: {e}");
+                outcome.pdf_error = Some(e.to_string());
+            }
+            Err(_) => {
+                eprintln!("[vzt-flow] PDF export panicked");
+                outcome.pdf_error = Some("the PDF renderer panicked".to_string());
+            }
+        }
+    }
+
+    match transcript_error {
+        Some(msg) => emit(SessionState::Failed(msg)),
+        None => emit(SessionState::Completed),
+    }
+    outcome
+}
+
+/// Appends the summary markdown and its coverage line to the transcript.
+/// An empty summary still gets its coverage line — that line is how a reader
+/// learns *why* there is no summary.
+#[cfg(any(target_os = "macos", test))]
+fn append_summary(transcript: &Path, markdown: &str, coverage_note: &str) -> Result<()> {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(transcript)
+        .with_context(|| format!("failed to open {}", transcript.display()))?;
+    writeln!(file)?;
+    if !markdown.is_empty() {
+        writeln!(file, "{markdown}")?;
+        writeln!(file)?;
+    }
+    writeln!(file, "_{coverage_note}_")?;
+    file.flush()?;
+    Ok(())
+}
+
+/// Reads back the timestamped transcript lines (for the PDF body) and the
+/// meeting length (the last `[HH:MM:SS]` seen), reusing the same parse
+/// `list_meetings` uses so the PDF and the listing can't disagree.
+#[cfg(any(target_os = "macos", test))]
+fn transcript_lines_and_duration(transcript: &Path) -> (Vec<String>, String) {
+    let content = fs::read_to_string(transcript).unwrap_or_default();
+    let mut lines = Vec::new();
+    let mut duration = None;
+    for line in content.lines() {
+        if let Some(ts) = parse_leading_timestamp(line) {
+            duration = Some(ts);
+            lines.push(line.to_string());
+        }
+    }
+    (lines, duration.unwrap_or_else(|| "00:00:00".to_string()))
+}
+
+// ---------------------------------------------------------------------------
 // In-process session handle (used by the desktop app's tray integration).
 // ---------------------------------------------------------------------------
 
-/// A meeting session started in-process on a background thread. Wraps the same
-/// [`run`] entry the CLI uses (with its own cooperative stop flag) so the
-/// desktop app can start/stop a session without shelling out to `flow
-/// meeting`. Purely additive over [`run`]; the CLI path is unchanged.
+/// A meeting session started in-process on a background thread.
+///
+/// The identity fields ([`Self::session_id`], [`Self::transcript_path`],
+/// [`Self::notes_path`]) are known the moment [`start_with`] returns — the
+/// transcript file is reserved on the caller's thread — so a notepad window
+/// can bind to the session before the first line exists.
 pub struct MeetingHandle {
+    session_id: String,
+    transcript: PathBuf,
+    notes: PathBuf,
+    interview: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
-    join: Option<JoinHandle<Result<PathBuf>>>,
+    join: Option<JoinHandle<Result<MeetingOutcome>>>,
+    /// Set when [`start`] could not even reserve a transcript. The legacy
+    /// `start` has no `Result`, so the error is held here and surfaces from
+    /// [`Self::stop`], where the caller already handles one.
+    start_error: Option<anyhow::Error>,
+}
+
+/// Starts a meeting session with full options and returns a handle whose
+/// identity is already resolved.
+///
+/// The transcript is reserved (and its header written) **on this thread**
+/// before the session thread is spawned, and `on_started` fires here — so the
+/// caller can open a notepad bound to `session_id` with no race against the
+/// first transcript line.
+pub fn start_with(mut opts: MeetingOptions) -> Result<MeetingHandle> {
+    let title = opts.title.clone().unwrap_or_else(|| "meeting".to_string());
+    let out_dir = match opts.out_dir.clone() {
+        Some(d) => d,
+        None => default_meetings_dir()?,
+    };
+    let now = chrono::Local::now();
+    let transcript = match opts.transcript_path.clone() {
+        Some(p) => p,
+        None => reserve_transcript_path(&out_dir, &now, &title)?,
+    };
+
+    let session_id = session_id_for(&transcript);
+    let notes = notes::notes_path_for(&transcript);
+
+    opts.title = Some(title.clone());
+    opts.out_dir = Some(out_dir);
+    opts.transcript_path = Some(transcript.clone());
+
+    notify(
+        opts.on_started.as_ref(),
+        &SessionStarted {
+            session_id: session_id.clone(),
+            title,
+            started_at_ms: now.timestamp_millis(),
+            transcript: transcript.clone(),
+            notes: notes.clone(),
+        },
+    );
+
+    let interview = Arc::clone(&opts.interview);
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = Arc::clone(&stop);
+    let join = std::thread::Builder::new()
+        .name("vzt-flow-meeting-session".into())
+        .spawn(move || run_with(opts, thread_stop))
+        .context("failed to spawn meeting session thread")?;
+
+    Ok(MeetingHandle {
+        session_id,
+        transcript,
+        notes,
+        interview,
+        stop,
+        join: Some(join),
+        start_error: None,
+    })
 }
 
 /// Starts a meeting session on a background thread and returns a handle. The
@@ -159,23 +680,59 @@ pub struct MeetingHandle {
 /// which also triggers the on-stop summary. `title`/`out_dir` mirror [`run`]'s
 /// arguments (default title `"meeting"`, default dir
 /// [`default_meetings_dir`]).
+///
+/// Thin wrapper over [`start_with`]: no observers, no PDF, no coach.
 pub fn start(title: Option<String>, out_dir: Option<PathBuf>) -> MeetingHandle {
-    let stop = Arc::new(AtomicBool::new(false));
-    let thread_stop = stop.clone();
-    let join = std::thread::Builder::new()
-        .name("vzt-flow-meeting-session".into())
-        .spawn(move || run(title, out_dir, thread_stop))
-        .expect("failed to spawn meeting session thread");
-    MeetingHandle { stop, join: Some(join) }
+    let opts = MeetingOptions { title, out_dir, ..Default::default() };
+    match start_with(opts) {
+        Ok(handle) => handle,
+        // The legacy signature can't return an error here; hand back a handle
+        // that is already finished and reports it from `stop`.
+        Err(e) => MeetingHandle {
+            session_id: String::new(),
+            transcript: PathBuf::new(),
+            notes: PathBuf::new(),
+            interview: Arc::new(AtomicBool::new(false)),
+            stop: Arc::new(AtomicBool::new(true)),
+            join: None,
+            start_error: Some(e),
+        },
+    }
 }
 
 impl MeetingHandle {
-    /// Signals the session to stop, blocks until it has flushed its tails and
-    /// generated the summary, and returns the transcript path.
+    /// The session id: the transcript file's stem, immutable for the life of
+    /// the session. Empty only for a handle whose start failed.
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    /// Where the transcript is being written.
+    pub fn transcript_path(&self) -> &Path {
+        &self.transcript
+    }
+
+    /// The `.notes.txt` sidecar for this session. It does not exist until
+    /// something saves notes into it.
+    pub fn notes_path(&self) -> &Path {
+        &self.notes
+    }
+
+    /// The live interview-mode flag. Flipping it takes effect mid-meeting:
+    /// it gates coaching and the tighter `Them` silence hold.
+    pub fn interview_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.interview)
+    }
+
+    /// Signals the session to stop, blocks until it has flushed its tails,
+    /// merged notes, summarized and exported, and returns the full outcome.
     ///
-    /// **Blocking**: summary generation can take 10-60s, so call this from a
-    /// background thread, never a UI/coordinator thread.
-    pub fn stop(mut self) -> Result<PathBuf> {
+    /// **Blocking**: finalize can take 10-60s, so call this from a background
+    /// thread, never a UI/coordinator thread.
+    pub fn stop_detailed(mut self) -> Result<MeetingOutcome> {
+        if let Some(e) = self.start_error.take() {
+            return Err(e);
+        }
         self.stop.store(true, Ordering::SeqCst);
         match self.join.take() {
             Some(j) => j
@@ -183,6 +740,11 @@ impl MeetingHandle {
                 .map_err(|_| anyhow::anyhow!("meeting session thread panicked"))?,
             None => anyhow::bail!("meeting session already stopped"),
         }
+    }
+
+    /// Legacy shape: stops the session and returns just the transcript path.
+    pub fn stop(self) -> Result<PathBuf> {
+        self.stop_detailed().map(|outcome| outcome.transcript)
     }
 
     /// Whether the session thread is still running (has not returned/panicked).
@@ -195,14 +757,19 @@ impl MeetingHandle {
 // Live session — macOS only (ScreenCaptureKit).
 // ---------------------------------------------------------------------------
 
+/// Runs a meeting session until `stop` is set (the CLI wires this to SIGINT).
+/// Returns the path of the transcript file written.
+///
+/// Thin wrapper over [`run_with`] with no observers, no PDF and no coach.
+pub fn run(title: Option<String>, out_dir: Option<PathBuf>, stop: Arc<AtomicBool>) -> Result<PathBuf> {
+    let opts = MeetingOptions { title, out_dir, ..Default::default() };
+    run_with(opts, stop).map(|outcome| outcome.transcript)
+}
+
 /// Off macOS there is no ScreenCaptureKit, so live capture is unavailable.
-/// The listing/MCP paths above still work everywhere.
+/// The listing/notes/summary/PDF paths above still work everywhere.
 #[cfg(target_os = "linux")]
-pub fn run(
-    _title: Option<String>,
-    _out_dir: Option<PathBuf>,
-    _stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-) -> Result<PathBuf> {
+pub fn run_with(_opts: MeetingOptions, _stop: Arc<AtomicBool>) -> Result<MeetingOutcome> {
     anyhow::bail!(
         "meeting mode is not yet available on Linux (needs a PipeWire system-audio \
          capture backend — on the roadmap; macOS uses ScreenCaptureKit today)"
@@ -210,117 +777,83 @@ pub fn run(
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-pub fn run(
-    _title: Option<String>,
-    _out_dir: Option<PathBuf>,
-    _stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-) -> Result<PathBuf> {
+pub fn run_with(_opts: MeetingOptions, _stop: Arc<AtomicBool>) -> Result<MeetingOutcome> {
     anyhow::bail!("meeting mode requires macOS (ScreenCaptureKit system-audio capture is macOS-only)")
 }
 
 #[cfg(target_os = "macos")]
-pub use session::run;
+pub use session::run_with;
 
 #[cfg(target_os = "macos")]
 mod session {
     //! The live meeting session: wires the two capture sources, the shared
-    //! Parakeet engine, the transcript writer, echo dedup, and the on-stop
-    //! summarizer together.
+    //! Parakeet engine, the transcript writer, echo dedup, the interview
+    //! coach and the finalize path together.
 
-    use std::collections::VecDeque;
-    use std::io::Write;
-    use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{mpsc, Arc, Mutex};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use anyhow::{Context, Result};
 
-    use crate::cleanup::LlamaCleanupProvider;
     use crate::dictionary;
     use crate::engine::{ParakeetTranscriber, Transcriber};
-    use crate::models::{cleanup_model_path, parakeet_model_dir};
+    use crate::models::parakeet_model_dir;
 
-    use super::dedup::{is_echo, time_overlaps, DEFAULT_ECHO_THRESHOLD};
+    use super::interview::{Coach, CoachConfig};
+    use super::pipeline::{ChunkPipeline, Decision};
     use super::syscapture;
-    use super::transcriber::{format_offset, Chunk, Source, StreamingChunker};
-    use super::{default_meetings_dir, slug_title};
+    use super::transcriber::{Chunk, Source, StreamingChunker, SILENCE_HOLD_SECS};
+    use super::{
+        build_generator, default_meetings_dir, finalize, notes, notify, reserve_transcript_path,
+        session_id_for, FinalizeRequest, LineFanout, MeetingOptions, MeetingOutcome, SessionStarted,
+        SessionState, TranscriptWriter,
+    };
 
-    /// Max characters of transcript fed to the summarizer. Beyond this, only
-    /// the final portion is summarized (see `transcriber::truncate_for_summary`)
-    /// so a marathon meeting never overruns the model's context. Sized well
-    /// under the cleanup model's 8192-token context budget.
-    const SUMMARY_MAX_CHARS: usize = 6_000;
-
-    /// How long a transcribed segment stays eligible for echo comparison. A
-    /// `Me:` chunk is only ever dropped as an echo of a `Them:` chunk it
-    /// overlaps in time with, so we only need to retain very recent history.
-    const DEDUP_RETAIN_SECS: f32 = 30.0;
-
-    /// One transcribed, dictionary-corrected line, retained briefly for the
-    /// echo-dedup time/word comparison.
-    struct RecordedSeg {
-        source: Source,
-        start: f32,
-        end: f32,
-        text: String,
-    }
-
-    /// Line-buffered, crash-safe transcript writer. Every line is flushed to
-    /// disk immediately (so a crash mid-meeting keeps everything written so
-    /// far) and mirrored to stderr (so stdout stays clean for piping).
-    struct TranscriptWriter {
-        file: std::fs::File,
-        /// Plain `Speaker: text` lines accumulated for the summarizer.
-        body: Vec<String>,
-    }
-
-    impl TranscriptWriter {
-        fn append_line(&mut self, offset_secs: f32, source: Source, text: &str) {
-            let line = format!("[{}] {}: {}", format_offset(offset_secs as u64), source.label(), text);
-            // Mirror live to stderr.
-            eprintln!("{line}");
-            // Persist immediately, line-buffered + fsync-lite via flush.
-            let _ = writeln!(self.file, "{line}");
-            let _ = self.file.flush();
-            self.body.push(format!("{}: {}", source.label(), text));
-        }
-
-        fn append_raw(&mut self, text: &str) {
-            let _ = writeln!(self.file, "{text}");
-            let _ = self.file.flush();
-        }
-    }
-
-    /// Runs a meeting session until `stop` is set (the CLI wires this to
-    /// SIGINT). Returns the path of the transcript file written.
-    pub fn run(title: Option<String>, out_dir: Option<PathBuf>, stop: Arc<AtomicBool>) -> Result<PathBuf> {
-        let title = title.unwrap_or_else(|| "meeting".to_string());
-        let out_dir = match out_dir {
+    /// Runs a full meeting session until `stop` is set.
+    pub fn run_with(opts: MeetingOptions, stop: Arc<AtomicBool>) -> Result<MeetingOutcome> {
+        let title = opts.title.clone().unwrap_or_else(|| "meeting".to_string());
+        let out_dir = match opts.out_dir.clone() {
             Some(d) => d,
             None => default_meetings_dir()?,
         };
-        std::fs::create_dir_all(&out_dir)
-            .with_context(|| format!("failed to create meetings directory {}", out_dir.display()))?;
 
         // Screen Recording (TCC) permission is required for system-audio
         // capture. Detect + prompt before we do anything else.
         syscapture::ensure_screen_permission();
 
         let now = chrono::Local::now();
-        let path = unique_transcript_path(&out_dir, &now, &title);
+        // `start_with` reserves on the caller's thread and fires `on_started`
+        // there; only a session that reserves its own path fires it here.
+        let (path, reserved_here) = match opts.transcript_path.clone() {
+            Some(p) => (p, false),
+            None => (reserve_transcript_path(&out_dir, &now, &title)?, true),
+        };
+        let session_id = session_id_for(&path);
+        let notes_path = notes::notes_path_for(&path);
+        if reserved_here {
+            notify(
+                opts.on_started.as_ref(),
+                &SessionStarted {
+                    session_id: session_id.clone(),
+                    title: title.clone(),
+                    started_at_ms: now.timestamp_millis(),
+                    transcript: path.clone(),
+                    notes: notes_path.clone(),
+                },
+            );
+        }
 
-        let mut file = std::fs::OpenOptions::new()
+        let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&path)
             .with_context(|| format!("failed to open transcript file {}", path.display()))?;
-        writeln!(file, "# Meeting: {} — {}\n", title, now.format("%Y-%m-%d %H:%M"))
-            .context("failed to write transcript header")?;
-        file.flush().ok();
 
         eprintln!("[vzt-flow] meeting started -> {}", path.display());
         eprintln!("[vzt-flow] press Ctrl+C to stop and summarize. (Wear headphones for best speaker separation.)");
+
+        let cfg = crate::config::Config::load().unwrap_or_default();
 
         // Shared Parakeet engine behind a mutex, serving both sources.
         let model_dir = parakeet_model_dir()?;
@@ -328,25 +861,64 @@ mod session {
             ParakeetTranscriber::load(&model_dir).context("failed to load Parakeet model")?,
         ));
         let dict = Arc::new(dictionary::load_or_seed().unwrap_or_default());
-        let writer = Arc::new(Mutex::new(TranscriptWriter { file, body: Vec::new() }));
+
+        let mut fanout = LineFanout::new(session_id.clone());
+        if let Some(on_line) = opts.on_line.clone() {
+            fanout.add_observer(on_line);
+        }
+        let writer = Arc::new(Mutex::new(TranscriptWriter::new(file, fanout)));
+
+        // One generator for the whole session: the coach and the end-of-
+        // meeting summary share it, so the process holds exactly one resident
+        // model. Dropping the last clone (at the end of this function) joins
+        // its manager thread — never detached (gotcha (e)).
+        let (generator, model_note) = build_generator(&opts);
+
+        // The coach lives behind a mutex rather than an `Arc<Coach>` so
+        // ownership can be taken back for `shutdown` (which consumes it)
+        // without depending on a refcount reaching one.
+        let coach: Arc<Mutex<Option<Coach>>> = Arc::new(Mutex::new(None));
+        if let Some(on_tip) = opts.on_tip.clone() {
+            let context = match opts.interview_context.clone() {
+                Some(c) => c,
+                None => super::interview::load_context(),
+            };
+            let coach_cfg = CoachConfig {
+                timeout_ms: cfg.interview_tip_timeout_ms,
+                context_max_chars: cfg.interview_context_max_chars,
+                ..CoachConfig::default()
+            };
+            let spawned = Coach::spawn(
+                session_id.clone(),
+                Arc::clone(&generator),
+                context,
+                Arc::clone(&opts.interview),
+                coach_cfg,
+                on_tip,
+            );
+            *coach.lock().unwrap_or_else(|p| p.into_inner()) = Some(spawned);
+        }
+
+        notify(opts.on_state.as_ref(), &SessionState::Recording);
 
         // One transcription worker consumes chunks from both sources in FIFO
         // order; a single worker naturally serializes engine access and keeps
         // the echo-dedup history single-threaded (no lock needed for it).
         let (flush_tx, flush_rx) = mpsc::channel::<Chunk>();
         let worker = {
-            let engine = engine.clone();
-            let dict = dict.clone();
-            let writer = writer.clone();
+            let engine = Arc::clone(&engine);
+            let dict = Arc::clone(&dict);
+            let writer = Arc::clone(&writer);
+            let coach = Arc::clone(&coach);
             std::thread::Builder::new()
                 .name("vzt-flow-meeting-worker".into())
-                .spawn(move || transcription_worker(flush_rx, engine, dict, writer))
+                .spawn(move || transcription_worker(flush_rx, engine, dict, writer, coach))
                 .context("failed to spawn transcription worker")?
         };
 
         // Microphone source on its own thread (cpal streams are !Send).
         let mic_flush = flush_tx.clone();
-        let mic_stop = stop.clone();
+        let mic_stop = Arc::clone(&stop);
         let mic = std::thread::Builder::new()
             .name("vzt-flow-meeting-mic".into())
             .spawn(move || {
@@ -358,16 +930,12 @@ mod session {
 
         // System audio source on THIS thread: start the SCK stream (kept
         // alive locally) and drive its chunker until stop.
-        let sys_result = run_system_source(&flush_tx, &stop);
-
-        // Stop everything: signal, then join in dependency order.
-        stop.store(true, Ordering::SeqCst);
-        let _ = mic.join();
-        // Dropping every sender lets the worker see the channel disconnect and
-        // drain the last queued chunks before exiting.
-        drop(flush_tx);
-        let _ = worker.join();
-
+        let sys_result = run_system_source(
+            &flush_tx,
+            &stop,
+            &opts.interview,
+            cfg.interview_silence_hold_secs as f32,
+        );
         if let Err(e) = sys_result {
             eprintln!(
                 "[vzt-flow] system-audio capture error: {e}\n\
@@ -376,101 +944,105 @@ mod session {
             );
         }
 
-        // Summarize (post-meeting latency is fine; no deadline race).
-        summarize_into_file(&writer, &path);
+        let outcome = finalize(
+            FinalizeRequest {
+                session_id: &session_id,
+                title: &title,
+                started_at: now,
+                transcript: &path,
+                notes_path: &notes_path,
+                generator: generator.as_ref(),
+                summary: &opts.summary,
+                pdf: opts.pdf.as_ref(),
+                on_state: opts.on_state.as_ref(),
+                model_note: model_note.as_deref(),
+            },
+            // Teardown, in dependency order, after `Stopping` is emitted.
+            move || {
+                stop.store(true, Ordering::SeqCst);
+                let _ = mic.join();
+                // Dropping every sender lets the worker see the channel
+                // disconnect and drain the last queued chunks before exiting.
+                drop(flush_tx);
+                let _ = worker.join();
+                // The worker is gone, so nothing can feed the coach any more;
+                // cancel + join it before the summary competes for the model.
+                let coach = coach.lock().unwrap_or_else(|p| p.into_inner()).take();
+                if let Some(coach) = coach {
+                    coach.shutdown();
+                }
+                let body = {
+                    let guard = writer.lock().unwrap_or_else(|p| p.into_inner());
+                    guard.body.clone()
+                };
+                // Close the append handle before finalize merges notes: the
+                // merge replaces the file by rename, so this handle would
+                // otherwise write into the replaced inode.
+                drop(writer);
+                body
+            },
+        );
 
         eprintln!("[vzt-flow] meeting saved -> {}", path.display());
-        Ok(path)
-    }
-
-    /// Builds `<out>/<date>-<slug>.md`, adding a `-HHMMSS` suffix if that path
-    /// already exists so a same-day, same-title meeting never clobbers an
-    /// earlier one.
-    fn unique_transcript_path(out_dir: &std::path::Path, now: &chrono::DateTime<chrono::Local>, title: &str) -> PathBuf {
-        let date = now.format("%Y-%m-%d");
-        let slug = slug_title(title);
-        let base = out_dir.join(format!("{date}-{slug}.md"));
-        if !base.exists() {
-            return base;
+        if let Some(pdf) = &outcome.pdf {
+            eprintln!("[vzt-flow] meeting PDF -> {}", pdf.display());
         }
-        out_dir.join(format!("{date}-{slug}-{}.md", now.format("%H%M%S")))
+        Ok(outcome)
     }
 
-    /// The single transcription worker: for each chunk, resample to 16 kHz,
-    /// transcribe on the shared engine, dictionary-correct, apply echo dedup,
-    /// and append the surviving line.
+    /// The single transcription worker: hands each chunk to the shared
+    /// [`ChunkPipeline`] (resample, transcribe on the shared engine,
+    /// dictionary-correct, echo dedup), appends the surviving line and feeds
+    /// it to the interview coach.
     fn transcription_worker(
         flush_rx: mpsc::Receiver<Chunk>,
         engine: Arc<Mutex<ParakeetTranscriber>>,
         dict: Arc<Vec<dictionary::DictionaryTerm>>,
         writer: Arc<Mutex<TranscriptWriter>>,
+        coach: Arc<Mutex<Option<Coach>>>,
     ) {
-        let mut recent: VecDeque<RecordedSeg> = VecDeque::new();
+        let mut pipeline = ChunkPipeline::new(dict);
 
         while let Ok(chunk) = flush_rx.recv() {
-            if !chunk.has_speech || chunk.samples.is_empty() {
-                continue; // dead-air chunk flushed by the 30s cap — skip it
-            }
-            let start = chunk.start_offset;
-            let end = chunk.end_offset();
-
-            // Resample native -> 16 kHz for the engine.
-            let samples = crate::audio::resample_linear(
-                &chunk.samples,
-                chunk.sample_rate,
-                crate::audio::TARGET_SAMPLE_RATE,
-            );
-
-            let text = {
-                let mut guard = match engine.lock() {
-                    Ok(g) => g,
-                    Err(p) => p.into_inner(),
-                };
-                match guard.transcribe(&samples) {
-                    Ok(t) => t.text.trim().to_string(),
-                    Err(e) => {
-                        eprintln!("[vzt-flow] transcription error: {e}");
-                        continue;
+            // Stamped at dequeue, not after transcription: a coaching tip's
+            // latency is what the candidate experiences, which starts when
+            // the interviewer stopped talking, and transcription is part of
+            // that wait.
+            let chunk_closed_at = Instant::now();
+            let decision = pipeline.process(&chunk, |samples| {
+                let mut guard = engine.lock().unwrap_or_else(|p| p.into_inner());
+                Ok(guard.transcribe(samples)?.text)
+            });
+            match decision {
+                Decision::Emit { start, source, text } => {
+                    let line = {
+                        let mut w = writer.lock().unwrap_or_else(|p| p.into_inner());
+                        w.append_line(start, source, &text)
+                    };
+                    if let Some(line) = line {
+                        let guard = coach.lock().unwrap_or_else(|p| p.into_inner());
+                        if let Some(coach) = guard.as_ref() {
+                            coach.observe(&line, chunk_closed_at);
+                        }
                     }
                 }
-            };
-            if text.is_empty() {
-                continue;
-            }
-            let corrected = dictionary::correct(&text, &dict);
-
-            // Prune history older than the dedup window relative to this chunk.
-            while let Some(front) = recent.front() {
-                if front.end < start - DEDUP_RETAIN_SECS {
-                    recent.pop_front();
-                } else {
-                    break;
-                }
-            }
-
-            // Echo dedup: drop a Me line that time-overlaps a recent Them line
-            // and is textually near-identical (the no-headphones case).
-            if chunk.source == Source::Me {
-                let echo = recent.iter().any(|seg| {
-                    seg.source == Source::Them
-                        && time_overlaps(start, end, seg.start, seg.end)
-                        && is_echo(&corrected, &seg.text, DEFAULT_ECHO_THRESHOLD)
-                });
-                if echo {
+                Decision::DroppedEcho(corrected) => {
                     eprintln!("[vzt-flow] dropped echo (Me overlapped Them): {corrected}");
-                    continue;
                 }
+                Decision::Failed(e) => {
+                    eprintln!("[vzt-flow] transcription error: {e}");
+                }
+                Decision::Skipped(_) => {}
             }
-
-            if let Ok(mut w) = writer.lock() {
-                w.append_line(start, chunk.source, &corrected);
-            }
-            recent.push_back(RecordedSeg { source: chunk.source, start, end, text: corrected });
         }
     }
 
     /// Microphone capture loop: opens a cpal input stream, feeds a chunker at
     /// the device's native rate, and forwards `Me` chunks. Runs until `stop`.
+    ///
+    /// The mic chunker keeps the documented [`SILENCE_HOLD_SECS`] hold in
+    /// every mode — the interview-mode hold is a `Them`-only policy, not a
+    /// global threshold change.
     fn run_mic_source(flush_tx: mpsc::Sender<Chunk>, stop: Arc<AtomicBool>) -> Result<()> {
         use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
         use cpal::{SampleFormat, StreamConfig};
@@ -550,7 +1122,16 @@ mod session {
     /// feeds a chunker at the capture rate, and forwards `Them` chunks. Runs on
     /// the calling thread until `stop` (the SCK stream is kept alive here and
     /// never crosses a thread boundary).
-    fn run_system_source(flush_tx: &mpsc::Sender<Chunk>, stop: &Arc<AtomicBool>) -> Result<()> {
+    ///
+    /// The chunker's silence hold is re-applied every iteration rather than
+    /// once at the top, so toggling interview mode mid-meeting tightens (or
+    /// relaxes) the `Them` cut on the very next block.
+    fn run_system_source(
+        flush_tx: &mpsc::Sender<Chunk>,
+        stop: &Arc<AtomicBool>,
+        interview: &Arc<AtomicBool>,
+        interview_hold_secs: f32,
+    ) -> Result<()> {
         let capture = syscapture::SystemAudioCapture::start()
             .context("failed to start ScreenCaptureKit system-audio capture")?;
         let rate = capture.sample_rate();
@@ -558,6 +1139,11 @@ mod session {
         let mut stats = SourceStats::new("system (SCK)");
 
         while !stop.load(Ordering::SeqCst) {
+            chunker.set_silence_hold_secs(if interview.load(Ordering::Relaxed) {
+                interview_hold_secs
+            } else {
+                SILENCE_HOLD_SECS
+            });
             match capture.recv_timeout(Duration::from_millis(100)) {
                 Ok(mono) => {
                     stats.observe(&mono);
@@ -623,70 +1209,54 @@ mod session {
         }
         samples.chunks(channels).map(|f| f.iter().sum::<f32>() / f.len() as f32).collect()
     }
-
-    /// Loads the cleanup model and appends `## Summary` + `## Action items` to
-    /// the transcript. Never crashes the meeting: any failure (missing model,
-    /// generation error) is logged and the transcript is left as-is.
-    fn summarize_into_file(writer: &Arc<Mutex<TranscriptWriter>>, path: &std::path::Path) {
-        let body = {
-            let guard = match writer.lock() {
-                Ok(g) => g,
-                Err(p) => p.into_inner(),
-            };
-            guard.body.join("\n")
-        };
-        if body.trim().is_empty() {
-            eprintln!("[vzt-flow] nothing was transcribed; skipping summary");
-            return;
-        }
-
-        let (input, truncated) = super::transcriber::truncate_for_summary(&body, SUMMARY_MAX_CHARS);
-        eprintln!("[vzt-flow] generating summary (this can take 10-60s)...");
-
-        let model_path = match cleanup_model_path() {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("[vzt-flow] summary skipped (cleanup model path error: {e})");
-                return;
-            }
-        };
-        let provider = match LlamaCleanupProvider::load(&model_path) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("[vzt-flow] summary skipped (cleanup model unavailable: {e})");
-                return;
-            }
-        };
-
-        let cancel = AtomicBool::new(false);
-        let summary = match provider.summarize(&input, &cancel) {
-            Ok(s) if !s.trim().is_empty() => s,
-            Ok(_) => {
-                eprintln!("[vzt-flow] summary generation produced no text; leaving transcript as-is");
-                return;
-            }
-            Err(e) => {
-                eprintln!("[vzt-flow] summary generation failed: {e}");
-                return;
-            }
-        };
-
-        if let Ok(mut w) = writer.lock() {
-            w.append_raw("");
-            if truncated {
-                w.append_raw("_(summary of final portion)_");
-                w.append_raw("");
-            }
-            w.append_raw(summary.trim());
-        }
-        let _ = path; // path retained for symmetry / future use
-    }
 }
-
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::Mutex;
+
+    use crate::llm::{GenRequest, NullGenerator, TextGenerator};
+
+    static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let n = TEMP_SEQ.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir()
+            .join(format!("vzt-meeting-mod-{}-{tag}-{n}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Returns a fixed body of markdown for every request.
+    struct CannedGen(String);
+
+    impl TextGenerator for CannedGen {
+        fn generate(&self, _req: GenRequest) -> Result<String> {
+            Ok(self.0.clone())
+        }
+    }
+
+    fn state_label(state: &SessionState) -> String {
+        match state {
+            SessionState::Recording => "recording".to_string(),
+            SessionState::Stopping => "stopping".to_string(),
+            SessionState::Finalizing { step } => format!("finalizing:{step}"),
+            SessionState::Completed => "completed".to_string(),
+            SessionState::Failed(msg) => format!("failed:{msg}"),
+        }
+    }
+
+    /// A state observer plus the log it appends to.
+    fn state_recorder() -> (Arc<Mutex<Vec<String>>>, StateObserver) {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&log);
+        let observer: StateObserver = Arc::new(move |state: &SessionState| {
+            sink.lock().unwrap().push(state_label(state));
+        });
+        (log, observer)
+    }
 
     #[test]
     fn slug_is_filesystem_safe() {
@@ -708,8 +1278,7 @@ mod tests {
 
     #[test]
     fn summarize_file_parses_header_and_duration() {
-        let dir = std::env::temp_dir().join(format!("vzt-meeting-test-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
+        let dir = temp_dir("summarize-file");
         let path = dir.join("2026-07-08-demo.md");
         fs::write(
             &path,
@@ -730,5 +1299,331 @@ mod tests {
     fn list_meetings_on_missing_dir_is_empty() {
         let dir = std::env::temp_dir().join("vzt-meeting-does-not-exist-xyz");
         assert!(list_meetings(&dir, 10).unwrap().is_empty());
+    }
+
+    /// The no-permission integration oracle: a synthetic line goes to disk
+    /// first and reaches every observer second, and a panicking observer
+    /// costs its notification rather than the line or the session.
+    #[test]
+    fn a_synthetic_line_reaches_every_observer() {
+        let dir = temp_dir("fanout");
+        let path = dir.join("2026-09-09-fanout.md");
+        let file = OpenOptions::new().create(true).append(true).open(&path).unwrap();
+
+        let mut fanout = LineFanout::new("sess-fanout");
+
+        // Registered first: it reads the transcript back from disk while the
+        // notification is in flight, so this fails against any writer that
+        // notifies before it flushes.
+        let durable = Arc::new(Mutex::new(Vec::<bool>::new()));
+        {
+            let durable = Arc::clone(&durable);
+            let path = path.clone();
+            fanout.add_observer(Arc::new(move |line: &TranscriptLine| {
+                let on_disk = fs::read_to_string(&path).unwrap_or_default();
+                durable.lock().unwrap().push(on_disk.contains(&line.text));
+            }));
+        }
+
+        let seen: Vec<Arc<Mutex<Vec<(u64, String)>>>> =
+            (0..3).map(|_| Arc::new(Mutex::new(Vec::new()))).collect();
+        for sink in &seen {
+            let sink = Arc::clone(sink);
+            fanout.add_observer(Arc::new(move |line: &TranscriptLine| {
+                sink.lock().unwrap().push((line.seq, line.text.clone()));
+            }));
+        }
+        // Registered last, so the three above still see every line.
+        fanout.add_observer(Arc::new(|line: &TranscriptLine| {
+            assert!(line.seq != 2, "observer panics on the second line (deliberate)");
+        }));
+
+        let mut writer = TranscriptWriter::new(file, fanout);
+        let texts = ["first line", "second line", "third line"];
+        for (i, text) in texts.iter().enumerate() {
+            let emitted = writer.append_line(i as f32 * 10.0, transcriber::Source::Them, text);
+            if i == 1 {
+                assert!(emitted.is_none(), "a panicking observer yields no delivered line");
+            } else {
+                let emitted = emitted.expect("line delivered");
+                assert_eq!(emitted.seq as usize, i + 1);
+                assert_eq!(emitted.session_id, "sess-fanout");
+                assert_eq!(emitted.text, *text);
+            }
+        }
+        assert_eq!(writer.body.len(), 3);
+        drop(writer);
+
+        // Every observer saw a line that was already on disk.
+        assert_eq!(*durable.lock().unwrap(), vec![true, true, true]);
+
+        // Every line is on disk — including the one whose observer panicked.
+        let content = fs::read_to_string(&path).unwrap();
+        for text in texts {
+            assert!(content.contains(text), "{text} missing from {content}");
+        }
+        assert!(content.contains("[00:00:20] Them: third line"));
+
+        for sink in &seen {
+            let got = sink.lock().unwrap().clone();
+            assert_eq!(got.iter().map(|(seq, _)| *seq).collect::<Vec<_>>(), vec![1, 2, 3]);
+        }
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn reserve_transcript_path_is_unique_for_same_second_starts() {
+        let dir = temp_dir("reserve");
+        // One timestamp for all five: the same date *and* the same second,
+        // which is exactly what the old exists-then-open shape collided on.
+        let now = chrono::Local::now();
+        let mut paths = Vec::new();
+        for _ in 0..5 {
+            paths.push(reserve_transcript_path(&dir, &now, "Weekly Sync").unwrap());
+        }
+
+        let unique: std::collections::HashSet<&PathBuf> = paths.iter().collect();
+        assert_eq!(unique.len(), 5, "collided: {paths:?}");
+        for path in &paths {
+            assert!(path.exists(), "{} was not created", path.display());
+            let content = fs::read_to_string(path).unwrap();
+            assert!(content.starts_with("# Meeting: Weekly Sync — "), "bad header: {content}");
+        }
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 5);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn list_meetings_ignores_the_notes_sidecar() {
+        let dir = temp_dir("sidecar");
+        let transcript = dir.join("2026-09-08-standup.md");
+        fs::write(&transcript, "# Meeting: Standup — 2026-09-08 09:00\n\n[00:00:01] Them: hi\n").unwrap();
+        fs::write(notes::notes_path_for(&transcript), "my typed notes\n").unwrap();
+
+        let found = list_meetings(&dir, 10).unwrap();
+        assert_eq!(found.len(), 1, "sidecar leaked into the listing: {found:?}");
+        assert_eq!(found[0].title, "Standup");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Compile-level: the exact shapes `flow-cli` (`commands/meeting.rs:22`)
+    /// and the desktop (`meeting_ctl.rs:78/110`) call must still exist, and
+    /// the defaults must fill in everything they don't pass. Coercing to
+    /// `fn` pointers is the assertion — actually running a session would need
+    /// a microphone, Screen Recording and the Parakeet model.
+    #[test]
+    fn run_with_defaults_matches_the_legacy_run_signature() {
+        let legacy_run: fn(Option<String>, Option<PathBuf>, Arc<AtomicBool>) -> Result<PathBuf> = run;
+        let legacy_start: fn(Option<String>, Option<PathBuf>) -> MeetingHandle = start;
+        let legacy_stop: fn(MeetingHandle) -> Result<PathBuf> = MeetingHandle::stop;
+        let legacy_is_running: fn(&MeetingHandle) -> bool = MeetingHandle::is_running;
+        let full: fn(MeetingOptions, Arc<AtomicBool>) -> Result<MeetingOutcome> = run_with;
+        let full_start: fn(MeetingOptions) -> Result<MeetingHandle> = start_with;
+        let full_stop: fn(MeetingHandle) -> Result<MeetingOutcome> = MeetingHandle::stop_detailed;
+
+        // What `run`/`start` hand to `run_with` for everything else.
+        let opts = MeetingOptions {
+            title: Some("Weekly Sync".to_string()),
+            out_dir: Some(PathBuf::from("/tmp")),
+            ..Default::default()
+        };
+        assert!(opts.transcript_path.is_none());
+        assert!(opts.on_started.is_none() && opts.on_line.is_none());
+        assert!(opts.on_state.is_none() && opts.on_tip.is_none());
+        assert!(opts.generator.is_none() && opts.interview_context.is_none());
+        assert!(opts.pdf.is_none(), "no PDF unless the caller asks for one");
+        assert!(!opts.interview.load(Ordering::SeqCst), "interview mode is off by default");
+
+        let _ = (
+            legacy_run,
+            legacy_start,
+            legacy_stop,
+            legacy_is_running,
+            full,
+            full_start,
+            full_stop,
+        );
+    }
+
+    #[test]
+    fn finalize_records_a_pdf_error_without_failing_the_meeting() {
+        let dir = temp_dir("pdf-error");
+        let now = chrono::Local::now();
+        let transcript = reserve_transcript_path(&dir, &now, "Broken Export").unwrap();
+        let notes_path = notes::notes_path_for(&transcript);
+
+        // A regular file where the export directory should be: `create_dir_all`
+        // fails against it, which is the portable stand-in for an unwritable
+        // destination (and unlike a chmod, it also blocks a root test runner).
+        let blocked = dir.join("blocked");
+        fs::write(&blocked, b"not a directory").unwrap();
+
+        let (log, on_state) = state_recorder();
+        let generator = NullGenerator;
+        let summary_opts = summary::SummaryOptions::default();
+        let pdf_opts = pdf::PdfOptions { dir: blocked.join("exports"), enabled: true };
+
+        let outcome = finalize(
+            FinalizeRequest {
+                session_id: &session_id_for(&transcript),
+                title: "Broken Export",
+                started_at: now,
+                transcript: &transcript,
+                notes_path: &notes_path,
+                generator: &generator,
+                summary: &summary_opts,
+                pdf: Some(&pdf_opts),
+                on_state: Some(&on_state),
+                model_note: None,
+            },
+            || vec!["Them: are we shipping".to_string(), "Me: yes".to_string()],
+        );
+
+        assert!(outcome.transcript.exists(), "the transcript survives a failed export");
+        assert!(outcome.pdf.is_none());
+        let err = outcome.pdf_error.expect("pdf error recorded");
+        assert!(!err.is_empty());
+
+        let states = log.lock().unwrap().clone();
+        assert_eq!(states.last().map(String::as_str), Some("completed"), "states: {states:?}");
+        assert!(states.iter().any(|s| s == "finalizing:writing pdf"));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn finalize_emits_states_in_order() {
+        let dir = temp_dir("states");
+        let now = chrono::Local::now();
+        let transcript = reserve_transcript_path(&dir, &now, "Ordered").unwrap();
+        let notes_path = notes::notes_path_for(&transcript);
+
+        let (log, on_state) = state_recorder();
+        let generator = CannedGen("## Summary\n- shipped\n".to_string());
+        let summary_opts = summary::SummaryOptions::default();
+        let pdf_opts = pdf::PdfOptions { dir: dir.join("exports"), enabled: true };
+
+        let _ = finalize(
+            FinalizeRequest {
+                session_id: &session_id_for(&transcript),
+                title: "Ordered",
+                started_at: now,
+                transcript: &transcript,
+                notes_path: &notes_path,
+                generator: &generator,
+                summary: &summary_opts,
+                pdf: Some(&pdf_opts),
+                on_state: Some(&on_state),
+                model_note: None,
+            },
+            || vec!["Them: shall we ship".to_string()],
+        );
+
+        let states = log.lock().unwrap().clone();
+        assert_eq!(states.first().map(String::as_str), Some("stopping"), "states: {states:?}");
+        assert_eq!(states.last().map(String::as_str), Some("completed"), "states: {states:?}");
+
+        let stopping = states.iter().position(|s| s == "stopping").unwrap();
+        let first_finalizing = states.iter().position(|s| s.starts_with("finalizing:")).unwrap();
+        assert!(stopping < first_finalizing, "states: {states:?}");
+        assert_eq!(states[first_finalizing], "finalizing:merging notes");
+        assert!(states.iter().any(|s| s.starts_with("finalizing:summarizing ")), "states: {states:?}");
+        assert!(states.iter().any(|s| s == "finalizing:writing pdf"), "states: {states:?}");
+        assert!(!states.iter().any(|s| s.starts_with("failed")), "states: {states:?}");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// With no cleanup model the session degrades to a `NullGenerator`, and
+    /// the transcript says so — but it must not carry a coverage line
+    /// claiming to cover a summary that was never written.
+    #[test]
+    fn a_missing_cleanup_model_is_explained_not_claimed_as_coverage() {
+        let dir = temp_dir("no-model");
+        let now = chrono::Local::now();
+        let transcript = reserve_transcript_path(&dir, &now, "No Model").unwrap();
+        let notes_path = notes::notes_path_for(&transcript);
+        let generator = NullGenerator;
+        let summary_opts = summary::SummaryOptions::default();
+
+        let outcome = finalize(
+            FinalizeRequest {
+                session_id: &session_id_for(&transcript),
+                title: "No Model",
+                started_at: now,
+                transcript: &transcript,
+                notes_path: &notes_path,
+                generator: &generator,
+                summary: &summary_opts,
+                pdf: None,
+                on_state: None,
+                model_note: Some("No cleanup model is installed, so no summary was generated."),
+            },
+            || vec!["Them: hello".to_string()],
+        );
+
+        assert!(!outcome.summary_complete);
+        let content = fs::read_to_string(&transcript).unwrap();
+        assert!(content.contains("No cleanup model is installed"), "{content}");
+        assert!(!content.contains("Summary covers the full transcript"), "{content}");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn notes_are_merged_before_the_summary_is_appended() {
+        let dir = temp_dir("notes-order");
+        let now = chrono::Local::now();
+        let transcript = reserve_transcript_path(&dir, &now, "Notes First").unwrap();
+        let notes_path = notes::notes_path_for(&transcript);
+        fs::write(&notes_path, "ask about pricing\n").unwrap();
+        // A real capture line, so the transcript has a body before finalize.
+        {
+            let mut f = OpenOptions::new().append(true).open(&transcript).unwrap();
+            writeln!(f, "[00:00:05] Them: what does it cost").unwrap();
+        }
+
+        let (log, on_state) = state_recorder();
+        let generator = CannedGen(
+            "## Summary\n- pricing was discussed\n\n## Action items\n- send the quote".to_string(),
+        );
+        let summary_opts = summary::SummaryOptions::default();
+
+        let outcome = finalize(
+            FinalizeRequest {
+                session_id: &session_id_for(&transcript),
+                title: "Notes First",
+                started_at: now,
+                transcript: &transcript,
+                notes_path: &notes_path,
+                generator: &generator,
+                summary: &summary_opts,
+                pdf: None,
+                on_state: Some(&on_state),
+                model_note: None,
+            },
+            || vec!["Them: what does it cost".to_string()],
+        );
+
+        assert!(outcome.notes_merged, "the sidecar should have been merged");
+        assert_eq!(outcome.summary_sections, 1);
+        assert!(outcome.summary_complete);
+
+        let content = fs::read_to_string(&transcript).unwrap();
+        let notes_at = content.find(notes::NOTES_HEADING).expect("## My notes heading");
+        let summary_at = content.find("## Summary").expect("## Summary heading");
+        assert!(notes_at < summary_at, "notes must precede the summary:\n{content}");
+        assert!(content.contains("ask about pricing"));
+        assert!(content.contains("_Summary covers the full transcript"));
+
+        let states = log.lock().unwrap().clone();
+        let merging = states.iter().position(|s| s == "finalizing:merging notes").unwrap();
+        let summarizing = states.iter().position(|s| s.starts_with("finalizing:summarizing ")).unwrap();
+        assert!(merging < summarizing, "states: {states:?}");
+
+        fs::remove_dir_all(&dir).ok();
     }
 }

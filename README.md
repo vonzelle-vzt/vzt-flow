@@ -179,7 +179,7 @@ same local Parakeet engine, and writes a timestamped `Me:`/`Them:` Markdown
 transcript with an echo filter (Jaccard similarity > 0.7 on time-overlapping
 lines) that drops your own mic re-picking-up speaker audio from participants
 without headphones. Stopping the meeting appends a local Qwen3-generated
-summary and action items. A `meeting_transcript` MCP tool exposes transcripts
+summary and action items. The desktop companion adds autosaved meeting notes, a Desktop PDF, and optional local interview tips after each detected question. A `meeting_transcript` MCP tool exposes transcripts
 to Claude Code ("summarize my last meeting", "pull the action items"). A
 background auto-detector (tray → **Meeting auto-detect ▸ Ask/Auto/Off**)
 combines frontmost-app matching (Zoom/Meet/Teams) with a mic-live signal to

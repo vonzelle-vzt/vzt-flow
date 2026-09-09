@@ -29,6 +29,70 @@ const btnModel = document.getElementById("btn-model");
 const btnCleanup = document.getElementById("btn-cleanup");
 const modelProgressRow = document.getElementById("model-progress-row");
 const modelProgress = document.getElementById("model-progress");
+const interviewContext = document.getElementById("interview-context");
+const interviewContextStatus = document.getElementById("interview-context-status");
+const meetingNotepad = document.getElementById("meeting-notepad");
+const meetingPdf = document.getElementById("meeting-pdf");
+const meetingInterview = document.getElementById("meeting-interview");
+const meetingPdfDir = document.getElementById("meeting-pdf-dir");
+const meetingSettingsStatus = document.getElementById("meeting-settings-status");
+const meetingControls = [meetingNotepad, meetingPdf, meetingInterview, meetingPdfDir];
+let meetingConfigLoaded = false;
+
+function fieldStatus(element, text, error = false) {
+  element.textContent = text;
+  element.classList.toggle("error", error);
+}
+
+let contextTimer = null;
+let contextSaving = false;
+let contextDirty = false;
+let contextRevision = 0;
+async function loadInterviewContext() {
+  try {
+    interviewContext.value = (await invoke("get_interview_context")) || "";
+    interviewContext.disabled = false;
+    fieldStatus(interviewContextStatus, "Saved");
+  } catch (error) {
+    // Keep the editor disabled on read failure so it cannot replace unread data.
+    fieldStatus(interviewContextStatus, `Couldn't load: ${error}`, true);
+  }
+}
+async function saveInterviewContext() {
+  if (!contextDirty || contextSaving) return;
+  clearTimeout(contextTimer);
+  contextTimer = null;
+  contextSaving = true;
+  const revision = contextRevision;
+  const text = interviewContext.value;
+  fieldStatus(interviewContextStatus, "Saving…");
+  let failed = false;
+  try {
+    await invoke("set_interview_context", { text });
+    contextDirty = revision !== contextRevision;
+    fieldStatus(interviewContextStatus, contextDirty ? "Unsaved changes" : "Saved");
+  } catch (error) {
+    failed = true;
+    fieldStatus(interviewContextStatus, `Couldn't save: ${error}`, true);
+  } finally {
+    contextSaving = false;
+    // A slow write cannot overtake the next draft or falsely mark it saved.
+    if (contextDirty && (!failed || revision !== contextRevision)) {
+      clearTimeout(contextTimer);
+      contextTimer = setTimeout(saveInterviewContext, 800);
+    }
+  }
+}
+interviewContext.addEventListener("input", () => {
+  contextRevision++;
+  contextDirty = true;
+  fieldStatus(interviewContextStatus, "Unsaved changes");
+  clearTimeout(contextTimer);
+  contextTimer = setTimeout(saveInterviewContext, 800);
+});
+interviewContext.addEventListener("blur", saveInterviewContext);
+window.addEventListener("beforeunload", () => { void saveInterviewContext(); });
+
 
 function setDot(el, ok) {
   el.classList.toggle("ok", ok);
@@ -159,6 +223,13 @@ async function loadConfig() {
   hotkeySelect.value = String(config.hotkey_keycode);
   holdThreshold.value = config.hold_threshold_ms;
   launchAtLogin.checked = config.launch_at_login;
+  meetingNotepad.checked = config.meeting_notepad;
+  meetingPdf.checked = config.meeting_pdf;
+  meetingInterview.checked = config.meeting_interview;
+  meetingPdfDir.value = config.meeting_pdf_dir || "";
+  meetingConfigLoaded = true;
+  meetingControls.forEach(control => { control.disabled = false; });
+  fieldStatus(meetingSettingsStatus, "Saved");
 }
 
 async function saveConfig() {
@@ -172,6 +243,12 @@ async function saveConfig() {
   }
   config.hold_threshold_ms = Number(holdThreshold.value);
   config.launch_at_login = launchAtLogin.checked;
+  if (meetingConfigLoaded) {
+    config.meeting_notepad = meetingNotepad.checked;
+    config.meeting_pdf = meetingPdf.checked;
+    config.meeting_interview = meetingInterview.checked;
+    config.meeting_pdf_dir = meetingPdfDir.value;
+  }
   await invoke("set_config", { config });
 }
 
@@ -270,6 +347,18 @@ btnHotkey.addEventListener("click", async () => {
 hotkeySelect.addEventListener("change", saveConfig);
 holdThreshold.addEventListener("change", saveConfig);
 launchAtLogin.addEventListener("change", saveConfig);
+// Use the same full get_config / set_config round trip as the other settings.
+// Queue these writes so rapid checkbox changes retain their final order.
+let meetingSaveQueue = Promise.resolve();
+for (const control of meetingControls) {
+  control.addEventListener("change", () => {
+    fieldStatus(meetingSettingsStatus, "Saving…");
+    meetingSaveQueue = meetingSaveQueue.then(async () => {
+      try { await saveConfig(); fieldStatus(meetingSettingsStatus, "Saved"); }
+      catch (error) { fieldStatus(meetingSettingsStatus, `Couldn't save: ${error}`, true); }
+    });
+  });
+}
 
 btnCopy.addEventListener("click", async () => {
   await invoke("copy_last_transcript");
@@ -293,7 +382,10 @@ if (!IS_MAC) {
   btnCleanup.disabled = true;
 }
 
-loadConfig();
+loadConfig().catch(error => {
+  fieldStatus(meetingSettingsStatus, `Couldn't load: ${error}`, true);
+});
+loadInterviewContext();
 loadTranscript();
 loadProfilesPath();
 loadHistory();

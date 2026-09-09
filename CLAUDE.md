@@ -236,6 +236,16 @@ is useless for a corpus) and counts echoes. Build the corpus from
 dictation and is therefore the record of what the LLM pass actually did. Keep
 corpora out of the repo — it is the user's dictation history.
 
+`cleanup_manager` is now the single owner of the desktop's resident LLM;
+`meeting::finalize` must use that generator and never load a second
+`LlamaCleanupProvider`.
+
+**(m) A new Tauri window label must be added to
+`apps/desktop/src-tauri/capabilities/default.json`, or every `invoke` from it is
+silently denied.** Loading the HTML and JavaScript is not proof the window can
+call commands. Include the label (for example, `notes`) in the capability's
+`windows` list and verify an actual invoke from that window.
+
 ## Verification norms
 
 - **Test with real TTS audio**, not silence/noise: `say -o /tmp/clip.aiff
