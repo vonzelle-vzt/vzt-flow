@@ -6,19 +6,105 @@
 //! The order of operations here is the order the live worker used before the
 //! extraction and must stay that way — accuracy work downstream measures
 //! itself against a baseline taken through this code.
+//!
+//! Accuracy changes (min-speech gate, normalization, seam dedup, low-
+//! information drop, echo tolerance/containment) are each independently
+//! switchable via [`PipelineOptions`], so an offline replay harness can
+//! attribute a WER change to one flip at a time. All are `true` in
+//! production (`PipelineOptions::default()`); [`PipelineOptions::legacy()`]
+//! reproduces the pre-accuracy-work (B0) behaviour exactly.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 
+use crate::chunking;
 use crate::dictionary;
 
-use super::dedup::{is_echo, time_overlaps, DEFAULT_ECHO_THRESHOLD};
-use super::transcriber::{Chunk, Source};
+use super::dedup::{is_echo_with, overlaps_within, time_overlaps, DEFAULT_ECHO_THRESHOLD, ECHO_TIME_TOLERANCE_SECS};
+use super::transcriber::{Chunk, Source, MIN_SPEECH_SECS};
 
 /// How long a transcribed segment stays eligible for echo comparison. A
 /// `Me:` chunk is only ever dropped as an echo of a `Them:` chunk it
 /// overlaps in time with, so we only need to retain very recent history.
 pub const DEDUP_RETAIN_SECS: f32 = 30.0;
+
+/// Peak below which a chunk is considered too quiet for the engine and is
+/// gain-scaled before inference. ScreenCaptureKit system audio routinely
+/// arrives far below microphone level (see `SourceStats`' peak report), and
+/// Parakeet's features are amplitude-sensitive.
+pub const NORMALIZE_PEAK_THRESHOLD: f32 = 0.1;
+/// Peak a normalized chunk is scaled to. Well under 1.0 so no sample clips.
+pub const NORMALIZE_TARGET_PEAK: f32 = 0.5;
+/// Ceiling on the applied gain, so a near-silent chunk of pure noise is not
+/// amplified into something the engine will hallucinate words from.
+pub const NORMALIZE_MAX_GAIN: f32 = 12.0;
+
+/// How long an emitted line is held before it is written. Two jobs: it lets a
+/// `Them` chunk that finishes transcribing *after* an overlapping `Me` chunk
+/// still veto that `Me` line as an echo (the two sources chunk independently,
+/// so completion order is not span order), and it makes the transcript file
+/// closer to monotonic in timestamp. The cost is that a crash loses up to
+/// this much transcript instead of ~nothing — bounded deliberately small.
+///
+/// Applies to `Me` lines only. `Them` lines pass straight through
+/// unheld: they are never vetoed themselves (only `Me` lines are ever
+/// dropped as echoes), and holding them would delay the interview coach and
+/// the live notepad by up to this long for no benefit.
+pub const LINE_HOLD_SECS: f32 = 5.0;
+
+/// Peak-normalizes `samples` in place when the peak is under
+/// [`NORMALIZE_PEAK_THRESHOLD`]. Returns the gain applied (1.0 = untouched).
+/// A silent (all-zero) buffer is left untouched and returns 1.0 rather than
+/// dividing by zero.
+pub fn normalize_for_asr(samples: &mut [f32]) -> f32 {
+    let peak = samples.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+    if peak <= 0.0 || peak >= NORMALIZE_PEAK_THRESHOLD {
+        return 1.0;
+    }
+    let gain = (NORMALIZE_TARGET_PEAK / peak).min(NORMALIZE_MAX_GAIN);
+    for s in samples.iter_mut() {
+        *s *= gain;
+    }
+    gain
+}
+
+/// Vocalizations that carry no lexical content on their own. A single-token
+/// transcription of exactly one of these is dropped; the same word inside a
+/// longer real sentence is left alone.
+const BARE_VOCALIZATIONS: [&str; 5] = ["uh", "um", "mm", "hmm", "mhm"];
+
+/// Normalizes `text` into lowercase, alphanumeric-only word tokens, dropping
+/// tokens that go fully empty (pure punctuation).
+fn alnum_tokens(text: &str) -> Vec<String> {
+    text.split_whitespace()
+        .map(|w| w.chars().filter(|c| c.is_alphanumeric()).flat_map(|c| c.to_lowercase()).collect::<String>())
+        .filter(|w| !w.is_empty())
+        .collect()
+}
+
+/// Whether a transcribed line carries no information and is almost certainly
+/// an ASR artifact rather than speech: no alphanumeric token; six or more
+/// tokens with two or fewer distinct ones (the repeated-token loop Parakeet
+/// falls into on noise); or a single token that is a pure vocalization
+/// ("uh", "um", "mm", "hmm", "mhm"). Deliberately narrow — real
+/// back-channels ("yeah", "right", "for sure") are speech and must survive,
+/// which is the same commitment `dedup::MIN_TOKENS_FOR_ECHO` makes.
+pub fn is_low_information(text: &str) -> bool {
+    let tokens = alnum_tokens(text);
+    if tokens.is_empty() {
+        return true;
+    }
+    if tokens.len() >= 6 {
+        let distinct: HashSet<&String> = tokens.iter().collect();
+        if distinct.len() <= 2 {
+            return true;
+        }
+    }
+    if tokens.len() == 1 && BARE_VOCALIZATIONS.contains(&tokens[0].as_str()) {
+        return true;
+    }
+    false
+}
 
 /// One transcribed, dictionary-corrected line, retained briefly for the
 /// echo-dedup time/word comparison.
@@ -52,6 +138,62 @@ pub enum SkipReason {
     EmptySamples,
     /// The engine returned nothing but whitespace.
     EmptyText,
+    /// `chunk.speech_secs` was under `MIN_SPEECH_SECS` — a blip, not a word.
+    TooShort,
+    /// The corrected text carried no information (see [`is_low_information`]).
+    LowInformation,
+}
+
+/// Which accuracy changes are active in a [`ChunkPipeline`]. Every field
+/// defaults to `true` (production behaviour); flip individual fields to
+/// attribute a WER change to one mechanism at a time, or use
+/// [`PipelineOptions::legacy`] to reproduce the pre-accuracy-work pipeline.
+#[derive(Clone, Copy, Debug)]
+pub struct PipelineOptions {
+    /// Gate 1: skip a chunk whose `speech_secs` is under `MIN_SPEECH_SECS`
+    /// before it ever reaches the engine.
+    pub min_speech: bool,
+    /// Gate 2: peak-normalize quiet chunks before transcription.
+    pub normalize: bool,
+    /// Gate 3: seam-dedup a hard-cap-cut chunk against the previous chunk
+    /// from the same source before dictionary correction.
+    pub seam_dedup: bool,
+    /// Gate 4: drop corrected text that carries no information.
+    pub low_information: bool,
+    /// Echo check: use `overlaps_within` (a small time-tolerance window)
+    /// instead of a strict half-open `time_overlaps`.
+    pub echo_tolerance: bool,
+    /// Echo check: also treat a mic line that is mostly *contained* in the
+    /// system-audio line (not just Jaccard-similar) as an echo.
+    pub echo_containment: bool,
+}
+
+impl Default for PipelineOptions {
+    fn default() -> Self {
+        Self {
+            min_speech: true,
+            normalize: true,
+            seam_dedup: true,
+            low_information: true,
+            echo_tolerance: true,
+            echo_containment: true,
+        }
+    }
+}
+
+impl PipelineOptions {
+    /// All accuracy gates off — reproduces the B0 extraction's behaviour
+    /// exactly, for the replay harness's baseline column.
+    pub fn legacy() -> Self {
+        Self {
+            min_speech: false,
+            normalize: false,
+            seam_dedup: false,
+            low_information: false,
+            echo_tolerance: false,
+            echo_containment: false,
+        }
+    }
 }
 
 /// The per-chunk meeting pipeline: resample, transcribe, dictionary-correct,
@@ -61,11 +203,28 @@ pub enum SkipReason {
 pub struct ChunkPipeline {
     recent: VecDeque<RecordedSeg>,
     dict: Arc<Vec<dictionary::DictionaryTerm>>,
+    opts: PipelineOptions,
+    /// Raw (pre-dedup, pre-dictionary-correction) text of the last chunk seen
+    /// from each source, for seam dedup. Kept as two plain fields rather than
+    /// a `HashMap<Source, _>` because `Source` isn't `Hash` and there are
+    /// only ever two sources.
+    prev_text_me: String,
+    prev_text_them: String,
 }
 
 impl ChunkPipeline {
     pub fn new(dict: Arc<Vec<dictionary::DictionaryTerm>>) -> Self {
-        Self { recent: VecDeque::new(), dict }
+        Self::with_options(dict, PipelineOptions::default())
+    }
+
+    pub fn with_options(dict: Arc<Vec<dictionary::DictionaryTerm>>, opts: PipelineOptions) -> Self {
+        Self {
+            recent: VecDeque::new(),
+            dict,
+            opts,
+            prev_text_me: String::new(),
+            prev_text_them: String::new(),
+        }
     }
 
     /// Runs one chunk end to end. `transcribe` receives 16 kHz mono samples
@@ -80,24 +239,69 @@ impl ChunkPipeline {
         if chunk.samples.is_empty() {
             return Decision::Skipped(SkipReason::EmptySamples);
         }
+        if self.opts.min_speech && chunk.speech_secs < MIN_SPEECH_SECS {
+            return Decision::Skipped(SkipReason::TooShort);
+        }
         let start = chunk.start_offset;
         let end = chunk.end_offset();
 
         // Resample native -> 16 kHz for the engine.
-        let samples = crate::audio::resample_linear(
+        let mut samples = crate::audio::resample_linear(
             &chunk.samples,
             chunk.sample_rate,
             crate::audio::TARGET_SAMPLE_RATE,
         );
 
-        let text = match transcribe(&samples) {
+        if self.opts.normalize {
+            let peak_before = samples.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+            let gain = normalize_for_asr(&mut samples);
+            if gain != 1.0 {
+                let peak_after = peak_before * gain;
+                eprintln!(
+                    "[vzt-flow] normalized {} chunk at {:.1}s: peak {:.3} -> {:.2} (gain {:.1}x)",
+                    chunk.source.label(),
+                    start,
+                    peak_before,
+                    peak_after,
+                    gain
+                );
+            }
+        }
+
+        let raw = match transcribe(&samples) {
             Ok(t) => t.trim().to_string(),
             Err(e) => return Decision::Failed(e.to_string()),
         };
+        if raw.is_empty() {
+            return Decision::Skipped(SkipReason::EmptyText);
+        }
+
+        let text = if self.opts.seam_dedup && chunk.seam_dedup {
+            let prev = match chunk.source {
+                Source::Me => &self.prev_text_me,
+                Source::Them => &self.prev_text_them,
+            };
+            chunking::dedup_seam(prev, &raw)
+        } else {
+            raw.clone()
+        };
+
+        if self.opts.seam_dedup {
+            match chunk.source {
+                Source::Me => self.prev_text_me = raw.clone(),
+                Source::Them => self.prev_text_them = raw.clone(),
+            }
+        }
+
         if text.is_empty() {
             return Decision::Skipped(SkipReason::EmptyText);
         }
+
         let corrected = dictionary::correct(&text, &self.dict);
+
+        if self.opts.low_information && is_low_information(&corrected) {
+            return Decision::Skipped(SkipReason::LowInformation);
+        }
 
         // Prune history older than the dedup window relative to this chunk.
         while let Some(front) = self.recent.front() {
@@ -112,9 +316,15 @@ impl ChunkPipeline {
         // and is textually near-identical (the no-headphones case).
         if chunk.source == Source::Me {
             let echo = self.recent.iter().any(|seg| {
-                seg.source == Source::Them
-                    && time_overlaps(start, end, seg.start, seg.end)
-                    && is_echo(&corrected, &seg.text, DEFAULT_ECHO_THRESHOLD)
+                if seg.source != Source::Them {
+                    return false;
+                }
+                let overlaps = if self.opts.echo_tolerance {
+                    overlaps_within(start, end, seg.start, seg.end, ECHO_TIME_TOLERANCE_SECS)
+                } else {
+                    time_overlaps(start, end, seg.start, seg.end)
+                };
+                overlaps && is_echo_with(&corrected, &seg.text, DEFAULT_ECHO_THRESHOLD, self.opts.echo_containment)
             });
             if echo {
                 return Decision::DroppedEcho(corrected);
@@ -131,14 +341,96 @@ impl ChunkPipeline {
     }
 }
 
+/// One line held by a [`LineBuffer`], awaiting release.
+struct HeldLine {
+    start: f32,
+    /// Best-effort end of the held line's span — the meeting offset at which
+    /// it was pushed, since `Decision` doesn't carry a span end.
+    end: f32,
+    text: String,
+}
+
+/// Holds emitted `Me` lines briefly, releasing them in `start_offset` order
+/// once they are older than [`LINE_HOLD_SECS`] of meeting time, and
+/// re-running the echo veto against `Them` lines that arrive late. `Them`
+/// lines are never held: they pass straight through immediately, since they
+/// are never vetoed themselves and holding them would delay the interview
+/// coach and the live notepad for no benefit.
+pub struct LineBuffer {
+    held: Vec<HeldLine>,
+}
+
+impl LineBuffer {
+    pub fn new() -> Self {
+        Self { held: Vec::new() }
+    }
+
+    /// Feed a decision at meeting-time `now_offset` (the offset at which the
+    /// chunk producing `d` finished processing). Returns any lines now due
+    /// for writing, in `start_offset` order — including, immediately, the
+    /// `Them` line carried by `d` itself if any.
+    pub fn push(&mut self, d: Decision, now_offset: f32) -> Vec<(f32, Source, String)> {
+        let mut out = Vec::new();
+        match d {
+            Decision::Emit { start, source: Source::Me, text } => {
+                self.held.push(HeldLine { start, end: now_offset, text });
+            }
+            Decision::Emit { start, source: Source::Them, text } => {
+                let them_end = now_offset;
+                // A Them line that overlaps and textually echoes a held Me
+                // line vetoes it, even though the Me line was emitted first —
+                // the two sources chunk (and finish transcribing)
+                // independently, so completion order is not span order.
+                self.held.retain(|held| {
+                    let overlaps = overlaps_within(held.start, held.end, start, them_end, ECHO_TIME_TOLERANCE_SECS);
+                    !(overlaps && is_echo_with(&held.text, &text, DEFAULT_ECHO_THRESHOLD, true))
+                });
+                out.push((start, Source::Them, text));
+            }
+            // Skipped/Failed/DroppedEcho: nothing new to hold or release
+            // directly, but time has still advanced — fall through to the
+            // due-line check below.
+            _ => {}
+        }
+        out.extend(self.release_due(now_offset));
+        out.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        out
+    }
+
+    /// Releases held lines older than `LINE_HOLD_SECS`, oldest first.
+    fn release_due(&mut self, now_offset: f32) -> Vec<(f32, Source, String)> {
+        let (due, remaining): (Vec<_>, Vec<_>) =
+            self.held.drain(..).partition(|h| now_offset - h.start >= LINE_HOLD_SECS);
+        self.held = remaining;
+        let mut due: Vec<(f32, Source, String)> =
+            due.into_iter().map(|h| (h.start, Source::Me, h.text)).collect();
+        due.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        due
+    }
+
+    /// Meeting over: release everything, in `start_offset` order.
+    pub fn drain_all(&mut self) -> Vec<(f32, Source, String)> {
+        let mut all: Vec<(f32, Source, String)> =
+            self.held.drain(..).map(|h| (h.start, Source::Me, h.text)).collect();
+        all.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        all
+    }
+}
+
+impl Default for LineBuffer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::cell::Cell;
 
-    /// A chunk of `len_secs` of (unused) 16 kHz audio starting at `start`.
-    /// The samples are never analysed by the pipeline — the injected
-    /// transcriber decides the text — so silence is fine here.
+    /// A chunk of `len_secs` of (unused) 16 kHz audio starting at `start`,
+    /// with `speech_secs` set to the full chunk length (tests that care about
+    /// the min-speech gate override it explicitly).
     fn chunk_at(source: Source, start: f32, len_secs: f32) -> Chunk {
         let sample_rate = 16_000u32;
         Chunk {
@@ -147,6 +439,7 @@ mod tests {
             sample_rate,
             start_offset: start,
             has_speech: true,
+            speech_secs: len_secs,
             ..Default::default()
         }
     }
@@ -308,5 +601,251 @@ mod tests {
             them,
             Decision::Emit { start: 1.0, source: Source::Them, text: line.to_string() }
         );
+    }
+
+    // ---- B6: normalize_for_asr ----
+
+    #[test]
+    fn normalize_scales_a_quiet_chunk_to_the_target_peak() {
+        let mut samples = vec![0.0, 0.05, -0.03, 0.02];
+        let gain = normalize_for_asr(&mut samples);
+        assert!((gain - (NORMALIZE_TARGET_PEAK / 0.05)).abs() < 1e-4, "gain {gain}");
+        let peak = samples.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+        assert!((peak - NORMALIZE_TARGET_PEAK).abs() < 1e-4, "peak {peak}");
+    }
+
+    #[test]
+    fn normalize_leaves_a_loud_chunk_untouched() {
+        let mut samples = vec![0.0, 0.3, -0.5, 0.2];
+        let original = samples.clone();
+        let gain = normalize_for_asr(&mut samples);
+        assert_eq!(gain, 1.0);
+        assert_eq!(samples, original);
+    }
+
+    #[test]
+    fn normalize_respects_the_gain_ceiling() {
+        let mut samples = vec![1e-5, -1e-5];
+        let gain = normalize_for_asr(&mut samples);
+        assert_eq!(gain, NORMALIZE_MAX_GAIN);
+    }
+
+    #[test]
+    fn normalize_is_a_noop_on_digital_silence() {
+        let mut samples = vec![0.0; 100];
+        let gain = normalize_for_asr(&mut samples);
+        assert_eq!(gain, 1.0);
+        assert!(samples.iter().all(|s| *s == 0.0 && !s.is_nan()));
+    }
+
+    // ---- B6: is_low_information ----
+
+    #[test]
+    fn low_information_drops_punctuation_only() {
+        assert!(is_low_information("...  --  ,,,"));
+    }
+
+    #[test]
+    fn low_information_drops_a_repeated_token_loop() {
+        assert!(is_low_information("the the the the the the"));
+    }
+
+    #[test]
+    fn low_information_drops_a_bare_vocalization() {
+        assert!(is_low_information("um"));
+        assert!(is_low_information("Uh."));
+        assert!(is_low_information("Hmm"));
+    }
+
+    #[test]
+    fn low_information_keeps_a_real_backchannel() {
+        for phrase in ["yeah", "right", "for sure", "makes sense"] {
+            assert!(!is_low_information(phrase), "{phrase} should survive");
+        }
+    }
+
+    #[test]
+    fn low_information_keeps_a_short_real_sentence() {
+        assert!(!is_low_information("ship it"));
+    }
+
+    // ---- B6: min-speech gate ----
+
+    #[test]
+    fn too_short_chunks_are_skipped_before_the_engine_runs() {
+        let mut pipeline = ChunkPipeline::new(Arc::new(Vec::new()));
+        let mut chunk = chunk_at(Source::Them, 0.0, 3.0);
+        chunk.speech_secs = 0.1; // under MIN_SPEECH_SECS
+
+        let called = Cell::new(false);
+        let decision = pipeline.process(&chunk, |_| {
+            called.set(true);
+            Ok("should never run".to_string())
+        });
+
+        assert_eq!(decision, Decision::Skipped(SkipReason::TooShort));
+        assert!(!called.get(), "a too-short chunk must not reach the engine");
+    }
+
+    #[test]
+    fn a_half_second_utterance_is_still_transcribed() {
+        let mut pipeline = ChunkPipeline::new(Arc::new(Vec::new()));
+        let mut chunk = chunk_at(Source::Them, 0.0, 0.5);
+        chunk.speech_secs = 0.5; // > MIN_SPEECH_SECS (0.3)
+
+        let decision = pipeline.process(&chunk, says("ship it"));
+
+        assert_eq!(
+            decision,
+            Decision::Emit { start: 0.0, source: Source::Them, text: "ship it".to_string() }
+        );
+    }
+
+    // ---- B6: seam dedup ----
+
+    #[test]
+    fn seam_dedup_removes_the_overlapped_words_at_a_hard_cap_cut() {
+        let mut pipeline = ChunkPipeline::new(Arc::new(Vec::new()));
+
+        let first = pipeline.process(&chunk_at(Source::Them, 0.0, 5.0), says("meet me at the cafe"));
+        assert!(matches!(first, Decision::Emit { .. }));
+
+        let mut second = chunk_at(Source::Them, 5.0, 5.0);
+        second.seam_dedup = true;
+        let decision = pipeline.process(&second, says("at the cafe tomorrow"));
+
+        assert_eq!(
+            decision,
+            Decision::Emit { start: 5.0, source: Source::Them, text: "tomorrow".to_string() }
+        );
+    }
+
+    #[test]
+    fn seam_dedup_is_per_source() {
+        let mut pipeline = ChunkPipeline::new(Arc::new(Vec::new()));
+
+        pipeline.process(&chunk_at(Source::Me, 0.0, 5.0), says("meet me at the cafe"));
+
+        let mut them = chunk_at(Source::Them, 5.0, 5.0);
+        them.seam_dedup = true;
+        // A Them seam is compared only against previous Them text, which is
+        // empty here, so nothing from the Me line is deduped away.
+        let decision = pipeline.process(&them, says("at the cafe tomorrow"));
+
+        assert_eq!(
+            decision,
+            Decision::Emit {
+                start: 5.0,
+                source: Source::Them,
+                text: "at the cafe tomorrow".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn legacy_options_reproduce_the_b0_behaviour() {
+        // Under legacy() all four new gates are off, so a chunk the new gates
+        // would skip (too short *and* a low-information repeated-token loop)
+        // is still transcribed exactly like the pre-B6 pipeline.
+        let mut pipeline = ChunkPipeline::with_options(Arc::new(Vec::new()), PipelineOptions::legacy());
+        let mut chunk = chunk_at(Source::Them, 0.0, 0.2);
+        chunk.speech_secs = 0.1; // well under MIN_SPEECH_SECS
+
+        let decision = pipeline.process(&chunk, says("uh uh uh uh uh uh"));
+
+        assert_eq!(
+            decision,
+            Decision::Emit {
+                start: 0.0,
+                source: Source::Them,
+                text: "uh uh uh uh uh uh".to_string(),
+            }
+        );
+    }
+
+    // ---- B6: LineBuffer ----
+
+    #[test]
+    fn me_lines_are_released_in_order_after_the_hold_and_them_lines_pass_straight_through() {
+        let mut buf = LineBuffer::new();
+
+        let r1 = buf.push(Decision::Emit { start: 3.0, source: Source::Me, text: "third".into() }, 3.0);
+        assert!(r1.is_empty(), "a Me line is held, not released immediately");
+        let r2 = buf.push(Decision::Emit { start: 1.0, source: Source::Me, text: "first".into() }, 1.0);
+        assert!(r2.is_empty());
+
+        // A Them line passes straight through immediately, never held.
+        let r3 = buf.push(Decision::Emit { start: 2.0, source: Source::Them, text: "them line".into() }, 2.0);
+        assert_eq!(r3, vec![(2.0, Source::Them, "them line".to_string())]);
+
+        // Advance past the hold window: both Me lines are now due, oldest
+        // start_offset first.
+        let r4 = buf.push(Decision::Skipped(SkipReason::NoSpeech), 8.1);
+        assert_eq!(
+            r4,
+            vec![
+                (1.0, Source::Me, "first".to_string()),
+                (3.0, Source::Me, "third".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn line_buffer_releases_in_start_offset_order() {
+        let mut buf = LineBuffer::new();
+        // Pushed out of start_offset order (and each push's own now_offset is
+        // still under its hold deadline, so nothing releases early).
+        buf.push(Decision::Emit { start: 8.0, source: Source::Me, text: "c".into() }, 8.0);
+        buf.push(Decision::Emit { start: 2.0, source: Source::Me, text: "a".into() }, 2.0);
+        buf.push(Decision::Emit { start: 5.0, source: Source::Me, text: "b".into() }, 5.0);
+
+        let released = buf.push(Decision::Skipped(SkipReason::NoSpeech), 13.0);
+        assert_eq!(
+            released,
+            vec![
+                (2.0, Source::Me, "a".to_string()),
+                (5.0, Source::Me, "b".to_string()),
+                (8.0, Source::Me, "c".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_late_them_line_still_vetoes_an_earlier_me_echo() {
+        let mut buf = LineBuffer::new();
+        let line = "so the migration lands on thursday";
+
+        // Me line finishes transcribing first (its Them counterpart is slower).
+        let r1 = buf.push(Decision::Emit { start: 1.0, source: Source::Me, text: line.to_string() }, 1.5);
+        assert!(r1.is_empty());
+
+        // The overlapping Them line arrives later and vetoes the held Me line.
+        let r2 = buf.push(Decision::Emit { start: 0.0, source: Source::Them, text: line.to_string() }, 5.0);
+        assert_eq!(
+            r2,
+            vec![(0.0, Source::Them, line.to_string())],
+            "the them line still passes through immediately"
+        );
+
+        // Even after the hold window elapses, the vetoed Me line is gone.
+        let r3 = buf.push(Decision::Skipped(SkipReason::NoSpeech), 10.0);
+        assert!(r3.is_empty(), "the echoed Me line must never be released");
+    }
+
+    #[test]
+    fn line_buffer_drain_all_releases_everything_in_order() {
+        let mut buf = LineBuffer::new();
+        buf.push(Decision::Emit { start: 5.0, source: Source::Me, text: "b".into() }, 5.0);
+        buf.push(Decision::Emit { start: 2.0, source: Source::Me, text: "a".into() }, 2.0);
+
+        let drained = buf.drain_all();
+        assert_eq!(
+            drained,
+            vec![
+                (2.0, Source::Me, "a".to_string()),
+                (5.0, Source::Me, "b".to_string()),
+            ]
+        );
+        assert!(buf.drain_all().is_empty());
     }
 }

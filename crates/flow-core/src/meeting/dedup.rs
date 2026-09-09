@@ -87,15 +87,25 @@ pub fn jaccard_similarity(a: &HashSet<String>, b: &HashSet<String>) -> f64 {
 /// Whether `me_text` (a candidate `Me:` line) is a textual echo of
 /// `them_text` (a time-overlapping `Them:` line) at or above `threshold`.
 /// Short `Me:` utterances (< [`MIN_TOKENS_FOR_ECHO`] tokens) are never
-/// echoes — see that constant.
+/// echoes — see that constant. Delegates to [`is_echo_with`] with
+/// containment always enabled; see that function to toggle it (used by the
+/// meeting pipeline's `PipelineOptions::echo_containment` for attribution).
 pub fn is_echo(me_text: &str, them_text: &str, threshold: f64) -> bool {
+    is_echo_with(me_text, them_text, threshold, true)
+}
+
+/// As [`is_echo`], but the containment arm ([`ECHO_CONTAINMENT_THRESHOLD`])
+/// can be switched off via `containment_enabled` — used by the meeting
+/// pipeline's `PipelineOptions` so an offline replay harness can attribute a
+/// WER change to the containment check specifically.
+pub fn is_echo_with(me_text: &str, them_text: &str, threshold: f64, containment_enabled: bool) -> bool {
     let me = normalize_tokens(me_text);
     if me.len() < MIN_TOKENS_FOR_ECHO {
         return false;
     }
     let them = normalize_tokens(them_text);
     jaccard_similarity(&me, &them) > threshold
-        || containment(&me, &them) >= ECHO_CONTAINMENT_THRESHOLD
+        || (containment_enabled && containment(&me, &them) >= ECHO_CONTAINMENT_THRESHOLD)
 }
 
 /// Whether two half-open time intervals `[a_start, a_end)` and
