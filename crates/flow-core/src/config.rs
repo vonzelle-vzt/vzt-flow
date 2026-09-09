@@ -141,6 +141,16 @@ pub struct Config {
     /// it; only `apps/desktop`'s `.setup()` does.
     #[serde(default)]
     pub onboarded: bool,
+    /// Load the speech model at app launch instead of waiting for the first
+    /// recording. Defaults to `false`: a loaded Parakeet engine costs ~2GB
+    /// RSS against a ~30-40MB idle baseline (see docs/PRD.md's memory
+    /// budget), which is the wrong trade for a user who may not dictate for
+    /// hours. Set `true` on a machine with RAM to spare to make the very
+    /// first dictation of a session as fast as every later one. The model
+    /// still idle-unloads after `idle_unload_secs` if never used.
+    /// Applies at launch only — changing it requires an app restart.
+    #[serde(default)]
+    pub preload_models_at_launch: bool,
 }
 
 /// Default for [`Config::rolling_transcription`] — a free fn so serde's
@@ -166,6 +176,7 @@ impl Default for Config {
             cleanup_enabled: true,
             meeting_auto: default_meeting_auto(),
             rolling_transcription: true,
+            preload_models_at_launch: false,
             onboarded: false,
         }
     }
@@ -294,6 +305,48 @@ mod tests {
         let raw = toml::to_string_pretty(&cfg).unwrap();
         let back: Config = toml::from_str(&raw).unwrap();
         assert!(back.onboarded, "onboarded must survive a save/load round-trip");
+    }
+
+    /// A `config.toml` written before `preload_models_at_launch` existed must
+    /// still load and default the flag to `false` (the additive-field
+    /// contract).
+    #[test]
+    fn old_config_without_preload_at_launch_loads_and_defaults_to_false() {
+        let old = r#"
+            hotkey_keycode = 61
+            hotkey_label = "Right Option"
+            hold_threshold_ms = 300
+            idle_unload_secs = 300
+            max_hold_secs = 600
+            max_handsfree_secs = 600
+            launch_at_login = false
+            cleanup_timeout_ms = 2500
+            cleanup_timeout_per_char_ms = 6
+            cleanup_timeout_max_ms = 20000
+            handsfree_silence_secs = 2.5
+            cleanup_enabled = true
+            meeting_auto = "ask"
+            rolling_transcription = true
+            onboarded = false
+        "#;
+        let cfg: Config = toml::from_str(old).expect("old config must still parse");
+        assert!(
+            !cfg.preload_models_at_launch,
+            "missing preload_models_at_launch key must default to false"
+        );
+    }
+
+    #[test]
+    fn preload_models_at_launch_round_trips() {
+        let mut cfg = Config::default();
+        assert!(!cfg.preload_models_at_launch);
+        cfg.preload_models_at_launch = true;
+        let raw = toml::to_string_pretty(&cfg).unwrap();
+        let back: Config = toml::from_str(&raw).unwrap();
+        assert!(
+            back.preload_models_at_launch,
+            "preload_models_at_launch must survive a save/load round-trip"
+        );
     }
 
     #[test]
