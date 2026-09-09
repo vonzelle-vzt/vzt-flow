@@ -82,6 +82,34 @@ fn alnum_tokens(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// Repair a hard-cut seam using at most 20 overlapping words. Exact overlaps
+/// preserve the previous line. If at least two preceding words match but the
+/// previous final word does not, drop that uncertain final word and keep the
+/// successor's complete word. Unrelated text (or a one-word coincidence) cannot
+/// justify changing the previous line. Original casing/punctuation is retained.
+/// The optional string replaces the entire previous line when a repair occurs.
+pub fn seam_repair(prev: &str, next: &str) -> (Option<String>, String) {
+    let p: Vec<&str> = prev.split_whitespace().collect();
+    let n: Vec<&str> = next.split_whitespace().collect();
+    let norm = |w: &&str| w.chars().filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase).collect::<String>();
+    let pn: Vec<String> = p.iter().map(norm).collect();
+    let nn: Vec<String> = n.iter().map(norm).collect();
+    let overlap = |end: usize| {
+        (1..=20.min(end).min(nn.len())).rev().find(|&len| {
+            pn[end - len..end].iter().zip(&nn[..len])
+                .all(|(a, b)| !a.is_empty() && a == b)
+        }).unwrap_or(0)
+    };
+    let exact = overlap(p.len());
+    let without_tail = if p.is_empty() { 0 } else { overlap(p.len() - 1) };
+    if without_tail >= 2 && without_tail > exact && without_tail < n.len() {
+        (Some(p[..p.len() - 1].join(" ")), n[without_tail..].join(" "))
+    } else {
+        (None, n[exact..].join(" "))
+    }
+}
+
 /// Whether a transcribed line carries no information and is almost certainly
 /// an ASR artifact rather than speech: no alphanumeric token; six or more
 /// tokens with two or fewer distinct ones (the repeated-token loop Parakeet
@@ -158,6 +186,8 @@ pub struct PipelineOptions {
     /// Gate 3: seam-dedup a hard-cap-cut chunk against the previous chunk
     /// from the same source before dictionary correction.
     pub seam_dedup: bool,
+    /// Repair uncertain Them tails while both sides of a hard seam are held.
+    pub seam_repair: bool,
     /// Gate 4: drop corrected text that carries no information.
     pub low_information: bool,
     /// Echo check: use `overlaps_within` (a small time-tolerance window)
@@ -176,6 +206,7 @@ impl Default for PipelineOptions {
             min_speech: true,
             normalize: true,
             seam_dedup: true,
+            seam_repair: true,
             low_information: true,
             echo_tolerance: true,
             echo_containment: true,
@@ -192,6 +223,7 @@ impl PipelineOptions {
             min_speech: false,
             normalize: false,
             seam_dedup: false,
+            seam_repair: false,
             low_information: false,
             echo_tolerance: false,
             echo_containment: false,
@@ -280,7 +312,10 @@ impl ChunkPipeline {
             return Decision::Skipped(SkipReason::EmptyText);
         }
 
-        let text = if self.opts.seam_dedup && chunk.seam_dedup {
+        // Them seam repair needs both untrimmed lines in LineBuffer. The Me
+        // path retains the existing one-sided exact dedup.
+        let repair_in_buffer = self.opts.seam_repair && chunk.source == Source::Them;
+        let text = if self.opts.seam_dedup && chunk.seam_dedup && !repair_in_buffer {
             let prev = match chunk.source {
                 Source::Me => &self.prev_text_me,
                 Source::Them => &self.prev_text_them,
@@ -359,15 +394,19 @@ struct HeldLine {
 /// re-running the echo veto against `Them` lines that arrive late. `Them`
 /// lines are never held: they pass straight through immediately, since they
 /// are never vetoed themselves and holding them would delay the interview
-/// coach and the live notepad for no benefit.
+/// coach and the live notepad for no benefit. Exception: with seam repair
+/// enabled, a hard-cut Them tail waits for its successor (or drain_all), so
+/// uncertain final words can be repaired before reaching the transcript.
 pub struct LineBuffer {
     held: Vec<HeldLine>,
+    pending_them: Option<HeldLine>,
+    late_echo_dropped: usize,
     opts: PipelineOptions,
 }
 
 impl LineBuffer {
     pub fn new(opts: PipelineOptions) -> Self {
-        Self { held: Vec::new(), opts }
+        Self { held: Vec::new(), pending_them: None, late_echo_dropped: 0, opts }
     }
 
     /// Feed a decision at meeting-time `now_offset` (the offset at which the
@@ -375,17 +414,34 @@ impl LineBuffer {
     /// for writing, in `start_offset` order — including, immediately, the
     /// `Them` line carried by `d` itself if any.
     pub fn push(&mut self, d: Decision, now_offset: f32) -> Vec<(f32, Source, String)> {
+        self.push_with_seam(d, now_offset, false, false, false)
+    }
+
+    /// Preserve chunk boundary metadata for two-sided Them seam repair.
+    pub fn push_chunk(&mut self, d: Decision, chunk: &Chunk) -> Vec<(f32, Source, String)> {
+        self.push_with_seam(d, chunk.end_offset(), chunk.hard_cut, chunk.seam_dedup,
+            chunk.source == Source::Them)
+    }
+
+    /// Echo vetoes only, excluding text removed by seam repair.
+    pub fn dropped_echo_count(&self) -> usize {
+        self.late_echo_dropped
+    }
+
+    fn push_with_seam(&mut self, d: Decision, now_offset: f32, hard_cut: bool,
+        seam_dedup: bool, is_them: bool) -> Vec<(f32, Source, String)> {
         let mut out = Vec::new();
         match d {
             Decision::Emit { start, source: Source::Me, text } => {
                 self.held.push(HeldLine { start, end: now_offset, text });
             }
-            Decision::Emit { start, source: Source::Them, text } => {
+            Decision::Emit { start, source: Source::Them, mut text } => {
                 let them_end = now_offset;
                 // A Them line that overlaps and textually echoes a held Me
                 // line vetoes it, even though the Me line was emitted first —
                 // the two sources chunk (and finish transcribing)
                 // independently, so completion order is not span order.
+                let held_before = self.held.len();
                 self.held.retain(|held| {
                     let overlaps = if self.opts.echo_tolerance {
                         overlaps_within(held.start, held.end, start, them_end, ECHO_TIME_TOLERANCE_SECS)
@@ -394,12 +450,32 @@ impl LineBuffer {
                     };
                     !(overlaps && is_echo_with(&held.text, &text, DEFAULT_ECHO_THRESHOLD, self.opts.echo_containment, self.opts.echo_fuzzy))
                 });
-                out.push((start, Source::Them, text));
+                self.late_echo_dropped += held_before - self.held.len();
+                if let Some(mut previous) = self.pending_them.take() {
+                    if self.opts.seam_repair && seam_dedup {
+                        let (repaired, trimmed) = seam_repair(&previous.text, &text);
+                        if let Some(repaired) = repaired { previous.text = repaired; }
+                        text = trimmed;
+                    }
+                    out.push((previous.start, Source::Them, previous.text));
+                }
+                if self.opts.seam_repair && hard_cut && !text.is_empty() {
+                    self.pending_them = Some(HeldLine { start, end: them_end, text });
+                } else if !text.is_empty() {
+                    out.push((start, Source::Them, text));
+                }
             }
             // Skipped/Failed/DroppedEcho: nothing new to hold or release
             // directly, but time has still advanced — fall through to the
             // due-line check below.
-            _ => {}
+            _ => {
+                // A failed/skipped successor cannot repair the held tail.
+                if is_them {
+                    if let Some(previous) = self.pending_them.take() {
+                        out.push((previous.start, Source::Them, previous.text));
+                    }
+                }
+            }
         }
         out.extend(self.release_due(now_offset));
         out.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
@@ -421,6 +497,11 @@ impl LineBuffer {
     pub fn drain_all(&mut self) -> Vec<(f32, Source, String)> {
         let mut all: Vec<(f32, Source, String)> =
             self.held.drain(..).map(|h| (h.start, Source::Me, h.text)).collect();
+        if let Some(previous) = self.pending_them.take() {
+            if !previous.text.is_empty() {
+                all.push((previous.start, Source::Them, previous.text));
+            }
+        }
         all.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
         all
     }
@@ -714,7 +795,9 @@ mod tests {
 
     #[test]
     fn seam_dedup_removes_the_overlapped_words_at_a_hard_cap_cut() {
-        let mut pipeline = ChunkPipeline::new(Arc::new(Vec::new()));
+        let mut pipeline = ChunkPipeline::with_options(Arc::new(Vec::new()), PipelineOptions {
+            seam_repair: false, ..PipelineOptions::default()
+        });
 
         let first = pipeline.process(&chunk_at(Source::Them, 0.0, 5.0), says("meet me at the cafe"));
         assert!(matches!(first, Decision::Emit { .. }));
@@ -891,5 +974,110 @@ mod tests {
             buf.push(Decision::Emit { start: 0.5, source: Source::Them, text: them.into() }, 2.5);
             assert_eq!(buf.drain_all().is_empty(), dropped);
         }
+    }
+
+    #[test]
+    fn seam_repair_fixes_the_corpus_boundary_and_partial_words() {
+        assert_eq!(seam_repair("the summary and confirm the", "Summary and confirm that early decisions remain"),
+            (Some("the summary and confirm".into()), "that early decisions remain".into()));
+        assert_eq!(seam_repair("please review the docu", "review the document tomorrow"),
+            (Some("please review the".into()), "document tomorrow".into()));
+    }
+
+    #[test]
+    fn seam_repair_preserves_exact_overlap_and_legitimate_repetition() {
+        assert_eq!(seam_repair("meet me at the CAFE,", "At the cafe tomorrow"),
+            (None, "tomorrow".into()));
+        assert_eq!(seam_repair("we will win", "win win win"), (None, "win win".into()));
+        assert_eq!(seam_repair("check this now", "check this now"), (None, "".into()));
+    }
+
+    #[test]
+    fn seam_repair_needs_two_anchors_to_change_the_previous_tail() {
+        for (prev, next) in [("", "hello world"), ("review this tomorrow", "unrelated words here"),
+            ("review draft", "review tomorrow"), ("... !!!", "!!! ...")]
+        {
+            assert_eq!(seam_repair(prev, next), (None, next.to_string()));
+        }
+        assert_eq!(seam_repair("review the document", ""), (None, String::new()));
+    }
+
+    #[test]
+    fn hard_them_tail_waits_for_successor_and_repairs_both_lines() {
+        let opts = PipelineOptions::default();
+        let mut pipeline = ChunkPipeline::with_options(Arc::new(Vec::new()), opts);
+        let mut buf = LineBuffer::new(opts);
+        let mut first = chunk_at(Source::Them, 0.0, 30.0);
+        first.hard_cut = true;
+        let d = pipeline.process(&first, says("the summary and confirm the"));
+        assert!(buf.push_chunk(d, &first).is_empty());
+        // A Me interjection neither replaces nor repairs the held Them tail.
+        let me = chunk_at(Source::Me, 28.0, 0.5);
+        assert!(buf.push_chunk(Decision::Emit { start: 28.0, source: Source::Me, text: "yes".into() }, &me).is_empty());
+        let mut next = chunk_at(Source::Them, 29.0, 15.0);
+        next.seam_dedup = true;
+        let d = pipeline.process(&next, says("Summary and confirm that early decisions remain"));
+        let lines = buf.push_chunk(d, &next);
+        assert_eq!(lines, vec![
+            (0.0, Source::Them, "the summary and confirm".into()),
+            (28.0, Source::Me, "yes".into()),
+            (29.0, Source::Them, "that early decisions remain".into()),
+        ]);
+        assert_eq!(buf.dropped_echo_count(), 0);
+        assert!(buf.drain_all().is_empty());
+    }
+
+    #[test]
+    fn ordinary_them_and_disabled_repair_pass_through() {
+        for (opts, hard_cut) in [(PipelineOptions::default(), false), (PipelineOptions::legacy(), true)] {
+            let mut buf = LineBuffer::new(opts);
+            let mut chunk = chunk_at(Source::Them, 0.0, 30.0);
+            chunk.hard_cut = hard_cut;
+            assert_eq!(buf.push_chunk(Decision::Emit { start: 0.0, source: Source::Them, text: "original words".into() }, &chunk),
+                vec![(0.0, Source::Them, "original words".into())]);
+        }
+    }
+
+    #[test]
+    fn a_chain_of_hard_tails_repairs_each_successor_and_drains_last() {
+        let mut buf = LineBuffer::default();
+        let mut first = chunk_at(Source::Them, 0.0, 30.0);
+        first.hard_cut = true;
+        buf.push_chunk(Decision::Emit { start: 0.0, source: Source::Them, text: "we review the docu".into() }, &first);
+        let mut next = chunk_at(Source::Them, 29.0, 30.0);
+        next.hard_cut = true;
+        next.seam_dedup = true;
+        assert_eq!(buf.push_chunk(Decision::Emit { start: 29.0, source: Source::Them, text: "review the document and confirm the".into() }, &next),
+            vec![(0.0, Source::Them, "we review the".into())]);
+        assert_eq!(buf.drain_all(), vec![(29.0, Source::Them, "document and confirm the".into())]);
+        assert!(buf.drain_all().is_empty());
+    }
+
+    #[test]
+    fn skipped_successor_flushes_uncertain_tail_without_losing_it() {
+        let mut buf = LineBuffer::default();
+        let mut chunk = chunk_at(Source::Them, 0.0, 30.0);
+        chunk.hard_cut = true;
+        buf.push_chunk(Decision::Emit { start: 0.0, source: Source::Them, text: "unrepaired tail".into() }, &chunk);
+        let mut next = chunk_at(Source::Them, 29.0, 1.0);
+        next.seam_dedup = true;
+        assert_eq!(buf.push_chunk(Decision::Skipped(SkipReason::EmptyText), &next),
+            vec![(0.0, Source::Them, "unrepaired tail".into())]);
+    }
+
+    #[test]
+    fn late_echo_count_excludes_completely_duplicated_seam_lines() {
+        let mut buf = LineBuffer::default();
+        let mut first = chunk_at(Source::Them, 0.0, 30.0);
+        first.hard_cut = true;
+        buf.push_chunk(Decision::Emit { start: 0.0, source: Source::Them, text: "check this now".into() }, &first);
+        let mut next = chunk_at(Source::Them, 29.0, 1.0);
+        next.seam_dedup = true;
+        assert_eq!(buf.push_chunk(Decision::Emit { start: 29.0, source: Source::Them, text: "check this now".into() }, &next),
+            vec![(0.0, Source::Them, "check this now".into())]);
+        assert_eq!(buf.dropped_echo_count(), 0);
+        buf.push(Decision::Emit { start: 40.0, source: Source::Me, text: "please check this now".into() }, 41.0);
+        buf.push(Decision::Emit { start: 40.0, source: Source::Them, text: "please check this now".into() }, 42.0);
+        assert_eq!(buf.dropped_echo_count(), 1);
     }
 }

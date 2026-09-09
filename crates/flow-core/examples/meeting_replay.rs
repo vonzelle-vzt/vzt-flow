@@ -221,7 +221,6 @@ fn run_case(
 
     let mut pipeline = ChunkPipeline::with_options(Arc::clone(dict), opts);
     let mut buffer = LineBuffer::new(opts);
-    let mut emitted_before_buffer = 0usize;
     let mut lines: Vec<Line> = Vec::new();
     let mut dropped_echo = 0usize;
     let mut skipped = 0usize;
@@ -231,7 +230,7 @@ fn run_case(
             transcriber.transcribe(samples).map(|t| t.text)
         });
         match &decision {
-            Decision::Emit { .. } => emitted_before_buffer += 1,
+            Decision::Emit { .. } => {},
             Decision::DroppedEcho(text) => {
                 println!("  [dropped echo] {text}");
                 dropped_echo += 1;
@@ -252,13 +251,12 @@ fn run_case(
                 skipped += 1;
             }
         }
-        let now_offset = chunk.start_offset + chunk.samples.len() as f32 / chunk.sample_rate as f32;
-        lines.extend(buffer.push(decision, now_offset).into_iter()
+        lines.extend(buffer.push_chunk(decision, chunk).into_iter()
             .map(|(start, source, text)| Line { start, source, text }));
     }
     lines.extend(buffer.drain_all().into_iter()
         .map(|(start, source, text)| Line { start, source, text }));
-    let late_dropped = emitted_before_buffer - lines.len();
+    let late_dropped = buffer.dropped_echo_count();
     dropped_echo += late_dropped;
     if late_dropped > 0 {
         println!("  [late-Them veto] dropped_echo={late_dropped}");
@@ -285,6 +283,7 @@ fn set_option(opts: &mut PipelineOptions, name: &str, on: bool) -> Result<()> {
         "min_speech" => opts.min_speech = on,
         "normalize" => opts.normalize = on,
         "seam_dedup" => opts.seam_dedup = on,
+        "seam_repair" => opts.seam_repair = on,
         "low_information" => opts.low_information = on,
         "echo_tolerance" => opts.echo_tolerance = on,
         "echo_containment" => opts.echo_containment = on,
@@ -329,8 +328,8 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args> {
 
 fn main() -> Result<()> {
     let Args { corpus_dir, json, emit_hyp, opts } = parse_args(std::env::args().skip(1))?;
-    println!("# meeting_replay chunker=B1 (not toggleable) min_speech={} normalize={} seam_dedup={} low_information={} echo_tolerance={} echo_containment={} echo_fuzzy={}",
-        opts.min_speech, opts.normalize, opts.seam_dedup, opts.low_information,
+    println!("# meeting_replay chunker=B1 (not toggleable) min_speech={} normalize={} seam_dedup={} seam_repair={} low_information={} echo_tolerance={} echo_containment={} echo_fuzzy={}",
+        opts.min_speech, opts.normalize, opts.seam_dedup, opts.seam_repair, opts.low_information,
         opts.echo_tolerance, opts.echo_containment, opts.echo_fuzzy);
     if let Some(dir) = &emit_hyp { std::fs::create_dir_all(dir)?; }
 
@@ -433,7 +432,7 @@ mod tests {
         for flags in [vec!["--enable", "normalize,echo_fuzzy", "--legacy"], vec!["--enable", "normalize,echo_fuzzy"]] {
             let opts = args(&flags).unwrap().opts;
             assert!(opts.normalize && opts.echo_fuzzy);
-            assert!(!opts.min_speech && !opts.seam_dedup && !opts.low_information && !opts.echo_tolerance && !opts.echo_containment);
+            assert!(!opts.min_speech && !opts.seam_dedup && !opts.seam_repair && !opts.low_information && !opts.echo_tolerance && !opts.echo_containment);
         }
     }
 
@@ -441,7 +440,7 @@ mod tests {
     fn disable_starts_from_defaults() {
         let opts = args(&["--disable", "echo_fuzzy"]).unwrap().opts;
         assert!(!opts.echo_fuzzy);
-        assert!(opts.min_speech && opts.normalize && opts.seam_dedup && opts.low_information && opts.echo_tolerance && opts.echo_containment);
+        assert!(opts.min_speech && opts.normalize && opts.seam_dedup && opts.seam_repair && opts.low_information && opts.echo_tolerance && opts.echo_containment);
     }
 
     #[test]

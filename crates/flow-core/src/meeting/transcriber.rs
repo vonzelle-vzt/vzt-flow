@@ -102,6 +102,8 @@ pub struct Chunk {
     /// trailing words (it began inside a hard cap cut's overlap) and must be
     /// seam-deduped against them with `chunking::dedup_seam`.
     pub seam_dedup: bool,
+    /// This chunk ended at a hard cap cut; its last word may be incomplete.
+    pub hard_cut: bool,
 }
 
 impl Default for Chunk {
@@ -117,6 +119,7 @@ impl Default for Chunk {
             has_speech: false,
             speech_secs: 0.0,
             seam_dedup: false,
+            hard_cut: false,
         }
     }
 }
@@ -409,6 +412,7 @@ impl StreamingChunker {
             has_speech: self.has_speech,
             speech_secs,
             seam_dedup: self.pending_seam_dedup,
+            hard_cut: false,
         };
         // Reset for the next span; the next buffered sample sets the offset.
         self.frame_energies.clear();
@@ -462,6 +466,7 @@ impl StreamingChunker {
             has_speech: emitted_speech > 0,
             speech_secs,
             seam_dedup: self.pending_seam_dedup,
+            hard_cut: matches!(kind, CapCut::Hard),
         };
 
         // What stays: the tail from `retain_from` on (the overlap included).
@@ -738,6 +743,7 @@ mod tests {
         // Cut at the breath (~27.1s), not mid-word on the 30s boundary.
         assert!((27.0..27.5).contains(&dur), "duration {dur}");
         assert!(!first.seam_dedup, "a silence cut repeats nothing");
+        assert!(!first.hard_cut);
 
         // The retained tail keeps the clock exact: the next chunk starts where
         // speech resumed after the breath, ~27.3s in.
@@ -762,6 +768,8 @@ mod tests {
         // 60s without a single quiet frame: both caps must hard-cut.
         let chunks = c.push(&block(60.0, 0.3));
         assert_eq!(chunks.len(), 2, "expected two capped chunks");
+        assert!(chunks.iter().all(|chunk| chunk.hard_cut));
+        assert!(!c.flush().unwrap().hard_cut, "stop flush is not a hard cut");
         assert!(!chunks[0].seam_dedup, "the first chunk overlaps nothing");
         assert!(
             chunks[1].seam_dedup,
