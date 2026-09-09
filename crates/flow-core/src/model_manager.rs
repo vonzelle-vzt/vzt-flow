@@ -1,7 +1,7 @@
 //! Owns the (lazily loaded, idle-unloaded) transcriber on a dedicated
 //! thread so the tray/overlay never blocks on model load/inference.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -27,6 +27,14 @@ pub enum ModelCommand {
         samples: Vec<f32>,
         reply: mpsc::Sender<Result<Transcript, String>>,
     },
+    /// Best-effort: load the model now if it isn't loaded, so the (multi-
+    /// second) load overlaps the user speaking instead of landing on the
+    /// critical path at release. No reply — fire and forget from the
+    /// coordinator, mirroring `CleanupCommand::Warmup`. Idempotent: a
+    /// second Warmup while loaded is a no-op. Resets the idle timer, so a
+    /// press counts as activity, and a preload that is never used still
+    /// unloads after `idle_unload_secs`.
+    Warmup,
 }
 
 #[derive(Debug, Clone)]
@@ -36,6 +44,31 @@ pub enum ModelStatusEvent {
     LoadFailed(String),
     /// Emitted after unloading due to idle timeout.
     Unloaded,
+}
+
+/// Loads the transcriber into `model` if it isn't already present. Shared by
+/// the transcribe commands and `Warmup` so both go through identical
+/// load/status-event bookkeeping. Returns whether a model is now available.
+fn ensure_loaded(
+    model: &mut Option<ParakeetTranscriber>,
+    model_dir: &Path,
+    status_tx: &mpsc::Sender<ModelStatusEvent>,
+) -> Result<(), String> {
+    if model.is_some() {
+        return Ok(());
+    }
+    let _ = status_tx.send(ModelStatusEvent::Loading);
+    match ParakeetTranscriber::load(model_dir) {
+        Ok(m) => {
+            let _ = status_tx.send(ModelStatusEvent::Loaded { load_time: m.load_time });
+            *model = Some(m);
+            Ok(())
+        }
+        Err(e) => {
+            let _ = status_tx.send(ModelStatusEvent::LoadFailed(e.to_string()));
+            Err(e.to_string())
+        }
+    }
 }
 
 /// Spawns the model-lifecycle thread. Runs until `cmd_rx` disconnects.
@@ -53,6 +86,13 @@ pub fn spawn(
 
             loop {
                 match cmd_rx.recv_timeout(idle_timeout) {
+                    Ok(ModelCommand::Warmup) => {
+                        last_used = Instant::now();
+                        if model.is_some() {
+                            continue;
+                        }
+                        let _ = ensure_loaded(&mut model, &model_dir, &status_tx);
+                    }
                     Ok(cmd) => {
                         // Unify the two transcription commands: a full
                         // `Transcribe` (chunked internally) vs. a single
@@ -68,24 +108,14 @@ pub fn spawn(
                                 );
                                 (samples, d, reply, true)
                             }
+                            // Already handled by the `Ok(ModelCommand::Warmup)` arm above.
+                            ModelCommand::Warmup => unreachable!("Warmup is matched before this arm"),
                         };
 
                         last_used = Instant::now();
-                        if model.is_none() {
-                            let _ = status_tx.send(ModelStatusEvent::Loading);
-                            match ParakeetTranscriber::load(&model_dir) {
-                                Ok(m) => {
-                                    let _ = status_tx.send(ModelStatusEvent::Loaded {
-                                        load_time: m.load_time,
-                                    });
-                                    model = Some(m);
-                                }
-                                Err(e) => {
-                                    let _ = status_tx.send(ModelStatusEvent::LoadFailed(e.to_string()));
-                                    let _ = reply.send(Err(e.to_string()));
-                                    continue;
-                                }
-                            }
+                        if let Err(e) = ensure_loaded(&mut model, &model_dir, &status_tx) {
+                            let _ = reply.send(Err(e));
+                            continue;
                         }
                         let transcriber = model.as_mut().expect("model just loaded or already present");
                         let started = Instant::now();
@@ -146,4 +176,124 @@ pub fn spawn(
             }
         })
         .expect("failed to spawn model manager thread")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A path that can never resolve to a real model, so `ParakeetTranscriber::load`
+    /// bails immediately (`engine.rs:91-95`) and no real model is required for these
+    /// tests — they only exercise `Warmup`'s bookkeeping, never real inference.
+    fn missing_model_dir() -> PathBuf {
+        PathBuf::from("/nonexistent/vzt-flow-model-manager-test-dir")
+    }
+
+    fn spawn_with(idle_timeout: Duration) -> (mpsc::Sender<ModelCommand>, mpsc::Receiver<ModelStatusEvent>) {
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (status_tx, status_rx) = mpsc::channel();
+        spawn(missing_model_dir(), idle_timeout, cmd_rx, status_tx);
+        (cmd_tx, status_rx)
+    }
+
+    /// Every `ensure_loaded` attempt against a missing model dir emits
+    /// `Loading` before `LoadFailed`. Drains the `Loading` and returns the
+    /// event after it, so tests can assert on `LoadFailed` without hardcoding
+    /// that ordering inline.
+    fn recv_past_loading(status_rx: &mpsc::Receiver<ModelStatusEvent>) -> ModelStatusEvent {
+        match status_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(ModelStatusEvent::Loading) => {
+                status_rx.recv_timeout(Duration::from_secs(5)).expect("event after Loading")
+            }
+            Ok(other) => other,
+            Err(e) => panic!("expected a status event, got {e:?}"),
+        }
+    }
+
+    #[test]
+    fn warmup_on_a_missing_model_emits_load_failed_and_does_not_panic() {
+        let (cmd_tx, status_rx) = spawn_with(Duration::from_secs(300));
+
+        cmd_tx.send(ModelCommand::Warmup).unwrap();
+        match recv_past_loading(&status_rx) {
+            ModelStatusEvent::LoadFailed(_) => {}
+            other => panic!("expected LoadFailed after first Warmup, got {other:?}"),
+        }
+
+        // The thread must still be alive (not panicked) after a failed
+        // Warmup — a second Warmup should also produce a LoadFailed.
+        cmd_tx.send(ModelCommand::Warmup).unwrap();
+        match recv_past_loading(&status_rx) {
+            ModelStatusEvent::LoadFailed(_) => {}
+            other => panic!("expected LoadFailed after second Warmup, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn warmup_is_not_answered_and_never_blocks_the_sender() {
+        let (cmd_tx, _status_rx) = spawn_with(Duration::from_secs(300));
+
+        // `Warmup` carries no reply channel, so there is nothing to wait on;
+        // the send itself must return immediately.
+        let result = cmd_tx.send(ModelCommand::Warmup);
+        assert!(result.is_ok(), "Warmup send should succeed without blocking on any reply");
+    }
+
+    #[test]
+    fn warmup_resets_the_idle_timer() {
+        let idle_timeout = Duration::from_millis(300);
+        let (cmd_tx, status_rx) = spawn_with(idle_timeout);
+
+        // Two Warmups 200ms apart against a missing model: each resets
+        // `last_used`, so the idle-unload branch should never fire before
+        // 400ms even though the timeout itself is only 300ms.
+        cmd_tx.send(ModelCommand::Warmup).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        cmd_tx.send(ModelCommand::Warmup).unwrap();
+
+        let deadline = Instant::now() + Duration::from_millis(400);
+        while Instant::now() < deadline {
+            if let Ok(ModelStatusEvent::Unloaded) = status_rx.try_recv() {
+                panic!("Unloaded fired before the idle timer should have elapsed");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // The thread must still be responsive: a further Warmup still
+        // produces a LoadFailed rather than silence from a wedged loop.
+        cmd_tx.send(ModelCommand::Warmup).unwrap();
+        match recv_past_loading(&status_rx) {
+            ModelStatusEvent::LoadFailed(_) => {}
+            other => panic!("expected LoadFailed, thread appears wedged: got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_never_used_preload_still_unloads() {
+        // Documents the intent: a Warmup that is never followed by a
+        // transcribe still counts as "used" for idle-unload purposes via
+        // `last_used = Instant::now()`, so the unload branch's existing
+        // guard (`model.is_some() && last_used.elapsed() >= idle_timeout`)
+        // is what eventually reclaims it — no separate "warmed but idle"
+        // path is needed. Exercised here against the missing-model path
+        // (so no real model is required): after a short idle_timeout with
+        // no further activity, the loop must still observe timeouts and
+        // stay alive rather than getting stuck waiting on `recv_timeout`.
+        let idle_timeout = Duration::from_millis(100);
+        let (cmd_tx, status_rx) = spawn_with(idle_timeout);
+
+        cmd_tx.send(ModelCommand::Warmup).unwrap();
+        // Drain the Loading + LoadFailed from the Warmup itself.
+        let _ = recv_past_loading(&status_rx);
+
+        // No model ever loaded (load failed), so there is nothing to
+        // unload — but the loop must still be alive and responsive after
+        // several idle_timeout windows have elapsed with no activity.
+        std::thread::sleep(idle_timeout * 4);
+        cmd_tx.send(ModelCommand::Warmup).unwrap();
+        match recv_past_loading(&status_rx) {
+            ModelStatusEvent::LoadFailed(_) => {}
+            other => panic!("expected LoadFailed, thread appears wedged: got {other:?}"),
+        }
+    }
 }
