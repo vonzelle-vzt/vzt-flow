@@ -1273,6 +1273,17 @@ fn start_recording(app: &AppHandle, max_secs: u64) {
     if let Some(cleanup_tx) = cleanup_tx {
         let _ = cleanup_tx.send(CleanupCommand::Warmup);
     }
+
+    // Kick off the Parakeet load now too, in parallel with the user
+    // speaking. Without this the (multi-second) first-of-session load lands
+    // on the critical path at release, because the batch path only sends
+    // ModelCommand::Transcribe from the Stopped handler and the rolling
+    // path only cuts its first chunk after ~35s of settled audio. Fire and
+    // forget — the manager no-ops if it is already loaded.
+    let model_tx = state.model_cmd_tx.lock_or_recover().clone();
+    if let Some(model_tx) = model_tx {
+        let _ = model_tx.send(ModelCommand::Warmup);
+    }
 }
 
 fn stop_and_transcribe(audio_cmd_tx: &Sender<AudioCommand>) {

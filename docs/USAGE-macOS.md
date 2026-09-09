@@ -579,6 +579,7 @@ Persisted at `~/.config/vzt-flow/config.toml`. Every field, with its default
 | `hotkey_label` | `"Right Option"` | Human-readable label shown in Settings |
 | `hold_threshold_ms` | `300` | Minimum hold duration (ms) before a press counts as "hold" rather than a tap that toggles hands-free |
 | `idle_unload_secs` | `300` | Seconds of transcriber/cleanup-model inactivity before it's unloaded from memory |
+| `preload_models_at_launch` | `false` | Load the speech model at app launch instead of waiting for the first recording, moving model load off the first dictation path when preload finishes in time. First-inference overhead can still vary with clip length. Costs ~2GB RSS while loaded (vs. a ~30-40MB idle baseline); still idle-unloads on `idle_unload_secs` if never used. **Applies at launch only — changing it requires an app restart.** |
 | `max_hold_secs` | `600` | Hard cap (seconds) on a single hold-to-talk recording (10min, for long-form dictation) |
 | `max_handsfree_secs` | `600` | Hard cap (seconds) on a single hands-free recording |
 | `launch_at_login` | `false` | Mirrors `tauri-plugin-autostart` state |
@@ -817,3 +818,8 @@ the app is open:**
   stale, check the app's console output for `daemon control socket failed to
   start` (usually means another instance is already bound to it — quit any
   duplicate instances and relaunch).
+
+Meeting notes, Desktop PDFs, local interview coaching, and the measured accuracy
+limits are covered in [Meeting mode](MEETINGS.md). In Settings, Interview mode
+edits `~/.config/vzt-flow/interview.md`; Meetings controls the notepad, PDF
+destination, and whether coaching starts enabled.

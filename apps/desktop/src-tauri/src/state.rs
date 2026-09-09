@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
@@ -6,6 +8,9 @@ use flow_core::audio::AudioCommand;
 use flow_core::cleanup_manager::CleanupCommand;
 use flow_core::config::Config;
 use flow_core::dictionary::DictionaryTerm;
+use flow_core::meeting::{
+    InterviewTip, MeetingHandle, MeetingOutcome, SessionStarted, SessionState, TranscriptLine,
+};
 use flow_core::model_manager::ModelCommand;
 use flow_core::profiles::Profiles;
 use flow_core::snippets::Snippets;
@@ -154,6 +159,216 @@ pub enum ModelLifecycle {
     Loaded,
 }
 
+// ---------------------------------------------------------------------------
+// Meeting sessions.
+// ---------------------------------------------------------------------------
+
+/// How many transcript lines a slot keeps for the notepad's initial snapshot.
+/// A 90-minute meeting produces a few thousand lines; the notepad only ever
+/// renders a scrollback, so the ring is bounded rather than unbounded growth
+/// in a long call.
+pub const LINES_CAP: usize = 500;
+
+/// How many sessions [`Meetings`] retains. Old sessions stay addressable so a
+/// notepad bound to a finished meeting can still save notes and re-export.
+pub const RETAIN_SESSIONS: usize = 4;
+
+/// One meeting session, alive or finished.
+///
+/// The desktop — not flow-core — owns session identity: `session_id` is the
+/// transcript file's stem (assigned by `meeting::start_with`), and everything
+/// the notepad, tray and finalize path need is keyed by it. A slot outlives
+/// its `handle`: `stop` takes the handle to hand it to the finalize thread,
+/// which comes back later and writes the outcome into the slot by id.
+// Every field is read by `meeting_ctl` and, from U11/U12, by the notepad
+// commands and the tray; those readers are not wired up yet, and dead-code
+// analysis walks from reachable roots, so the whole struct reads as unused
+// until they are.
+#[allow(dead_code)]
+pub struct SessionSlot {
+    pub session_id: String,
+    pub title: String,
+    pub started_at_ms: i64,
+    pub state: SessionState,
+    /// `Some` only while the session thread is ours to stop. Taken by
+    /// `meeting_ctl::stop`, which moves it onto the finalize thread — so a
+    /// `None` handle on a non-terminal state means "finalize is in flight",
+    /// never "there is nothing running".
+    pub handle: Option<MeetingHandle>,
+    pub transcript: PathBuf,
+    pub notes: PathBuf,
+    /// The *live* interview flag — the same `Arc` the running session reads,
+    /// so flipping it here takes effect mid-meeting.
+    pub interview: Arc<AtomicBool>,
+    /// True when the auto-detector started this session. Only a
+    /// detection-owned session is stopped by the detector's `Ended` event; a
+    /// manually started one keeps running (see [`should_auto_stop`]).
+    pub detection_owned: bool,
+    /// The notepad is opened at most once per session, so closing it doesn't
+    /// make the next transcript line pop it back up.
+    pub notepad_opened: bool,
+    /// Revision counter for the `.notes.txt` sidecar. flow-core has no
+    /// counter of its own (`MeetingOutcome::notes_rev_used` always arrives as
+    /// `0`), so this is the authority and the finalize path overwrites the
+    /// outcome's field from it.
+    pub notes_rev: u64,
+    /// The revision that was last *merged into the transcript* — set on
+    /// finalize and on re-export. `notes_rev > notes_rev_used` means the
+    /// sidecar has edits the exported files don't have yet.
+    pub notes_rev_used: Option<u64>,
+    /// Bounded scrollback for the notepad's initial snapshot (cap
+    /// [`LINES_CAP`]); the live view is driven by `meeting://line` events.
+    pub lines: VecDeque<TranscriptLine>,
+    pub last_tip: Option<InterviewTip>,
+    /// Sequence number of the newest line seen, so a snapshot can tell the
+    /// frontend which events it already contains.
+    pub last_seq: u64,
+    pub outcome: Option<MeetingOutcome>,
+    pub last_error: Option<String>,
+    /// The summary markdown as written into the transcript, kept so a
+    /// re-export can re-render the PDF without a second LLM pass.
+    pub summary_markdown: Option<String>,
+}
+
+impl SessionSlot {
+    /// Builds a slot from the `SessionStarted` that `meeting::start_with`
+    /// fires synchronously on the caller's thread. The handle is attached
+    /// afterwards (it doesn't exist until `start_with` returns).
+    pub fn new(started: &SessionStarted, interview: Arc<AtomicBool>, detection_owned: bool) -> Self {
+        Self {
+            session_id: started.session_id.clone(),
+            title: started.title.clone(),
+            started_at_ms: started.started_at_ms,
+            state: SessionState::Recording,
+            handle: None,
+            transcript: started.transcript.clone(),
+            notes: started.notes.clone(),
+            interview,
+            detection_owned,
+            notepad_opened: false,
+            notes_rev: 0,
+            notes_rev_used: None,
+            lines: VecDeque::new(),
+            last_tip: None,
+            last_seq: 0,
+            outcome: None,
+            last_error: None,
+            summary_markdown: None,
+        }
+    }
+
+    /// Appends one line to the bounded ring and advances `last_seq`.
+    ///
+    /// Called from `on_line`, which runs on the session thread *while the
+    /// transcript writer's mutex is held* — so it must stay O(1) and must
+    /// never block on anything but this lock.
+    pub fn push_line(&mut self, line: TranscriptLine) {
+        self.last_seq = self.last_seq.max(line.seq);
+        self.lines.push_back(line);
+        while self.lines.len() > LINES_CAP {
+            self.lines.pop_front();
+        }
+    }
+
+    /// Records one saved notes revision and returns the new value.
+    #[allow(dead_code)] // called by `meeting_ctl::save_notes` (a U11 seam).
+    pub fn bump_notes_rev(&mut self) -> u64 {
+        self.notes_rev += 1;
+        self.notes_rev
+    }
+
+    /// True while the session is capturing audio.
+    pub fn is_recording(&self) -> bool {
+        matches!(self.state, SessionState::Recording)
+    }
+
+    /// True once the session has reached a terminal state. A `Stopping` or
+    /// `Finalizing` slot is **not** finished — its finalize thread is still
+    /// going to write into it.
+    pub fn is_finished(&self) -> bool {
+        matches!(self.state, SessionState::Completed | SessionState::Failed(_))
+    }
+}
+
+/// Whether the detector's `Ended` event should stop this session.
+///
+/// Only a session the detector itself started is the detector's to stop: a
+/// meeting the user started from the tray keeps running when Zoom quits, so a
+/// mis-detection can't silently end a recording somebody is relying on.
+pub fn should_auto_stop(slot: &SessionSlot) -> bool {
+    slot.detection_owned && slot.is_recording()
+}
+
+/// The desktop's meeting sessions: the current one plus a short history.
+///
+/// Pure data — no Tauri, no threads — so the lifecycle rules are unit
+/// testable. Held behind `AppState::meetings` and always taken with
+/// `lock_or_recover` (gotcha (i)).
+#[derive(Default)]
+pub struct Meetings {
+    pub slots: Vec<SessionSlot>,
+    /// `session_id` of the newest session, alive or not.
+    pub current: Option<String>,
+}
+
+impl Meetings {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn get(&self, session_id: &str) -> Option<&SessionSlot> {
+        self.slots.iter().find(|s| s.session_id == session_id)
+    }
+
+    pub fn get_mut(&mut self, session_id: &str) -> Option<&mut SessionSlot> {
+        self.slots.iter_mut().find(|s| s.session_id == session_id)
+    }
+
+    pub fn current(&self) -> Option<&SessionSlot> {
+        let id = self.current.as_deref()?;
+        self.get(id)
+    }
+
+    pub fn current_mut(&mut self) -> Option<&mut SessionSlot> {
+        let id = self.current.clone()?;
+        self.get_mut(&id)
+    }
+
+    /// Adds a session and makes it current, retiring old ones.
+    ///
+    /// Deliberately does not touch any other slot: a session that is still
+    /// finalizing keeps its state, its notes revision and its pending outcome
+    /// while the next meeting records.
+    pub fn insert(&mut self, slot: SessionSlot) {
+        self.current = Some(slot.session_id.clone());
+        self.slots.push(slot);
+        self.retire();
+    }
+
+    /// Drops the oldest sessions beyond [`RETAIN_SESSIONS`].
+    ///
+    /// Only *finished*, non-current slots are evictable. Dropping a slot that
+    /// still holds a `MeetingHandle` would drop its `JoinHandle` — detaching a
+    /// live session thread that then never stops or finalizes — and dropping
+    /// one that is mid-finalize would strand its outcome, since the finalize
+    /// thread writes back by id. So a pathological run of unfinished sessions
+    /// grows past the cap rather than losing one.
+    pub fn retire(&mut self) {
+        while self.slots.len() > RETAIN_SESSIONS {
+            let current = self.current.clone();
+            let evictable = self.slots.iter().position(|s| {
+                s.is_finished() && s.handle.is_none() && Some(&s.session_id) != current.as_ref()
+            });
+            match evictable {
+                Some(i) => {
+                    self.slots.remove(i);
+                }
+                None => break,
+            }
+        }
+    }
+}
+
 /// Shared state accessed from the tray, the coordinator thread, and Tauri
 /// commands invoked by the webview.
 pub struct AppState {
@@ -200,11 +415,16 @@ pub struct AppState {
     /// applies) for the current recording, set alongside `recording_started`
     /// — used to compute the overlay's last-30s warning state.
     pub recording_max_secs: Mutex<Option<u64>>,
-    /// The in-progress meeting-transcription session, if any (owned by
-    /// `meeting_ctl`). `Some` while a meeting is being transcribed; taken and
-    /// joined on stop. Independent of the dictation state machine above — a
-    /// meeting and hold-to-talk dictation can be active at the same time.
-    pub meeting_session: Mutex<Option<flow_core::meeting::MeetingHandle>>,
+    /// The meeting-transcription sessions (owned by `meeting_ctl`): the
+    /// current one plus a short history, keyed by `session_id`. Independent
+    /// of the dictation state machine above — a meeting and hold-to-talk
+    /// dictation can be active at the same time.
+    ///
+    /// Locked on the session thread from `on_line` (which runs while the
+    /// transcript writer's mutex is held), so nothing may hold this lock
+    /// across a blocking call — never across `stop_detailed`, a file write or
+    /// a notification.
+    pub meetings: Mutex<Meetings>,
     /// In-app model downloader state (see [`ModelDownload`]). `Arc` so a
     /// download worker thread can own a handle across the whole transfer.
     pub model_download: Arc<ModelDownload>,
@@ -248,6 +468,11 @@ impl AppState {
     ///
     /// A daemon `listen` waiting on a reply is answered with an error rather
     /// than dropped, so the CLI caller fails fast instead of blocking forever.
+    ///
+    /// `meetings` is deliberately **not** touched: a meeting runs on its own
+    /// threads and is not part of the dictation state machine, so a
+    /// coordinator panic must not end a recording the user is relying on —
+    /// and resetting the slot would strand the live `MeetingHandle`.
     pub fn reset_after_panic(&self) {
         *self.dictation_state.lock_or_recover() = DictationState::Idle;
         *self.recording_started.lock_or_recover() = None;
@@ -317,7 +542,7 @@ impl AppState {
             hotkey_monitor_active: AtomicBool::new(false),
             recording_started: Mutex::new(None),
             recording_max_secs: Mutex::new(None),
-            meeting_session: Mutex::new(None),
+            meetings: Mutex::new(Meetings::new()),
             model_download,
         }
     }
@@ -359,5 +584,147 @@ mod lock_recover_tests {
         // intact — so the restarted coordinator can make progress.
         *m.lock_or_recover() += 1;
         assert_eq!(*m.lock_or_recover(), 42);
+    }
+}
+
+#[cfg(test)]
+mod meetings_tests {
+    use super::*;
+    use flow_core::meeting::transcriber::Source;
+
+    fn started(id: &str) -> SessionStarted {
+        SessionStarted {
+            session_id: id.to_string(),
+            title: format!("{id} meeting"),
+            started_at_ms: 1_700_000_000_000,
+            transcript: PathBuf::from(format!("/tmp/{id}.md")),
+            notes: PathBuf::from(format!("/tmp/{id}.notes.txt")),
+        }
+    }
+
+    fn slot(id: &str) -> SessionSlot {
+        SessionSlot::new(&started(id), Arc::new(AtomicBool::new(false)), false)
+    }
+
+    fn line(id: &str, seq: u64) -> TranscriptLine {
+        TranscriptLine {
+            session_id: id.to_string(),
+            seq,
+            source: Source::Them,
+            offset_secs: seq as f32,
+            text: format!("line {seq}"),
+        }
+    }
+
+    /// The history is a fixed-size window: a fifth session evicts the first,
+    /// and the evicted one is no longer addressable by id.
+    #[test]
+    fn retire_keeps_the_last_four_sessions_and_drops_the_oldest() {
+        let mut meetings = Meetings::new();
+        for id in ["A", "B", "C", "D", "E"] {
+            // Only one meeting runs at a time, so the previous one is always
+            // finished by the time the next starts.
+            if let Some(prev) = meetings.current_mut() {
+                prev.state = SessionState::Completed;
+            }
+            meetings.insert(slot(id));
+        }
+
+        let ids: Vec<&str> = meetings.slots.iter().map(|s| s.session_id.as_str()).collect();
+        assert_eq!(ids, vec!["B", "C", "D", "E"]);
+        assert!(meetings.get("A").is_none(), "the oldest session is dropped");
+        assert_eq!(meetings.current.as_deref(), Some("E"));
+    }
+
+    /// A slot that is still finalizing is never evicted, even past the cap —
+    /// its finalize thread is going to write the outcome back into it by id,
+    /// and dropping it would strand that write (and, if it still held the
+    /// handle, detach the session thread).
+    #[test]
+    fn retire_never_evicts_an_unfinished_session() {
+        let mut meetings = Meetings::new();
+        for id in ["A", "B", "C", "D", "E", "F"] {
+            let mut s = slot(id);
+            s.state = SessionState::Finalizing { step: "summarizing 1/1".to_string() };
+            meetings.insert(s);
+        }
+        assert_eq!(meetings.slots.len(), 6, "unfinished slots grow past the cap");
+        assert!(meetings.get("A").is_some());
+    }
+
+    /// Starting the next meeting must not disturb one that is still writing
+    /// its summary — the new session takes `current`, nothing else changes.
+    #[test]
+    fn a_new_session_does_not_disturb_a_finalizing_one() {
+        let mut meetings = Meetings::new();
+        let mut a = slot("A");
+        a.state = SessionState::Finalizing { step: "writing pdf".to_string() };
+        a.notes_rev = 7;
+        meetings.insert(a);
+
+        meetings.insert(slot("B"));
+
+        let a = meetings.get("A").expect("the finalizing session is still addressable");
+        assert!(
+            matches!(a.state, SessionState::Finalizing { .. }),
+            "A must still be Finalizing, was {:?}",
+            a.state
+        );
+        assert_eq!(a.notes_rev, 7, "A keeps its notes revision");
+        assert_eq!(meetings.current.as_deref(), Some("B"));
+        assert!(meetings.current().map(|s| s.is_recording()).unwrap_or(false));
+    }
+
+    /// Requirement 6: the detector may only stop what the detector started.
+    #[test]
+    fn detector_end_only_stops_a_detection_owned_session() {
+        let mut auto = slot("auto");
+        auto.detection_owned = true;
+        assert!(should_auto_stop(&auto), "a detected session is the detector's to stop");
+
+        let manual = slot("manual");
+        assert!(!should_auto_stop(&manual), "a manually started session keeps running");
+
+        // Neither is stoppable once it has left Recording.
+        auto.state = SessionState::Stopping;
+        assert!(!should_auto_stop(&auto), "a stopping session is not stopped twice");
+    }
+
+    /// A long meeting must not grow the slot without bound; the newest lines
+    /// are the ones kept.
+    #[test]
+    fn lines_ring_is_bounded_at_500() {
+        let mut s = slot("A");
+        for seq in 1..=(LINES_CAP as u64 + 250) {
+            s.push_line(line("A", seq));
+        }
+
+        assert_eq!(s.lines.len(), LINES_CAP);
+        assert_eq!(s.lines.front().map(|l| l.seq), Some(251), "oldest lines are dropped");
+        assert_eq!(s.lines.back().map(|l| l.seq), Some(750));
+        assert_eq!(s.last_seq, 750, "last_seq tracks the newest line, not the ring");
+    }
+
+    /// The desktop owns the notes revision counter (flow-core always reports
+    /// `notes_rev_used: 0`), and an export snapshots whichever revision it
+    /// merged — later edits bump `notes_rev` without touching it.
+    #[test]
+    fn notes_rev_increments_monotonically_and_export_snapshots_it() {
+        let mut s = slot("A");
+        assert_eq!(s.notes_rev, 0);
+        assert_eq!(s.notes_rev_used, None);
+
+        assert_eq!(s.bump_notes_rev(), 1);
+        assert_eq!(s.bump_notes_rev(), 2);
+        assert_eq!(s.bump_notes_rev(), 3);
+
+        // Finalize/export snapshots the revision it actually merged.
+        s.notes_rev_used = Some(s.notes_rev);
+        assert_eq!(s.notes_rev_used, Some(3));
+
+        // A late edit after Completed still saves, and is visibly unexported.
+        assert_eq!(s.bump_notes_rev(), 4);
+        assert_eq!(s.notes_rev_used, Some(3), "the export snapshot does not move on its own");
+        assert!(s.notes_rev > s.notes_rev_used.unwrap_or(0));
     }
 }

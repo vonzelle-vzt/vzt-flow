@@ -15,3 +15,6 @@ anyhow = "1"
 hound = "3.5"
 # SIGINT handler for `flow meeting` (Ctrl+C -> graceful stop + summarize).
 ctrlc = "3"
+# `flow meeting --notes`: needs "now" to reserve the transcript path on the
+# CLI thread before `run_with` does (same version pin as flow-core).
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

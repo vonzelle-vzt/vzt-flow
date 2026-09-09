@@ -1,7 +1,9 @@
 mod commands;
+mod commands_meeting;
 mod coordinator;
 mod daemon;
 mod meeting_ctl;
+mod notepad;
 mod overlay;
 mod settings;
 mod state;
@@ -11,6 +13,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use flow_core::config::Config;
+use flow_core::model_manager::ModelCommand;
 use state::{AppState, LockRecover};
 use tauri::Manager;
 
@@ -77,6 +80,14 @@ pub fn run() {
             commands::test_overlay,
             commands::get_model_status,
             commands::start_model_download,
+            commands_meeting::get_meeting_snapshot,
+            commands_meeting::save_meeting_notes,
+            commands_meeting::set_interview_mode,
+            commands_meeting::open_meeting_notes,
+            commands_meeting::reexport_meeting,
+            commands_meeting::get_interview_context,
+            commands_meeting::set_interview_context,
+            commands_meeting::reveal_in_finder,
         ])
         .setup(|app| {
             let handle = app.handle().clone();
@@ -115,6 +126,8 @@ pub fn run() {
                 settings::show_settings(&handle);
             }
 
+            let config_preload = config.preload_models_at_launch;
+
             let (coordinator_tx, hotkey_active) =
                 coordinator::spawn(handle.clone(), config, is_recording);
             *app.state::<AppState>().coordinator_tx.lock_or_recover() = Some(coordinator_tx);
@@ -124,6 +137,26 @@ pub fn run() {
                      \"Start/Stop dictation\" item, then grant Input Monitoring permission \
                      and restart the app to enable the hardware hotkey."
                 );
+            }
+
+            // Optional launch-time preload (config: preload_models_at_launch,
+            // default false). Off by default because a resident Parakeet
+            // engine is ~2GB against a ~30-40MB idle baseline. Gated on the
+            // model actually being installed so a fresh install can't fire a
+            // doomed load, and skipped if a meeting session somehow already
+            // owns an engine. The idle-unload timer still applies, so an
+            // unused preload releases the memory after idle_unload_secs.
+            if config_preload
+                && flow_core::models::check_parakeet_model()
+                    .map(|s| s.present)
+                    .unwrap_or(false)
+                && !meeting_ctl::is_active(&handle)
+            {
+                let tx = app.state::<AppState>().model_cmd_tx.lock_or_recover().clone();
+                if let Some(tx) = tx {
+                    eprintln!("[vzt-flow] preloading the speech model at launch (preload_models_at_launch)");
+                    let _ = tx.send(ModelCommand::Warmup);
+                }
             }
 
             // Daemon control socket: started after the coordinator so
@@ -138,6 +171,11 @@ pub fn run() {
             // Pre-create (hidden) so the first `show_overlay` call has no
             // window-creation latency mid-recording.
             let _ = overlay::ensure_overlay(&handle);
+
+            // Pre-create the hidden notepad window too, so the first
+            // `notepad::open` (a meeting starting, or the tray's "Open
+            // meeting notes") has no window-creation latency.
+            let _ = notepad::ensure_window(&handle);
 
             // Background meeting auto-detector (Zoom/Meet/Teams). Always
             // spawned; it no-ops when `meeting_auto = "off"` and reads the

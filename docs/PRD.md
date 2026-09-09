@@ -71,10 +71,30 @@ extended (a concurrent workstream may be mid-merge)
 - **Cleanup (warm)**: ~0.3s for a short sentence; deadline formula
   (2500ms base + 6ms/char, capped 20000ms) guarantees a bounded worst case
   regardless of input length.
-- **First dictation of a session**: a few extra seconds for lazy Parakeet
-  model load; cleanup LLM pre-warms in parallel with speech (model load + a
-  throwaway generation to force Metal kernel JIT), so it's typically already
-  warm by the time cleanup actually runs.
+- **First dictation of a session**: measured on v0.3.5 (M5 MacBook Air,
+  before this fix), Parakeet load takes **4.79s** (median of 3 in-process
+  runs, range 4.11–6.48s) and the same cost shows up end-to-end over the
+  daemon socket on a 4.2s clip as **4.22s cold vs. 0.28s warm** (a ~3.9s
+  penalty). The speech model now starts loading the moment you press the
+  key, in parallel with your speech, the same way the cleanup model already
+  did (model load + a throwaway generation to force Metal kernel JIT) — a
+  hold longer than the load is fully covered, a hold shorter than it still
+  pays whatever's left uncovered at release. An opt-in
+  `preload_models_at_launch` config loads the speech model at app launch
+  instead (~2GB RSS while loaded) for a warm first press of the session, and
+  it also fires when a Zoom/Meet/Teams call is detected in Ask mode.
+  A throwaway warm-up *inference* (as opposed to just the model load) was
+  evaluated and **not** added: the first-inference cost is shape-dependent —
+  warming on a 4.2s clip left a 14.5s clip's first inference 42%/360ms
+  slower in RTF than warming on its own length — so a fixed warm-up clip
+  would not reliably pay for real dictations of varying length.
+
+The combined-build integration check measured a 3.648s median ASR load across
+three runs, but direct socket transcription was 5.177s cold / 0.315s warm,
+versus 4.22s / 0.28s in the installed baseline. The socket route bypasses
+recording-start warmup; these results do not establish a cold hotkey speedup.
+Ten toggle/cancel trials all returned to idle, with 0.091s median toggle time.
+Physical hold/release-to-paste acceptance is still pending for the ad-hoc build.
 
 ### Memory budget, including the quadratic-ASR lesson
 
@@ -280,3 +300,28 @@ grants survive rebuilds (not yet done — see Out of scope below).
    `claude` CLI is present — no manual build step required for a Release
    install (source build remains available and documented for
    contributors/Windows/unreleased-commit use).
+
+## Meeting accuracy: measured outcome
+
+On seven frozen synthetic speech fixtures (252 reference words), all eight
+pipeline options reduced word error rate from **21.43% (54 errors)** to
+**17.06% (43 errors)**. The true baseline is commit `08f23f8`; the final
+measurement is pinned at `774d92d`, including live-worker LineBuffer wiring.
+This is an offline replay benchmark, not a measured live-call accuracy rate.
+
+The spelling-tolerant echo filter removed one echoed sentence while keeping
+“yes that works for me.” Hard-cut seam repair reduced the seam case from three
+errors to two (one substitution and one deletion, with no inserted repeats).
+The total improvement removes eleven inserted words. Reference-word alignment
+counts were harmful=0 and helpful=0: that metric counts lost/recovered matches,
+so it does not itself count removed insertions. Names and numbers remain
+challenging; those fixtures did not improve.
+
+The pipeline uses minimum voiced duration, quiet-audio normalization, low-information
+filtering, token and character-based echo matching with a one-second overlap
+tolerance, and overlap repair at hard chunk cuts. The other isolated switches
+showed no WER gain on this small corpus. Exact suffix/prefix dedup alone could
+not repair a boundary heard as “the” in one chunk and “that” in the next;
+seam repair holds the hard-cut line until its successor can resolve the boundary.
+The reproducible fixtures and per-change harness live in
+`scripts/make-accuracy-corpus.sh` and `crates/flow-core/examples/meeting_replay.rs`.

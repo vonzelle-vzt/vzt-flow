@@ -132,9 +132,13 @@ on an int8-quantized [NVIDIA Parakeet TDT 0.6B v3](https://huggingface.co/nvidia
 ONNX model, with the CoreML execution provider on Apple Silicon. Measured on
 this repo's own hardware (M5 MacBook Air, `flow transcribe` on an 8.6s
 synthesized clip): **0.83s wall time, RTF 0.097x** — about 10x realtime.
-Windows runs the same model on plain CPU ONNX (no CoreML there), so expect a
-lower realtime factor. Per NVIDIA's model card, Parakeet TDT v3 covers 25
-European languages.
+That figure is warm-model steady state; measured cold-vs-warm on v0.3.5 (a
+4.2s clip through the daemon socket): **4.22s cold vs. 0.28s warm**, a ~3.9s
+penalty attributable to the ~4.8s Parakeet load — see
+[Why is my first dictation slow?](#faq) for how that load now overlaps your
+speech instead of following it. Windows runs the same model on plain CPU
+ONNX (no CoreML there), so expect a lower realtime factor. Per NVIDIA's
+model card, Parakeet TDT v3 covers 25 European languages.
 
 ### Long-form dictation: 10-minute holds, chunked so they don't OOM
 
@@ -179,7 +183,7 @@ same local Parakeet engine, and writes a timestamped `Me:`/`Them:` Markdown
 transcript with an echo filter (Jaccard similarity > 0.7 on time-overlapping
 lines) that drops your own mic re-picking-up speaker audio from participants
 without headphones. Stopping the meeting appends a local Qwen3-generated
-summary and action items. A `meeting_transcript` MCP tool exposes transcripts
+summary and action items. The desktop companion adds autosaved meeting notes, a Desktop PDF, and optional local interview tips after each detected question. A `meeting_transcript` MCP tool exposes transcripts
 to Claude Code ("summarize my last meeting", "pull the action items"). A
 background auto-detector (tray → **Meeting auto-detect ▸ Ask/Auto/Off**)
 combines frontmost-app matching (Zoom/Meet/Teams) with a mic-live signal to
@@ -293,10 +297,14 @@ just in CI's pipe unit tests.
 
 The Parakeet and cleanup models are lazy-loaded on first use and idle-
 unloaded after `idle_unload_secs` (300s default) of inactivity, so VZT Flow
-doesn't sit holding ~1.5GB of models in memory between dictations. The
-packaged `.app` bundle itself measures **36MB** on this build — small enough
-that Tauri's native-webview approach (vs. bundling a full Chromium/Electron
-runtime) is doing real work here, not just a marketing line.
+doesn't sit holding ~1.5GB of models in memory between dictations. Opting in
+to `preload_models_at_launch` trades that off for a faster first dictation:
+the speech model loads at app launch instead, costing roughly 2GB RSS while
+it's loaded, and it still idle-unloads on the same timer if you never
+dictate. The packaged `.app` bundle itself measures **36MB** on this build —
+small enough that Tauri's native-webview approach (vs. bundling a full
+Chromium/Electron runtime) is doing real work here, not just a marketing
+line.
 
 ## Install
 
@@ -869,6 +877,7 @@ require a restart: [docs/USAGE-macOS.md#config-reference-configtoml](docs/USAGE-
 | `hotkey_keycode` | `61` (Right Option) | Hold-to-talk key — changeable in Settings → Hotkey; only the modifier keycodes are valid (a non-modifier key auto-repeats keyDown instead of the clean hold/tap transition detection relies on, see [docs/USAGE-macOS.md#config-reference-configtoml](docs/USAGE-macOS.md#config-reference-configtoml)) |
 | `hold_threshold_ms` | `300` | Hold vs. tap threshold (ms) |
 | `idle_unload_secs` | `300` | Model idle-unload timer (s) |
+| `preload_models_at_launch` | `false` | Load the speech model at app launch instead of on first use (~2GB RSS while loaded; still idle-unloads on `idle_unload_secs`). Applies at launch only — requires an app restart |
 | `max_hold_secs` | `600` | Hard cap on a held recording (s) |
 | `max_handsfree_secs` | `600` | Hard cap on hands-free recording (s) |
 | `cleanup_timeout_ms` | `2500` | LLM cleanup deadline before raw fallback (ms) |
@@ -925,13 +934,16 @@ MIT — see [LICENSE](LICENSE). Copyright (c) 2026 VZT Tech Consulting.
 never leave your machine. The only network traffic VZT Flow ever makes is
 downloading the Parakeet/Qwen3 model files once, from Hugging Face.
 
-**Why is my first dictation slow?** The Parakeet model isn't loaded until
-the first recording finishes (lazy load), and is idle-unloaded again after
-`idle_unload_secs` of inactivity — expect a few seconds of one-time load
-latency on that first dictation only. If you're using `clean`/`polish`, the
-cleanup LLM pre-warms (model load + a throwaway generation to force Metal
-kernel JIT compilation) as soon as a recording *starts*, in parallel with
-you talking, so it's typically already warm by the time you finish speaking.
+**Why is my first dictation slow?** The Parakeet speech model isn't loaded
+until you dictate (lazy load), and is idle-unloaded again after
+`idle_unload_secs` of inactivity. It now starts loading the moment you press
+the hotkey — in parallel with you talking, the same way the cleanup model
+already did — instead of waiting until you release the key, so most of the
+~4.8s load (measured on this repo's M5, v0.3.5 baseline) overlaps your
+speech rather than sitting after it. A hold shorter than the load still pays
+whatever's left uncovered. If you dictate often, set `preload_models_at_launch`
+so the model is already warm before your first press of the session — see the
+[config reference](#configuration-quick-reference) for its RSS cost.
 
 **Does it work offline?** Yes, fully, once the models are downloaded.
 

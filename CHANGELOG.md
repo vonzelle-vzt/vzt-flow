@@ -6,6 +6,85 @@ versioning](https://semver.org/). Numbers quoted below were measured on this
 repo's dev hardware (M5 MacBook Air) unless noted — see `README.md` /
 `docs/PRD.md` for the full methodology.
 
+## [Unreleased]
+
+Long summary merge prompts now prefill in bounded native batches. This prevents
+an assertion that could terminate the app once a merge exceeded the model's
+batch limit, and lets cancellation interrupt prefill between batches. Summary
+merges also avoid repeating identical partial summaries. Coverage means every
+window was processed; model-generated summaries can still omit decisions.
+
+**Meeting transcripts drop spelling-varied echoes and repair hard-cut overlaps.**
+The seven-case synthetic corpus improved from 54/252 errors (21.43% WER) to
+43/252 (17.06%) with all defaults, keeping the genuine interjection and removing
+seam insertions. This is offline replay, not a live-call accuracy claim; names
+and numbers still need review. See [the accuracy results](docs/MEETINGS.md#measured-transcript-accuracy).
+
+**Meetings now leave you with your notes, a summary, and a PDF on the Desktop.**
+The desktop companion opens a notepad with the meeting, autosaves what you type
+to a `.notes.txt` sidecar, and merges it into the transcript under `## My notes`
+when you stop. Invisible marker comments delimit the typed section so headings
+inside your notes cannot cut it short. Closing the notepad hides it; clicking it
+activates VZT Flow so you can type. After a later edit, **Update files** refreshes
+the exports.
+
+The PDF brings together the summary, action items, explicitly labelled typed
+notes, and a full-transcript appendix. Its Latin-1-oriented Helvetica font uses
+WinAnsi encoding: unsupported characters are replaced and counted in the footer.
+The Markdown transcript remains the lossless Unicode original, and a failed PDF
+export does not discard it. Recording, Stopping, Finalizing, Completed, and
+Failed states make the session's progress visible.
+
+**Optional interview coaching runs entirely on your machine.** Put your resume,
+job description, and talking points in Settings' Interview mode editor
+(`~/.config/vzt-flow/interview.md`). Tips arrive after silence ends a recognized
+question; an uninterrupted monologue can delay them until the 30s chunk cap.
+On this M5, a roughly 600-token prompt measured **p50 2.15s / p95 2.76s** on a
+quiet machine, and **3.2–4.4s p50** under heavy build load. These are coaching
+benchmarks, not meeting-finalization timings. A later idle integration run
+with a larger ~760-token prompt measured **p50 3.83s / p95 6.57s**, with 8/8
+valid tips and no context echoes; it missed the 3-second p95 target. The live
+coach can omit an over-deadline tip. Context defaults to 2,400
+characters and the tip deadline to 5,000ms: at 4,800 characters, 3 of 8 tips
+failed to parse and one recited the resume. Invalid or context-reciting tips
+are discarded.
+
+Long meetings now use hierarchical summaries: up to **12 window passes plus
+one final merge pass**, with a full/partial coverage note replacing the old
+"summary of final portion" label. Dictation cleanup, coaching, and summaries
+share one resident LLM; dictation cleanup can preempt a summary and coaching
+requests are latest-only. Nine configuration keys control the notepad, PDF
+output, interview defaults and timing, context size, and summary windows and
+deadlines. See [Meeting mode](docs/MEETINGS.md) for defaults and output details.
+**The speech model now starts loading the moment you press the hotkey**,
+instead of waiting until you release it. On v0.3.5 (this repo's M5, before
+this change) Parakeet load measured **4.79s** (median of 3 in-process runs,
+range 4.11–6.48s), and that cost showed up end-to-end over the daemon socket
+on a 4.2s clip as **4.22s cold vs. 0.28s warm** — a ~3.9s penalty landing
+entirely after you finished speaking, because the load only began once
+`start_recording` returned. It now fires a fire-and-forget, idempotent
+`ModelCommand::Warmup` at the *end* of `start_recording`, the same way the
+cleanup LLM has pre-warmed since it shipped, so the load overlaps your
+speech instead of following it. A hold shorter than the load still pays
+whatever's left uncovered when you release the key — this doesn't eliminate
+the cost, it moves as much of it as possible off the critical path.
+
+Two more pieces ship alongside it. An opt-in `preload_models_at_launch`
+config (default `false`, applies at launch only, requires an app restart)
+loads the speech model when the app starts rather than on first use, moving
+that load off the first dictation path when preload finishes in time — it costs
+roughly 2GB RSS while loaded and still idle-unloads on `idle_unload_secs` if
+you never dictate. And in Ask mode, detecting a Zoom/Meet/Teams call now
+triggers the same dictation-model preload. Meeting capture still owns a
+separate speech engine; this does not eliminate its model load.
+
+A throwaway warm-up *inference* (beyond just the model load) was evaluated
+and **not** added: measurement showed the first-inference cost is
+shape-dependent, not a one-time JIT you can pay off with any clip — warming
+on a 4.2s clip left a 14.5s clip's first inference 42%/360ms slower in RTF
+than warming on its own length, so a fixed warm-up clip would not reliably
+pay for real dictations of varying length.
+
 ## [0.3.5] — 2026-08-02
 
 **Dictation sometimes pasted your dictionary instead of what you said.** You

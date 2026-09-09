@@ -236,6 +236,23 @@ is useless for a corpus) and counts echoes. Build the corpus from
 dictation and is therefore the record of what the LLM pass actually did. Keep
 corpora out of the repo — it is the user's dictation history.
 
+`cleanup_manager` is now the single owner of the desktop's resident LLM;
+`meeting::finalize` must use that generator and never load a second
+`LlamaCleanupProvider`.
+
+**(m) A new Tauri window label must be added to
+`apps/desktop/src-tauri/capabilities/default.json`, or every `invoke` from it is
+silently denied.** Loading the HTML and JavaScript is not proof the window can
+call commands. Include the label (for example, `notes`) in the capability's
+`windows` list and verify an actual invoke from that window.
+
+**(n) A `LlamaBatch` allocation does not enlarge a context's `n_batch`.**
+A long prompt sent in one decode can trigger a native `GGML_ASSERT` and abort
+the entire app. Keep prompt prefill within the configured batch limit, preserve
+absolute token positions across batches, and check cancellation between them.
+Test the multi-window summary's final merge with the real model; short prompts
+and mock-generator tests do not exercise this failure.
+
 ## Verification norms
 
 - **Test with real TTS audio**, not silence/noise: `say -o /tmp/clip.aiff
