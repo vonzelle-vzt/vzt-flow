@@ -11,6 +11,7 @@
 
 pub mod dedup;
 pub mod detect;
+pub mod pipeline;
 pub mod transcriber;
 
 #[cfg(target_os = "macos")]
@@ -227,7 +228,6 @@ mod session {
     //! Parakeet engine, the transcript writer, echo dedup, and the on-stop
     //! summarizer together.
 
-    use std::collections::VecDeque;
     use std::io::Write;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -241,7 +241,7 @@ mod session {
     use crate::engine::{ParakeetTranscriber, Transcriber};
     use crate::models::{cleanup_model_path, parakeet_model_dir};
 
-    use super::dedup::{is_echo, time_overlaps, DEFAULT_ECHO_THRESHOLD};
+    use super::pipeline::{ChunkPipeline, Decision};
     use super::syscapture;
     use super::transcriber::{format_offset, Chunk, Source, StreamingChunker};
     use super::{default_meetings_dir, slug_title};
@@ -251,20 +251,6 @@ mod session {
     /// so a marathon meeting never overruns the model's context. Sized well
     /// under the cleanup model's 8192-token context budget.
     const SUMMARY_MAX_CHARS: usize = 6_000;
-
-    /// How long a transcribed segment stays eligible for echo comparison. A
-    /// `Me:` chunk is only ever dropped as an echo of a `Them:` chunk it
-    /// overlaps in time with, so we only need to retain very recent history.
-    const DEDUP_RETAIN_SECS: f32 = 30.0;
-
-    /// One transcribed, dictionary-corrected line, retained briefly for the
-    /// echo-dedup time/word comparison.
-    struct RecordedSeg {
-        source: Source,
-        start: f32,
-        end: f32,
-        text: String,
-    }
 
     /// Line-buffered, crash-safe transcript writer. Every line is flushed to
     /// disk immediately (so a crash mid-meeting keeps everything written so
@@ -396,76 +382,39 @@ mod session {
         out_dir.join(format!("{date}-{slug}-{}.md", now.format("%H%M%S")))
     }
 
-    /// The single transcription worker: for each chunk, resample to 16 kHz,
-    /// transcribe on the shared engine, dictionary-correct, apply echo dedup,
-    /// and append the surviving line.
+    /// The single transcription worker: hands each chunk to the shared
+    /// [`ChunkPipeline`] (resample, transcribe on the shared engine,
+    /// dictionary-correct, echo dedup) and appends the surviving line.
     fn transcription_worker(
         flush_rx: mpsc::Receiver<Chunk>,
         engine: Arc<Mutex<ParakeetTranscriber>>,
         dict: Arc<Vec<dictionary::DictionaryTerm>>,
         writer: Arc<Mutex<TranscriptWriter>>,
     ) {
-        let mut recent: VecDeque<RecordedSeg> = VecDeque::new();
+        let mut pipeline = ChunkPipeline::new(dict);
 
         while let Ok(chunk) = flush_rx.recv() {
-            if !chunk.has_speech || chunk.samples.is_empty() {
-                continue; // dead-air chunk flushed by the 30s cap — skip it
-            }
-            let start = chunk.start_offset;
-            let end = chunk.end_offset();
-
-            // Resample native -> 16 kHz for the engine.
-            let samples = crate::audio::resample_linear(
-                &chunk.samples,
-                chunk.sample_rate,
-                crate::audio::TARGET_SAMPLE_RATE,
-            );
-
-            let text = {
+            let decision = pipeline.process(&chunk, |samples| {
                 let mut guard = match engine.lock() {
                     Ok(g) => g,
                     Err(p) => p.into_inner(),
                 };
-                match guard.transcribe(&samples) {
-                    Ok(t) => t.text.trim().to_string(),
-                    Err(e) => {
-                        eprintln!("[vzt-flow] transcription error: {e}");
-                        continue;
+                Ok(guard.transcribe(samples)?.text)
+            });
+            match decision {
+                Decision::Emit { start, source, text } => {
+                    if let Ok(mut w) = writer.lock() {
+                        w.append_line(start, source, &text);
                     }
                 }
-            };
-            if text.is_empty() {
-                continue;
-            }
-            let corrected = dictionary::correct(&text, &dict);
-
-            // Prune history older than the dedup window relative to this chunk.
-            while let Some(front) = recent.front() {
-                if front.end < start - DEDUP_RETAIN_SECS {
-                    recent.pop_front();
-                } else {
-                    break;
-                }
-            }
-
-            // Echo dedup: drop a Me line that time-overlaps a recent Them line
-            // and is textually near-identical (the no-headphones case).
-            if chunk.source == Source::Me {
-                let echo = recent.iter().any(|seg| {
-                    seg.source == Source::Them
-                        && time_overlaps(start, end, seg.start, seg.end)
-                        && is_echo(&corrected, &seg.text, DEFAULT_ECHO_THRESHOLD)
-                });
-                if echo {
+                Decision::DroppedEcho(corrected) => {
                     eprintln!("[vzt-flow] dropped echo (Me overlapped Them): {corrected}");
-                    continue;
                 }
+                Decision::Failed(e) => {
+                    eprintln!("[vzt-flow] transcription error: {e}");
+                }
+                Decision::Skipped(_) => {}
             }
-
-            if let Ok(mut w) = writer.lock() {
-                w.append_line(start, chunk.source, &corrected);
-            }
-            recent.push_back(RecordedSeg { source: chunk.source, start, end, text: corrected });
         }
     }
 
