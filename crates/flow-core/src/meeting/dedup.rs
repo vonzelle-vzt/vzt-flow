@@ -8,14 +8,15 @@
 //! The guard is deliberately conservative: a `Me:` chunk is dropped only when
 //! it (a) overlaps in time with a `Them:` chunk and (b) is textually near-
 //! identical to it (normalized-token Jaccard similarity above a threshold),
-//! or contains nearly all of the mic tokens despite a different chunk boundary.
+//! or contains nearly all of the mic tokens despite a different chunk boundary,
+//! or has high character-bigram similarity despite ASR spelling differences.
 //! Real back-channel interjections ("yeah", "right", "makes sense") are short
 //! and rarely word-for-word matches, so they survive.
 //!
 //! Wearing headphones eliminates the echo at the source and is the
 //! recommended setup — see `docs/MEETINGS.md`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Default Jaccard-similarity threshold above which an overlapping `Me:`
 /// chunk is treated as an echo of a `Them:` chunk and dropped. Chosen per the
@@ -32,6 +33,38 @@ pub const ECHO_TIME_TOLERANCE_SECS: f32 = 1.0;
 /// Fraction of mic tokens also present in the system-audio chunk. Unlike
 /// Jaccard, this catches a short mic fragment of a longer system utterance.
 pub const ECHO_CONTAINMENT_THRESHOLD: f64 = 0.8;
+
+/// Character-bigram Dice threshold for ASR spelling differences. The corpus
+/// echo scores 0.893; its genuine interjection scores 0.056.
+pub const ECHO_CHAR_DICE_THRESHOLD: f64 = 0.75;
+
+/// Multiset Dice similarity of lowercase, letters-only character bigrams.
+/// Spaces, punctuation and digits are removed before forming bigrams. Counts
+/// preserve repeated bigrams; inputs with no bigrams provide no evidence.
+pub fn char_bigram_dice(a: &str, b: &str) -> f64 {
+    fn bigrams(text: &str) -> (HashMap<(char, char), usize>, usize) {
+        let mut counts = HashMap::new();
+        let mut previous = None;
+        let mut total = 0;
+        for c in text.chars().flat_map(char::to_lowercase).filter(|c| c.is_alphabetic()) {
+            if let Some(p) = previous {
+                *counts.entry((p, c)).or_insert(0) += 1;
+                total += 1;
+            }
+            previous = Some(c);
+        }
+        (counts, total)
+    }
+    let (a, a_len) = bigrams(a);
+    let (b, b_len) = bigrams(b);
+    if a_len + b_len == 0 {
+        return 0.0;
+    }
+    let shared: usize = a.iter()
+        .map(|(pair, count)| (*count).min(b.get(pair).copied().unwrap_or(0)))
+        .sum();
+    2.0 * shared as f64 / (a_len + b_len) as f64
+}
 
 /// Overlap allowing a gap of less than `tol` seconds between the spans.
 /// At zero tolerance this is the existing strict half-open overlap test.
@@ -88,17 +121,20 @@ pub fn jaccard_similarity(a: &HashSet<String>, b: &HashSet<String>) -> f64 {
 /// `them_text` (a time-overlapping `Them:` line) at or above `threshold`.
 /// Short `Me:` utterances (< [`MIN_TOKENS_FOR_ECHO`] tokens) are never
 /// echoes — see that constant. Delegates to [`is_echo_with`] with
-/// containment always enabled; see that function to toggle it (used by the
-/// meeting pipeline's `PipelineOptions::echo_containment` for attribution).
+/// all arms enabled; see that function to toggle the additional arms.
 pub fn is_echo(me_text: &str, them_text: &str, threshold: f64) -> bool {
-    is_echo_with(me_text, them_text, threshold, true)
+    is_echo_with(me_text, them_text, threshold, true, true)
 }
 
-/// As [`is_echo`], but the containment arm ([`ECHO_CONTAINMENT_THRESHOLD`])
-/// can be switched off via `containment_enabled` — used by the meeting
-/// pipeline's `PipelineOptions` so an offline replay harness can attribute a
-/// WER change to the containment check specifically.
-pub fn is_echo_with(me_text: &str, them_text: &str, threshold: f64, containment_enabled: bool) -> bool {
+/// As [`is_echo`], with independently switchable containment and character
+/// similarity arms for offline attribution. Jaccard remains active.
+pub fn is_echo_with(
+    me_text: &str,
+    them_text: &str,
+    threshold: f64,
+    containment_enabled: bool,
+    fuzzy_enabled: bool,
+) -> bool {
     let me = normalize_tokens(me_text);
     if me.len() < MIN_TOKENS_FOR_ECHO {
         return false;
@@ -106,6 +142,7 @@ pub fn is_echo_with(me_text: &str, them_text: &str, threshold: f64, containment_
     let them = normalize_tokens(them_text);
     jaccard_similarity(&me, &them) > threshold
         || (containment_enabled && containment(&me, &them) >= ECHO_CONTAINMENT_THRESHOLD)
+        || (fuzzy_enabled && char_bigram_dice(me_text, them_text) >= ECHO_CHAR_DICE_THRESHOLD)
 }
 
 /// Whether two half-open time intervals `[a_start, a_end)` and
@@ -231,4 +268,55 @@ mod tests {
         assert!(!overlaps_within(0.0, 2.0, 10.0, 12.0, ECHO_TIME_TOLERANCE_SECS));
     }
 
+
+    const CORPUS_THEM: &str = "Von Zel Brown met Ifa O Sullivan and Rajesh Krishna Murti on Tuesday.";
+    const CORPUS_ME: &str = "Bonzell Brown met Ifa Osalivan and Rajesh Krishnamurathi on Tuesday.";
+
+    #[test]
+    fn fuzzy_catches_corpus_echo_with_different_name_spellings() {
+        let me = normalize_tokens(CORPUS_ME);
+        let them = normalize_tokens(CORPUS_THEM);
+        assert!(jaccard_similarity(&me, &them) <= 0.7);
+        assert!(containment(&me, &them) < 0.8);
+        assert!(!is_echo_with(CORPUS_ME, CORPUS_THEM, DEFAULT_ECHO_THRESHOLD, false, false));
+        assert!(is_echo_with(CORPUS_ME, CORPUS_THEM, DEFAULT_ECHO_THRESHOLD, false, true));
+        assert!(is_echo(CORPUS_ME, CORPUS_THEM, DEFAULT_ECHO_THRESHOLD));
+        assert!((char_bigram_dice(CORPUS_ME, CORPUS_THEM) - 0.892857142857).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fuzzy_keeps_the_genuine_corpus_interjection() {
+        assert!(!is_echo("Yes, that works for me.", CORPUS_THEM, DEFAULT_ECHO_THRESHOLD));
+    }
+
+    #[test]
+    fn fuzzy_keeps_a_genuine_paraphrase_agreement() {
+        assert!(!is_echo("yes I think Friday works but let's confirm with Priya first",
+            "the deadline is next Friday", DEFAULT_ECHO_THRESHOLD));
+    }
+
+    #[test]
+    fn unrelated_same_length_sentence_has_low_dice() {
+        let unrelated = "Fresh snow covered each rooftop while children played outside now.";
+        let letters = |s: &str| s.chars().filter(|c| c.is_alphabetic()).count();
+        assert_eq!(letters(unrelated), letters(CORPUS_THEM));
+        assert!(char_bigram_dice(unrelated, CORPUS_THEM) < 0.5);
+        assert!(!is_echo(unrelated, CORPUS_THEM, DEFAULT_ECHO_THRESHOLD));
+    }
+
+    #[test]
+    fn dice_normalizes_unicode_letters_and_counts_repeated_bigrams() {
+        assert_eq!(char_bigram_dice("É A! 123", "éa"), 1.0);
+        assert_eq!(char_bigram_dice("aaaa", "aa"), 0.5);
+        assert_eq!(char_bigram_dice("aa", "aaaa"), 0.5);
+        assert_eq!(char_bigram_dice("", "123"), 0.0);
+        assert_eq!(char_bigram_dice("a", "a"), 0.0);
+        assert_eq!(char_bigram_dice("a", "abc"), 0.0);
+    }
+
+    #[test]
+    fn fuzzy_never_bypasses_the_backchannel_guard() {
+        assert_eq!(char_bigram_dice("for sure", "for sure"), 1.0);
+        assert!(!is_echo_with("for sure", "for sure", 0.0, true, true));
+    }
 }

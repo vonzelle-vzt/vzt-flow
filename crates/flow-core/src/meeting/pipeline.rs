@@ -166,6 +166,8 @@ pub struct PipelineOptions {
     /// Echo check: also treat a mic line that is mostly *contained* in the
     /// system-audio line (not just Jaccard-similar) as an echo.
     pub echo_containment: bool,
+    /// Echo check: tolerate spelling differences using character-bigram Dice.
+    pub echo_fuzzy: bool,
 }
 
 impl Default for PipelineOptions {
@@ -177,6 +179,7 @@ impl Default for PipelineOptions {
             low_information: true,
             echo_tolerance: true,
             echo_containment: true,
+            echo_fuzzy: true,
         }
     }
 }
@@ -192,6 +195,7 @@ impl PipelineOptions {
             low_information: false,
             echo_tolerance: false,
             echo_containment: false,
+            echo_fuzzy: false,
         }
     }
 }
@@ -324,7 +328,7 @@ impl ChunkPipeline {
                 } else {
                     time_overlaps(start, end, seg.start, seg.end)
                 };
-                overlaps && is_echo_with(&corrected, &seg.text, DEFAULT_ECHO_THRESHOLD, self.opts.echo_containment)
+                overlaps && is_echo_with(&corrected, &seg.text, DEFAULT_ECHO_THRESHOLD, self.opts.echo_containment, self.opts.echo_fuzzy)
             });
             if echo {
                 return Decision::DroppedEcho(corrected);
@@ -358,11 +362,12 @@ struct HeldLine {
 /// coach and the live notepad for no benefit.
 pub struct LineBuffer {
     held: Vec<HeldLine>,
+    opts: PipelineOptions,
 }
 
 impl LineBuffer {
-    pub fn new() -> Self {
-        Self { held: Vec::new() }
+    pub fn new(opts: PipelineOptions) -> Self {
+        Self { held: Vec::new(), opts }
     }
 
     /// Feed a decision at meeting-time `now_offset` (the offset at which the
@@ -382,8 +387,12 @@ impl LineBuffer {
                 // the two sources chunk (and finish transcribing)
                 // independently, so completion order is not span order.
                 self.held.retain(|held| {
-                    let overlaps = overlaps_within(held.start, held.end, start, them_end, ECHO_TIME_TOLERANCE_SECS);
-                    !(overlaps && is_echo_with(&held.text, &text, DEFAULT_ECHO_THRESHOLD, true))
+                    let overlaps = if self.opts.echo_tolerance {
+                        overlaps_within(held.start, held.end, start, them_end, ECHO_TIME_TOLERANCE_SECS)
+                    } else {
+                        time_overlaps(held.start, held.end, start, them_end)
+                    };
+                    !(overlaps && is_echo_with(&held.text, &text, DEFAULT_ECHO_THRESHOLD, self.opts.echo_containment, self.opts.echo_fuzzy))
                 });
                 out.push((start, Source::Them, text));
             }
@@ -419,7 +428,7 @@ impl LineBuffer {
 
 impl Default for LineBuffer {
     fn default() -> Self {
-        Self::new()
+        Self::new(PipelineOptions::default())
     }
 }
 
@@ -767,7 +776,7 @@ mod tests {
 
     #[test]
     fn me_lines_are_released_in_order_after_the_hold_and_them_lines_pass_straight_through() {
-        let mut buf = LineBuffer::new();
+        let mut buf = LineBuffer::new(PipelineOptions::default());
 
         let r1 = buf.push(Decision::Emit { start: 3.0, source: Source::Me, text: "third".into() }, 3.0);
         assert!(r1.is_empty(), "a Me line is held, not released immediately");
@@ -792,7 +801,7 @@ mod tests {
 
     #[test]
     fn line_buffer_releases_in_start_offset_order() {
-        let mut buf = LineBuffer::new();
+        let mut buf = LineBuffer::new(PipelineOptions::default());
         // Pushed out of start_offset order (and each push's own now_offset is
         // still under its hold deadline, so nothing releases early).
         buf.push(Decision::Emit { start: 8.0, source: Source::Me, text: "c".into() }, 8.0);
@@ -812,7 +821,7 @@ mod tests {
 
     #[test]
     fn a_late_them_line_still_vetoes_an_earlier_me_echo() {
-        let mut buf = LineBuffer::new();
+        let mut buf = LineBuffer::new(PipelineOptions::default());
         let line = "so the migration lands on thursday";
 
         // Me line finishes transcribing first (its Them counterpart is slower).
@@ -834,7 +843,7 @@ mod tests {
 
     #[test]
     fn line_buffer_drain_all_releases_everything_in_order() {
-        let mut buf = LineBuffer::new();
+        let mut buf = LineBuffer::new(PipelineOptions::default());
         buf.push(Decision::Emit { start: 5.0, source: Source::Me, text: "b".into() }, 5.0);
         buf.push(Decision::Emit { start: 2.0, source: Source::Me, text: "a".into() }, 2.0);
 
@@ -847,5 +856,40 @@ mod tests {
             ]
         );
         assert!(buf.drain_all().is_empty());
+    }
+
+    #[test]
+    fn echo_options_control_both_process_and_late_them_veto() {
+        let them = "Von Zel Brown met Ifa O Sullivan and Rajesh Krishna Murti on Tuesday.";
+        let me = "Bonzell Brown met Ifa Osalivan and Rajesh Krishnamurathi on Tuesday.";
+        // Overlapping spans isolate the fuzzy arm; abutting spans also require
+        // tolerance. Containment alone cannot match this spelling difference.
+        for gap in [false, true] {
+            for fuzzy in [false, true] {
+                for tolerance in [false, true] {
+                    let opts = PipelineOptions {
+                        echo_fuzzy: fuzzy, echo_tolerance: tolerance,
+                        echo_containment: false, ..PipelineOptions::default()
+                    };
+                    let me_start = if gap { 1.3 } else { 0.5 };
+                    let should_drop = fuzzy && (!gap || tolerance);
+                    let mut pipeline = ChunkPipeline::with_options(Arc::new(Vec::new()), opts);
+                    pipeline.process(&chunk_at(Source::Them, 0.0, 1.0), says(them));
+                    let result = pipeline.process(&chunk_at(Source::Me, me_start, 1.0), says(me));
+                    assert_eq!(matches!(result, Decision::DroppedEcho(_)), should_drop);
+
+                    let mut buf = LineBuffer::new(opts);
+                    buf.push(Decision::Emit { start: 0.0, source: Source::Me, text: me.into() }, 1.0);
+                    buf.push(Decision::Emit { start: me_start, source: Source::Them, text: them.into() }, 2.5);
+                    assert_eq!(buf.drain_all().is_empty(), should_drop);
+                }
+            }
+        }
+        for (opts, dropped) in [(PipelineOptions::legacy(), false), (PipelineOptions::default(), true)] {
+            let mut buf = LineBuffer::new(opts);
+            buf.push(Decision::Emit { start: 0.0, source: Source::Me, text: me.into() }, 1.0);
+            buf.push(Decision::Emit { start: 0.5, source: Source::Them, text: them.into() }, 2.5);
+            assert_eq!(buf.drain_all().is_empty(), dropped);
+        }
     }
 }
