@@ -102,7 +102,16 @@ pub fn summarize(
 ) -> SummaryResult {
     let total_chars = body.chars().count();
     let window_chars = effective_window_chars(total_chars, opts);
-    let windows = split_for_summary(body, window_chars);
+    let mut windows = split_for_summary(body, window_chars);
+    if opts.max_passes > 0 && windows.len() > opts.max_passes {
+        // Whole lines leave unused space at each boundary. A character-only
+        // average therefore does not enforce the pass cap. Allow one longest
+        // line of slack: every non-final window then contains at least the
+        // original target size, bounding the total to max_passes without
+        // discarding text or detaching lines from their context.
+        let longest_line = body.lines().map(|line| line.chars().count()).max().unwrap_or(0);
+        windows = split_for_summary(body, window_chars.saturating_add(longest_line));
+    }
     let sections = windows.len().max(1);
 
     if windows.len() <= 1 {
@@ -252,6 +261,24 @@ mod tests {
         assert_eq!(window, 16_667);
         let expected_windows = total.div_ceil(window);
         assert_eq!(expected_windows, 12);
+    }
+
+    #[test]
+    fn whole_line_boundaries_cannot_exceed_the_summary_pass_cap() {
+        // The nominal target is 7,669 chars: two 4,000-char lines cannot
+        // fit, so the old character-average calculation made 23 passes.
+        let lines: Vec<String> = (0..23).map(|i| format!("{i:04}{}", "x".repeat(3_996))).collect();
+        let body = lines.join("\n");
+        let o = SummaryOptions { window_chars: 6_000, max_passes: 12, ..opts() };
+        let gen = FakeGen::new();
+        let result = summarize(&body, &gen, &o, &no_progress);
+        assert_eq!(result.sections, 12);
+        assert_eq!(gen.call_count(), 13);
+        let prompts = gen.seen.lock().unwrap();
+        for line in &lines {
+            assert_eq!(prompts[..result.sections].iter().filter(|prompt| prompt.contains(line)).count(), 1,
+                "every original line must reach exactly one partial pass");
+        }
     }
 
     #[test]
