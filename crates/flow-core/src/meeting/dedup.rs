@@ -7,7 +7,8 @@
 //!
 //! The guard is deliberately conservative: a `Me:` chunk is dropped only when
 //! it (a) overlaps in time with a `Them:` chunk and (b) is textually near-
-//! identical to it (normalized-token [Jaccard similarity] above a threshold).
+//! identical to it (normalized-token Jaccard similarity above a threshold),
+//! or contains nearly all of the mic tokens despite a different chunk boundary.
 //! Real back-channel interjections ("yeah", "right", "makes sense") are short
 //! and rarely word-for-word matches, so they survive.
 //!
@@ -23,6 +24,27 @@ use std::collections::HashSet;
 /// that ASR jitter between the two captures of the same speech (a dropped
 /// filler word, a mis-heard token) doesn't push a true echo under the bar.
 pub const DEFAULT_ECHO_THRESHOLD: f64 = 0.7;
+
+/// Maximum gap between spans considered for echo comparison. Independent
+/// chunk boundaries and delayed speaker bleed can make echo spans abut.
+pub const ECHO_TIME_TOLERANCE_SECS: f32 = 1.0;
+
+/// Fraction of mic tokens also present in the system-audio chunk. Unlike
+/// Jaccard, this catches a short mic fragment of a longer system utterance.
+pub const ECHO_CONTAINMENT_THRESHOLD: f64 = 0.8;
+
+/// Overlap allowing a gap of less than `tol` seconds between the spans.
+/// At zero tolerance this is the existing strict half-open overlap test.
+pub fn overlaps_within(a_start: f32, a_end: f32, b_start: f32, b_end: f32, tol: f32) -> bool {
+    a_start - tol < b_end && b_start - tol < a_end
+}
+
+/// `|A ∩ B| / |A|`: the share of `a` tokens also found in `b`.
+/// An empty `a` has no evidence of containment and returns zero.
+pub fn containment(a: &HashSet<String>, b: &HashSet<String>) -> f64 {
+    if a.is_empty() { return 0.0; }
+    a.intersection(b).count() as f64 / a.len() as f64
+}
 
 /// A `Me:` utterance with fewer than this many tokens is never treated as an
 /// echo, regardless of similarity: short acknowledgements ("yeah", "right",
@@ -73,6 +95,7 @@ pub fn is_echo(me_text: &str, them_text: &str, threshold: f64) -> bool {
     }
     let them = normalize_tokens(them_text);
     jaccard_similarity(&me, &them) > threshold
+        || containment(&me, &them) >= ECHO_CONTAINMENT_THRESHOLD
 }
 
 /// Whether two half-open time intervals `[a_start, a_end)` and
@@ -156,4 +179,46 @@ mod tests {
         assert!(!time_overlaps(0.0, 3.0, 3.0, 6.0)); // touch at boundary, no overlap
         assert!(!time_overlaps(0.0, 2.0, 10.0, 12.0)); // far apart
     }
+
+    #[test]
+    fn containment_of_a_subset_is_one() {
+        let a = normalize_tokens("the next release");
+        let b = normalize_tokens("please review the next release tomorrow");
+        assert_eq!(containment(&a, &b), 1.0);
+    }
+
+    #[test]
+    fn containment_of_an_empty_set_is_zero() {
+        assert_eq!(containment(&HashSet::new(), &normalize_tokens("some words")), 0.0);
+        assert_eq!(containment(&HashSet::new(), &HashSet::new()), 0.0);
+    }
+
+    #[test]
+    fn echo_fires_when_me_captured_only_half_of_what_them_said() {
+        let them = "Please review our updated project timeline before sending the final report tomorrow";
+        let me = "before sending the final report tomorrow";
+        assert_eq!(them.split_whitespace().count(), 12);
+        assert_eq!(me.split_whitespace().count(), 6);
+        assert!(jaccard_similarity(&normalize_tokens(me), &normalize_tokens(them)) <= 0.7);
+        assert!(is_echo(me, them, DEFAULT_ECHO_THRESHOLD));
+    }
+
+    #[test]
+    fn containment_does_not_fire_on_a_genuine_agreement() {
+        let them = "the deadline is next Friday";
+        let me = "yes I think Friday works but let's confirm with Priya first";
+        assert!(!is_echo(me, them, DEFAULT_ECHO_THRESHOLD));
+    }
+
+    #[test]
+    fn overlaps_within_catches_an_abutting_span() {
+        assert!(overlaps_within(0.0, 9.0, 9.3, 13.0, ECHO_TIME_TOLERANCE_SECS));
+        assert!(!overlaps_within(0.0, 9.0, 9.3, 13.0, 0.0));
+    }
+
+    #[test]
+    fn overlaps_within_still_rejects_distant_spans() {
+        assert!(!overlaps_within(0.0, 2.0, 10.0, 12.0, ECHO_TIME_TOLERANCE_SECS));
+    }
+
 }
