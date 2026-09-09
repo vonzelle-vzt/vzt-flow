@@ -80,6 +80,31 @@ pub trait CleanupProvider: Send + Sync {
     /// caller can abort a long-running generation from another thread by
     /// setting it — see the module docs on the timeout model.
     fn clean(&self, raw: &str, mode: Mode, ctx: &CleanupContext, cancel: &AtomicBool) -> Result<String>;
+
+    /// Free-form generation on the same resident model, for the callers that
+    /// aren't dictation cleanup — the meeting summary and the interview
+    /// coach, both of which reach it through `crate::llm`. `system` and
+    /// `user` are the entire prompt (nothing is built for you the way
+    /// [`build_system_prompt`] builds `clean`'s), and `max_new_tokens` is an
+    /// explicit budget rather than one sized from the input: a ~90-token
+    /// coaching tip must not be budgeted as though it were a full cleanup
+    /// pass, however long the transcript behind it is.
+    ///
+    /// `cancel` carries the same cooperative contract as [`Self::clean`].
+    ///
+    /// Defaults to `Ok(String::new())` — the established "no usable output"
+    /// contract — so every existing implementor ([`PassthroughProvider`] and
+    /// the test providers) is unaffected, and a provider that simply can't do
+    /// free-form generation degrades rather than failing.
+    fn generate_raw(
+        &self,
+        _system: &str,
+        _user: &str,
+        _max_new_tokens: i32,
+        _cancel: &AtomicBool,
+    ) -> Result<String> {
+        Ok(String::new())
+    }
 }
 
 /// Always returns the input unchanged. Used when no model is loaded (or
@@ -187,10 +212,18 @@ mod llama_impl {
             Ok(Self { model, backend, chat_template, load_time: started.elapsed() })
         }
 
+        /// `max_new_tokens`: `None` sizes the output budget from
+        /// `input_char_len` via [`max_new_tokens_for`] — the dictation path,
+        /// floored at [`MIN_NEW_TOKENS`] so a short dictation is never cut
+        /// short. `Some(n)` takes `n` as the caller's own budget, clamped
+        /// only to the context room actually left after the prompt and
+        /// deliberately **not** floored: a caller that asks for 90 tokens
+        /// (a coaching tip) means 90, not 300.
         fn generate(
             &self,
             prompt_messages: &[(&str, String)],
             input_char_len: usize,
+            max_new_tokens: Option<i32>,
             cancel: &AtomicBool,
         ) -> Result<String> {
             let messages: Vec<LlamaChatMessage> = prompt_messages
@@ -234,8 +267,15 @@ mod llama_impl {
             // Size the output-token budget from the input length so long
             // dictations aren't cut off at the old flat 300-token limit;
             // still clamped to the remaining context room so it can never
-            // overrun what's actually left after the prompt.
-            let max_new_tokens = max_new_tokens_for(input_char_len, prompt_tokens, CONTEXT_SIZE);
+            // overrun what's actually left after the prompt. An explicit
+            // budget from the caller skips the sizing (and the floor) but
+            // gets the same context clamp — `prompt_fits_context` above
+            // guarantees the subtraction leaves at least MIN_NEW_TOKENS, so
+            // the `.max(1)` is belt-and-braces rather than load-bearing.
+            let max_new_tokens = match max_new_tokens {
+                None => max_new_tokens_for(input_char_len, prompt_tokens, CONTEXT_SIZE),
+                Some(n) => n.min((CONTEXT_SIZE - prompt_tokens) as i32).max(1),
+            };
 
             let mut batch = LlamaBatch::new(tokens.len().max(512), 1);
             let last_index = tokens.len() - 1;
@@ -287,7 +327,7 @@ mod llama_impl {
             let system = build_summary_prompt();
             // Same Qwen3 `/no_think` suppression rationale as `clean`.
             let user = format!("{transcript} /no_think");
-            self.generate(&[("system", system), ("user", user)], transcript.chars().count(), cancel)
+            self.generate(&[("system", system), ("user", user)], transcript.chars().count(), None, cancel)
         }
     }
 
@@ -322,7 +362,7 @@ mod llama_impl {
             // cheaper than trying to parse past a (possibly truncated)
             // thinking block.
             let user = format!("{raw} /no_think");
-            let out = self.generate(&[("system", system), ("user", user)], raw.chars().count(), cancel)?;
+            let out = self.generate(&[("system", system), ("user", user)], raw.chars().count(), None, cancel)?;
 
             // The empty-input guard above is not enough: the model also
             // recites the glossary for perfectly healthy input that simply
@@ -342,6 +382,25 @@ mod llama_impl {
                 return Ok(String::new());
             }
             Ok(out)
+        }
+
+        /// Free-form generation on the same context/sampler/cancel machinery
+        /// as `clean`, with the caller's own token budget. No dictionary
+        /// block and no `/no_think` are added here — the caller owns the
+        /// whole prompt, and the meeting/coaching prompts append their own.
+        fn generate_raw(
+            &self,
+            system: &str,
+            user: &str,
+            max_new_tokens: i32,
+            cancel: &AtomicBool,
+        ) -> Result<String> {
+            self.generate(
+                &[("system", system.to_string()), ("user", user.to_string())],
+                user.chars().count(),
+                Some(max_new_tokens),
+                cancel,
+            )
         }
     }
 }
@@ -526,8 +585,78 @@ pub fn build_summary_prompt() -> String {
      each with the owner if stated. If there are no action items, write \
      exactly \"- [ ] none\".\n\n\
      Base everything strictly on the transcript — do NOT invent participants, \
-     decisions, or tasks that weren't said. Output only the two sections."
+     decisions, or tasks that weren't said. Do NOT invent owners, dates or \
+     deadlines. If an action item has no stated owner, give it no owner. \
+     Output only the two sections."
         .to_string()
+}
+
+/// Minimum number of consecutive words an output must have lifted from the
+/// context before it can be judged a context echo at all. Plays the role
+/// [`MIN_ECHOED_TERMS`] plays for [`is_glossary_echo`]: under this length a
+/// shared run is ordinary phrasing ("tell me about a time when you"), not
+/// recitation.
+const MIN_ECHOED_CONTEXT_WORDS: usize = 8;
+
+/// Fraction of the output that must be lifted from the context for it to
+/// count as an echo, in tenths (7 = 70%).
+const CONTEXT_ECHO_RATIO_TENTHS: usize = 7;
+
+/// Whether a generation is just the *context* recited back rather than an
+/// answer derived from it — the free-form analogue of [`is_glossary_echo`],
+/// and the same failure: Qwen3-1.7B decodes greedily, so given a prompt it
+/// has little to add to, the highest-probability continuation is a copy of
+/// the most recent text in its context window (gotcha (l)). For the
+/// interview coach that context is the user's own resume/notes, and the
+/// symptom is a "tip" that is a paragraph of their CV.
+///
+/// True when the output's longest run of words that also appears
+/// *contiguously* in `context` is at least [`MIN_ECHOED_CONTEXT_WORDS`] long
+/// **and** covers at least [`CONTEXT_ECHO_RATIO_TENTHS`] of the output. A
+/// contiguous run is the discriminator: a real tip reuses the context's
+/// vocabulary scattered through new sentences, whereas an echo reproduces
+/// its word order verbatim.
+///
+/// Same bias as `is_glossary_echo` — a false positive costs one tip (the
+/// caller degrades to no tip), a false negative shows the user their own
+/// resume and calls it advice.
+pub fn is_context_echo(out: &str, context: &str) -> bool {
+    let out_words = comparable_words(out);
+    let ctx_words = comparable_words(context);
+    if out_words.is_empty() || ctx_words.is_empty() {
+        return false;
+    }
+    let lifted = longest_shared_run(&out_words, &ctx_words);
+    lifted >= MIN_ECHOED_CONTEXT_WORDS
+        && lifted * 10 >= out_words.len() * CONTEXT_ECHO_RATIO_TENTHS
+}
+
+/// Splits text into lowercased words with surrounding punctuation stripped,
+/// so "resume." and "Resume" compare equal and a re-wrapped or re-punctuated
+/// copy of the context still reads as a copy.
+fn comparable_words(s: &str) -> Vec<String> {
+    s.split_whitespace()
+        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase())
+        .filter(|w| !w.is_empty())
+        .collect()
+}
+
+/// Length of the longest run of words present, in the same order and with no
+/// gaps, in both slices. Rolling-row DP: O(a*b) time, O(b) space — a coaching
+/// tip is ~90 words against a context capped in the low thousands, so this is
+/// microseconds, not a hot path worth optimizing further.
+fn longest_shared_run(a: &[String], b: &[String]) -> usize {
+    let mut prev = vec![0usize; b.len() + 1];
+    let mut cur = vec![0usize; b.len() + 1];
+    let mut best = 0usize;
+    for a_word in a {
+        for (j, b_word) in b.iter().enumerate() {
+            cur[j + 1] = if a_word == b_word { prev[j] + 1 } else { 0 };
+            best = best.max(cur[j + 1]);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    best
 }
 
 #[cfg(test)]
@@ -625,6 +754,60 @@ mod tests {
             let cancel = AtomicBool::new(false);
             let out = provider.clean("   \n\t  ", Mode::Polish, &ctx, &cancel).unwrap();
             assert_eq!(out, "");
+        }
+
+        /// The free-form path against the real model. Everything else that
+        /// covers `generate_raw` exercises either the default trait body or
+        /// the scheduler's fake provider, so without this the *production*
+        /// implementation — and specifically the explicit-budget branch that
+        /// bypasses the [`MIN_NEW_TOKENS`] floor — is never actually run.
+        ///
+        /// `#[ignore]`d because, unlike the two tests above, this one really
+        /// decodes tokens: it pays the one-time Metal pipeline JIT (seconds)
+        /// on top of the model load, which is too much for every `cargo test`.
+        /// Run it explicitly:
+        /// `cargo test --release -p flow-core generate_raw_ -- --ignored --nocapture`
+        #[test]
+        #[ignore = "loads the real cleanup model and decodes tokens; run explicitly"]
+        fn generate_raw_respects_an_explicit_small_token_budget() {
+            let Some(provider) = load_or_skip() else { return };
+            let cancel = AtomicBool::new(false);
+            let started = Instant::now();
+            let out = provider
+                .generate_raw(
+                    "Answer in one short sentence. Output only the answer.",
+                    "What colour is a clear midday sky? /no_think",
+                    24,
+                    &cancel,
+                )
+                .unwrap();
+            let elapsed = started.elapsed();
+            eprintln!("generate_raw(24 tokens) -> {:?} in {:.2}s", out, elapsed.as_secs_f64());
+            assert!(!out.trim().is_empty(), "the real model produced nothing");
+            // 24 tokens at ~4 chars/token is ~96 characters. The assertion is
+            // deliberately loose (a 3x margin) — the point is that the budget
+            // was honoured at all, i.e. the explicit `Some(n)` branch ran and
+            // did not silently get floored up to MIN_NEW_TOKENS (300 tokens,
+            // ~1200 characters).
+            assert!(
+                out.chars().count() < 300,
+                "a 24-token budget produced {} chars; the explicit budget was ignored:\n{out}",
+                out.chars().count()
+            );
+        }
+
+        /// A cancel already set before the call must stop the free-form path
+        /// before it decodes anything — the same cooperative contract `clean`
+        /// has, and what the manager's preemption path depends on.
+        #[test]
+        #[ignore = "loads the real cleanup model; run explicitly"]
+        fn generate_raw_honours_a_preset_cancel() {
+            let Some(provider) = load_or_skip() else { return };
+            let cancel = AtomicBool::new(true);
+            let out = provider
+                .generate_raw("You are terse.", "Say something.", 300, &cancel)
+                .unwrap();
+            assert_eq!(out, "", "a pre-cancelled generation still produced output");
         }
     }
 
@@ -864,6 +1047,64 @@ mod tests {
         assert!(p.contains("- [ ] none"));
         // Must instruct the model not to fabricate content.
         assert!(p.contains("do NOT invent"));
+    }
+
+    /// Gotcha (l): whatever trails the system prompt is what the model
+    /// recites when it has little to say. The no-invention rule is a
+    /// constraint, not the task — it must be *in* the prompt but never the
+    /// last thing in it.
+    #[test]
+    fn summary_prompt_keeps_the_task_instruction_last() {
+        let p = build_summary_prompt();
+        let no_invention = "Do NOT invent owners, dates or deadlines. If an action item has no \
+                            stated owner, give it no owner.";
+        assert!(p.contains(no_invention), "the no-invention rule is missing:\n{p}");
+        assert!(
+            p.trim_end().ends_with("Output only the two sections."),
+            "the task instruction must be in tail position:\n{p}"
+        );
+        assert!(
+            !p.trim_end().ends_with(no_invention),
+            "the no-invention rule displaced the task instruction from the tail"
+        );
+    }
+
+    /// The default trait body is what keeps every existing implementor
+    /// compiling, and it must degrade (empty = "no usable output") rather
+    /// than error, because every `generate_raw` caller is best-effort.
+    #[test]
+    fn generate_raw_default_impl_returns_empty() {
+        let cancel = AtomicBool::new(false);
+        assert_eq!(PassthroughProvider.generate_raw("sys", "user", 90, &cancel).unwrap(), "");
+    }
+
+    #[test]
+    fn context_echo_catches_a_verbatim_slice_of_the_context() {
+        let context = "I led the migration of the billing service from Rails to Go, cutting \
+                       p99 latency by 40 percent and mentoring two junior engineers.";
+        let out = "I led the migration of the billing service from Rails to Go, cutting p99 \
+                   latency by 40 percent";
+        assert!(is_context_echo(out, context));
+    }
+
+    #[test]
+    fn context_echo_ignores_a_real_answer_that_merely_reuses_the_vocabulary() {
+        let context = "I led the migration of the billing service from Rails to Go, cutting \
+                       p99 latency by 40 percent and mentoring two junior engineers.";
+        // Same nouns, different sentence: not a recitation.
+        let out = "Name the billing migration, then give the p99 number — a concrete latency \
+                   figure lands better than the word 'mentoring', and they asked about impact.";
+        assert!(!is_context_echo(out, context));
+    }
+
+    #[test]
+    fn context_echo_needs_a_long_enough_run_and_never_panics_on_empty() {
+        let context = "Tell me about a time you shipped something hard.";
+        // Seven shared words: under the floor, so ordinary shared phrasing
+        // rather than an echo.
+        assert!(!is_context_echo("Tell me about a time you shipped", context));
+        assert!(!is_context_echo("", context));
+        assert!(!is_context_echo("anything at all", ""));
     }
 
     #[test]
