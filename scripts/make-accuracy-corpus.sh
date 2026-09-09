@@ -146,7 +146,7 @@ ff -i "$accuracy_tmp/blips-speech.wav" \
   -f lavfi -i 'anullsrc=r=16000:cl=mono:d=0.8' \
   -f lavfi -i 'anoisesrc=r=16000:d=0.2:a=0.12:seed=42' \
   -f lavfi -i 'anoisesrc=r=16000:d=0.2:a=0.12:seed=43' \
-  -filter_complex "[0:a]asplit=2[a][b];[a]atrim=end_sample=$accuracy_cut,asetpts=PTS-STARTPTS[first];[b]atrim=start_sample=$accuracy_cut,asetpts=PTS-STARTPTS[last];[1:a]asplit=2[gap][tail];[first][gap][last][tail]concat=n=4:v=0:a=1[speech];[2:a]adelay=$accuracy_noise_delay[n1];[3:a]adelay=9000[n2];[speech][n1][n2]amix=inputs=3:duration=first:normalize=0[out]" \
+  -filter_complex "[0:a]asplit=2[a][b];[a]atrim=end_sample=$accuracy_cut,asetpts=PTS-STARTPTS[first];[b]atrim=start_sample=$accuracy_cut,asetpts=PTS-STARTPTS[last];[1:a]asplit=2[gap][tail];[first][gap][last][tail]concat=n=4:v=0:a=1[speech];[2:a]adelay=${accuracy_noise_delay}[n1];[3:a]adelay=9000[n2];[speech][n1][n2]amix=inputs=3:duration=first:normalize=0[out]" \
   -map '[out]' -ar 16000 -ac 1 -c:a pcm_s16le "$accuracy_tmp/blips.wav"
 printf 'blips.speech_seconds=8\nblips.inserted_gap_sample=%s\nblips.noise_delays_ms=%s,9000\nblips.noise_duration_seconds=0.2\n' "$accuracy_cut" "$accuracy_noise_delay" >> "$accuracy_tmp/corpus.meta"
 
