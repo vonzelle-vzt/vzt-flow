@@ -365,6 +365,84 @@ impl TranscriptWriter {
 }
 
 // ---------------------------------------------------------------------------
+// Decision routing (pipeline -> hold buffer -> writer -> coach).
+// ---------------------------------------------------------------------------
+
+/// Writes every line the [`pipeline::LineBuffer`] released, in the order it
+/// released them (already `start_offset`-ordered), and feeds each one to the
+/// interview coach.
+///
+/// `chunk_closed_at` is the instant the chunk that triggered the release was
+/// dequeued, so a tip's measured latency still starts when the speaker
+/// stopped talking rather than when the buffer happened to let the line go.
+#[cfg(any(target_os = "macos", test))]
+fn write_released(
+    writer: &std::sync::Mutex<TranscriptWriter>,
+    coach: &std::sync::Mutex<Option<interview::Coach>>,
+    released: Vec<(f32, transcriber::Source, String)>,
+    chunk_closed_at: std::time::Instant,
+) {
+    for (start, source, text) in released {
+        // The writer lock is released before the coach is touched: an
+        // observer runs inline inside `append_line`, so holding both would
+        // widen the window in which a slow observer blocks the other source's
+        // lines (cf. `TranscriptWriter`'s flush-then-fanout contract).
+        let line = {
+            let mut w = writer.lock().unwrap_or_else(|p| p.into_inner());
+            w.append_line(start, source, &text)
+        };
+        if let Some(line) = line {
+            let guard = coach.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(coach) = guard.as_ref() {
+                coach.observe(&line, chunk_closed_at);
+            }
+        }
+    }
+}
+
+/// Routes one [`pipeline::Decision`] through the hold buffer and writes
+/// whatever comes back out.
+///
+/// Every decision is pushed — including `Skipped`/`Failed`/`DroppedEcho`,
+/// which carry no line but do advance meeting time and so can make an
+/// already-held line due. An ordinary `Them` line is returned by
+/// `push_chunk` on the same call, so it reaches `append_line` (and therefore
+/// the coach and the live notepad) with no added latency; only `Me` lines and
+/// a `Them` line that ended on a hard cap cut are ever held.
+///
+/// Factored out of the macOS-only transcription worker so the
+/// decision -> buffer -> writer path is unit-testable with no capture engine.
+#[cfg(any(target_os = "macos", test))]
+fn route_decision(
+    buffer: &mut pipeline::LineBuffer,
+    writer: &std::sync::Mutex<TranscriptWriter>,
+    coach: &std::sync::Mutex<Option<interview::Coach>>,
+    decision: pipeline::Decision,
+    chunk: &transcriber::Chunk,
+    chunk_closed_at: std::time::Instant,
+) {
+    match &decision {
+        pipeline::Decision::DroppedEcho(corrected) => {
+            eprintln!("[vzt-flow] dropped echo (Me overlapped Them): {corrected}");
+        }
+        pipeline::Decision::Failed(e) => {
+            eprintln!("[vzt-flow] transcription error: {e}");
+        }
+        _ => {}
+    }
+    // A held `Me` line vetoed by a `Them` line that finished transcribing
+    // later never reaches the writer, so the buffer's counter is the only
+    // place that late drop is visible. Log the delta, not the total.
+    let dropped_before = buffer.dropped_echo_count();
+    let released = buffer.push_chunk(decision, chunk);
+    let late = buffer.dropped_echo_count() - dropped_before;
+    if late > 0 {
+        eprintln!("[vzt-flow] dropped echo ({late} held Me line(s) vetoed by a late Them line)");
+    }
+    write_released(writer, coach, released, chunk_closed_at);
+}
+
+// ---------------------------------------------------------------------------
 // Finalize: stop -> merge notes -> summarize -> PDF.
 // ---------------------------------------------------------------------------
 
@@ -801,13 +879,13 @@ mod session {
     use crate::models::parakeet_model_dir;
 
     use super::interview::{Coach, CoachConfig};
-    use super::pipeline::{ChunkPipeline, Decision};
+    use super::pipeline::{ChunkPipeline, LineBuffer, PipelineOptions};
     use super::syscapture;
     use super::transcriber::{Chunk, Source, StreamingChunker, SILENCE_HOLD_SECS};
     use super::{
         build_generator, default_meetings_dir, finalize, notes, notify, reserve_transcript_path,
-        session_id_for, FinalizeRequest, LineFanout, MeetingOptions, MeetingOutcome, SessionStarted,
-        SessionState, TranscriptWriter,
+        route_decision, session_id_for, write_released, FinalizeRequest, LineFanout,
+        MeetingOptions, MeetingOutcome, SessionStarted, SessionState, TranscriptWriter,
     };
 
     /// Runs a full meeting session until `stop` is set.
@@ -992,8 +1070,14 @@ mod session {
 
     /// The single transcription worker: hands each chunk to the shared
     /// [`ChunkPipeline`] (resample, transcribe on the shared engine,
-    /// dictionary-correct, echo dedup), appends the surviving line and feeds
-    /// it to the interview coach.
+    /// dictionary-correct, echo dedup), routes the decision through the
+    /// [`LineBuffer`] hold and writes whatever the buffer releases, feeding
+    /// each written line to the interview coach.
+    ///
+    /// Both halves run the production configuration
+    /// ([`PipelineOptions::default`]) and must be given the *same* options —
+    /// the buffer re-runs the echo veto and the seam repair the pipeline
+    /// already applies, so a mismatch would silently change one of them.
     fn transcription_worker(
         flush_rx: mpsc::Receiver<Chunk>,
         engine: Arc<Mutex<ParakeetTranscriber>>,
@@ -1001,7 +1085,9 @@ mod session {
         writer: Arc<Mutex<TranscriptWriter>>,
         coach: Arc<Mutex<Option<Coach>>>,
     ) {
-        let mut pipeline = ChunkPipeline::new(dict);
+        let opts = PipelineOptions::default();
+        let mut pipeline = ChunkPipeline::with_options(dict, opts);
+        let mut buffer = LineBuffer::new(opts);
 
         while let Ok(chunk) = flush_rx.recv() {
             // Stamped at dequeue, not after transcription: a coaching tip's
@@ -1013,28 +1099,13 @@ mod session {
                 let mut guard = engine.lock().unwrap_or_else(|p| p.into_inner());
                 Ok(guard.transcribe(samples)?.text)
             });
-            match decision {
-                Decision::Emit { start, source, text } => {
-                    let line = {
-                        let mut w = writer.lock().unwrap_or_else(|p| p.into_inner());
-                        w.append_line(start, source, &text)
-                    };
-                    if let Some(line) = line {
-                        let guard = coach.lock().unwrap_or_else(|p| p.into_inner());
-                        if let Some(coach) = guard.as_ref() {
-                            coach.observe(&line, chunk_closed_at);
-                        }
-                    }
-                }
-                Decision::DroppedEcho(corrected) => {
-                    eprintln!("[vzt-flow] dropped echo (Me overlapped Them): {corrected}");
-                }
-                Decision::Failed(e) => {
-                    eprintln!("[vzt-flow] transcription error: {e}");
-                }
-                Decision::Skipped(_) => {}
-            }
+            route_decision(&mut buffer, &writer, &coach, decision, &chunk, chunk_closed_at);
         }
+
+        // Every sender is gone (teardown dropped them after joining the
+        // capture threads), so no later `Them` chunk can arrive to veto or
+        // repair what is still held: release the tail rather than lose it.
+        write_released(&writer, &coach, buffer.drain_all(), Instant::now());
     }
 
     /// Microphone capture loop: opens a cpal input stream, feeds a chunker at
@@ -1100,6 +1171,7 @@ mod session {
                 Ok(block) => {
                     let mono = downmix(&block, in_channels);
                     stats.observe(&mono);
+                    stats.maybe_report(in_rate);
                     for chunk in chunker.push(&mono) {
                         if flush_tx.send(chunk).is_err() {
                             return Ok(()); // worker gone
@@ -1147,6 +1219,7 @@ mod session {
             match capture.recv_timeout(Duration::from_millis(100)) {
                 Ok(mono) => {
                     stats.observe(&mono);
+                    stats.maybe_report(rate);
                     for chunk in chunker.push(&mono) {
                         if flush_tx.send(chunk).is_err() {
                             break;
@@ -1166,20 +1239,46 @@ mod session {
         Ok(())
     }
 
+    /// How much *captured audio* (not wall time) passes between periodic
+    /// [`SourceStats`] reports. Measured in samples so a stalled source stops
+    /// reporting instead of printing an unchanging line every 30 seconds.
+    const STATS_REPORT_SECS: f32 = 30.0;
+
+    /// Peak below which a source is called out as too quiet to detect speech
+    /// in reliably. Half [`super::pipeline::NORMALIZE_PEAK_THRESHOLD`]: a
+    /// chunk under that is merely gain-scaled before inference, but a source
+    /// that never gets above this over 30 seconds is misconfigured, not soft.
+    const QUIET_PEAK_THRESHOLD: f32 = 0.05;
+
     /// Per-source capture diagnostics: how much audio actually arrived and how
-    /// loud it was. Printed once when a source stops so a silent/blocked
-    /// capture (e.g. Screen Recording permission denied but not errored) is
-    /// visible rather than mistaken for a quiet meeting.
+    /// loud it was. Printed every [`STATS_REPORT_SECS`] of captured audio and
+    /// once more when the source stops, so a silent/blocked capture (e.g.
+    /// Screen Recording permission denied but not errored) is visible during
+    /// the meeting rather than mistaken for a quiet meeting and only noticed
+    /// at the end.
     struct SourceStats {
         label: &'static str,
         blocks: u64,
         samples: u64,
         peak: f32,
+        /// `samples` as of the last periodic report, so the next one is due a
+        /// further `STATS_REPORT_SECS` of captured audio later.
+        reported_samples: u64,
+        /// The quiet warning is one-shot: it is advice about the setup, and
+        /// repeating it every 30s would bury the per-source lines.
+        quiet_warned: bool,
     }
 
     impl SourceStats {
         fn new(label: &'static str) -> Self {
-            Self { label, blocks: 0, samples: 0, peak: 0.0 }
+            Self {
+                label,
+                blocks: 0,
+                samples: 0,
+                peak: 0.0,
+                reported_samples: 0,
+                quiet_warned: false,
+            }
         }
         fn observe(&mut self, mono: &[f32]) {
             self.blocks += 1;
@@ -1187,6 +1286,25 @@ mod session {
             let peak = mono.iter().fold(0.0f32, |m, s| m.max(s.abs()));
             if peak > self.peak {
                 self.peak = peak;
+            }
+        }
+        /// Emits the periodic report (and, the first time it applies, the
+        /// quiet-source warning) once another `STATS_REPORT_SECS` of audio
+        /// has been captured. Cheap enough to call per block.
+        fn maybe_report(&mut self, rate: u32) {
+            let interval = (STATS_REPORT_SECS * rate.max(1) as f32) as u64;
+            if self.samples < self.reported_samples.saturating_add(interval) {
+                return;
+            }
+            self.reported_samples = self.samples;
+            self.report(rate);
+            if !self.quiet_warned && self.peak < QUIET_PEAK_THRESHOLD {
+                self.quiet_warned = true;
+                eprintln!(
+                    "[vzt-flow] {} source is very quiet (peak {:.4}); speech detection may \
+                     miss — check the app's output volume / input gain",
+                    self.label, self.peak
+                );
             }
         }
         fn report(&self, rate: u32) {
@@ -1208,6 +1326,56 @@ mod session {
             return samples.to_vec();
         }
         samples.chunks(channels).map(|f| f.iter().sum::<f32>() / f.len() as f32).collect()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{SourceStats, STATS_REPORT_SECS};
+
+        /// One second of 16 kHz mono at a constant amplitude.
+        fn one_second(level: f32) -> Vec<f32> {
+            vec![level; 16_000]
+        }
+
+        #[test]
+        fn stats_report_per_30s_of_audio_and_warn_once_about_a_quiet_source() {
+            let interval = (STATS_REPORT_SECS * 16_000.0) as u64;
+            let mut stats = SourceStats::new("mic");
+            let block = one_second(0.01); // well under QUIET_PEAK_THRESHOLD
+
+            for _ in 0..29 {
+                stats.observe(&block);
+                stats.maybe_report(16_000);
+            }
+            assert_eq!(stats.reported_samples, 0, "under 30s of audio, nothing is due yet");
+            assert!(!stats.quiet_warned, "the warning needs 30s of evidence first");
+
+            stats.observe(&block);
+            stats.maybe_report(16_000);
+            assert_eq!(stats.reported_samples, interval);
+            assert!(stats.quiet_warned);
+
+            // Reporting continues on the same cadence after the one-shot
+            // warning has fired.
+            for _ in 0..30 {
+                stats.observe(&block);
+                stats.maybe_report(16_000);
+            }
+            assert_eq!(stats.reported_samples, 2 * interval);
+        }
+
+        #[test]
+        fn a_source_at_normal_level_is_never_called_quiet() {
+            let interval = (STATS_REPORT_SECS * 16_000.0) as u64;
+            let mut stats = SourceStats::new("system (SCK)");
+            let block = one_second(0.4);
+            for _ in 0..90 {
+                stats.observe(&block);
+                stats.maybe_report(16_000);
+            }
+            assert!(!stats.quiet_warned);
+            assert_eq!(stats.reported_samples, 3 * interval);
+        }
     }
 }
 
@@ -1623,6 +1791,128 @@ mod tests {
         let merging = states.iter().position(|s| s == "finalizing:merging notes").unwrap();
         let summarizing = states.iter().position(|s| s.starts_with("finalizing:summarizing ")).unwrap();
         assert!(merging < summarizing, "states: {states:?}");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- B7: decision -> LineBuffer -> writer routing ----
+
+    /// Builds a chunk carrying `len` seconds of (unused) 16 kHz audio, so
+    /// `end_offset()` — the meeting time `push_chunk` advances the buffer to —
+    /// is `start + len`.
+    fn routed_chunk(source: transcriber::Source, start: f32, len: f32) -> transcriber::Chunk {
+        transcriber::Chunk {
+            source,
+            samples: vec![0.0; (len * 16_000.0) as usize],
+            sample_rate: 16_000,
+            start_offset: start,
+            has_speech: true,
+            speech_secs: len,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn routing_writes_them_at_once_holds_me_and_drains_the_tail() {
+        use transcriber::Source;
+
+        let dir = temp_dir("route");
+        let path = dir.join("2026-09-09-route.md");
+        let file = OpenOptions::new().create(true).append(true).open(&path).unwrap();
+        let writer = Mutex::new(TranscriptWriter::new(file, LineFanout::new("sess-route")));
+        // No coach: routing must not depend on one being installed.
+        let coach: Mutex<Option<interview::Coach>> = Mutex::new(None);
+        let opts = pipeline::PipelineOptions::default();
+        let mut buffer = pipeline::LineBuffer::new(opts);
+        let closed_at = std::time::Instant::now();
+        let on_disk = || fs::read_to_string(&path).unwrap();
+
+        // (a) An ordinary (not hard-cut) Them line is written by the very
+        // call that produced it — no hold, so the coach and the live notepad
+        // see it with no added latency.
+        let them = routed_chunk(Source::Them, 0.0, 2.0);
+        route_decision(
+            &mut buffer,
+            &writer,
+            &coach,
+            pipeline::Decision::Emit {
+                start: 0.0,
+                source: Source::Them,
+                text: "them speaks first".to_string(),
+            },
+            &them,
+            closed_at,
+        );
+        assert!(
+            on_disk().contains("[00:00:00] Them: them speaks first"),
+            "an ordinary Them line must reach the transcript immediately:\n{}",
+            on_disk()
+        );
+
+        // (b) A Me line the per-chunk echo check could not catch (its Them
+        // counterpart had not been transcribed yet) is held, then vetoed by
+        // that overlapping Them line when it finally arrives.
+        let echo = "so the migration lands on thursday";
+        let me = routed_chunk(Source::Me, 10.5, 2.0);
+        route_decision(
+            &mut buffer,
+            &writer,
+            &coach,
+            pipeline::Decision::Emit { start: 10.5, source: Source::Me, text: echo.to_string() },
+            &me,
+            closed_at,
+        );
+        assert!(!on_disk().contains("Me: so the migration"), "a Me line is held, not written");
+
+        let late_them = routed_chunk(Source::Them, 10.0, 3.0);
+        route_decision(
+            &mut buffer,
+            &writer,
+            &coach,
+            pipeline::Decision::Emit { start: 10.0, source: Source::Them, text: echo.to_string() },
+            &late_them,
+            closed_at,
+        );
+        assert_eq!(buffer.dropped_echo_count(), 1, "the late Them line vetoes the held Me line");
+        let content = on_disk();
+        assert!(content.contains("[00:00:10] Them: so the migration lands on thursday"), "{content}");
+        assert!(!content.contains("Me: so the migration"), "the vetoed echo must never be written:\n{content}");
+
+        // (c) The last Me line is still inside its hold window when the
+        // channel disconnects; `drain_all` is what keeps it.
+        let tail = routed_chunk(Source::Me, 20.0, 1.0);
+        route_decision(
+            &mut buffer,
+            &writer,
+            &coach,
+            pipeline::Decision::Emit {
+                start: 20.0,
+                source: Source::Me,
+                text: "my closing thought".to_string(),
+            },
+            &tail,
+            closed_at,
+        );
+        assert!(!on_disk().contains("my closing thought"), "still held while the hold window runs");
+
+        write_released(&writer, &coach, buffer.drain_all(), std::time::Instant::now());
+        let content = on_disk();
+        assert!(
+            content.contains("[00:00:20] Me: my closing thought"),
+            "the tail must survive the channel disconnect:\n{content}"
+        );
+
+        // Everything written, in start_offset order, and the writer's body
+        // (what the summarizer reads) agrees with the file.
+        let body = writer.lock().unwrap().body.clone();
+        assert_eq!(
+            body,
+            vec![
+                "Them: them speaks first".to_string(),
+                "Them: so the migration lands on thursday".to_string(),
+                "Me: my closing thought".to_string(),
+            ]
+        );
 
         fs::remove_dir_all(&dir).ok();
     }
