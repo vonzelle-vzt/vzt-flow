@@ -4,6 +4,7 @@ use tauri::{AppHandle, Manager, State};
 use tauri_plugin_autostart::ManagerExt;
 
 use flow_core::config::MeetingAuto;
+use flow_core::meeting::SessionState;
 
 use crate::coordinator::CoordinatorMsg;
 use crate::state::{AppState, DictationState, LockRecover, ModelLifecycle};
@@ -32,22 +33,36 @@ pub fn build_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     };
 
     // --- meeting transcription state ---
-    let meeting_active = crate::meeting_ctl::is_active(app);
+    let meeting_state = crate::meeting_ctl::current_state(app);
+    let (meeting_toggle_label, meeting_toggle_enabled) = meeting_toggle_label(meeting_state.as_ref());
     let meeting_auto = state.config.lock_or_recover().meeting_auto_mode();
-    let meeting_toggle_label = if meeting_active {
-        "Stop meeting transcription (\u{25cf} recording)"
-    } else {
-        "Start meeting transcription"
-    };
+    let interview_on = crate::meeting_ctl::interview_enabled(app);
 
     let status_item = MenuItem::with_id(app, "status", &status_label, false, None::<&str>)?;
     let toggle_item = MenuItem::with_id(app, "toggle_dictation", toggle_label, true, None::<&str>)?;
     let copy_item = MenuItem::with_id(app, "copy_last", "Copy last transcript", true, None::<&str>)?;
 
-    let meeting_toggle_item =
-        MenuItem::with_id(app, "toggle_meeting", meeting_toggle_label, true, None::<&str>)?;
+    let meeting_toggle_item = MenuItem::with_id(
+        app,
+        "toggle_meeting",
+        meeting_toggle_label,
+        meeting_toggle_enabled,
+        None::<&str>,
+    )?;
     let meeting_folder_item =
         MenuItem::with_id(app, "open_meetings", "Open meetings folder", true, None::<&str>)?;
+    // Manual fallback for opening the notes window — Screen Recording being
+    // ungranted or a title-match miss can keep the automatic open from firing.
+    let open_notes_item =
+        MenuItem::with_id(app, "open_notes", "Open meeting notes", true, None::<&str>)?;
+    let toggle_interview_item = CheckMenuItem::with_id(
+        app,
+        "toggle_interview",
+        "Interview mode",
+        true,
+        interview_on,
+        None::<&str>,
+    )?;
     // Auto-detect submenu: three checked-radio-style options bound to config.
     let auto_ask = CheckMenuItem::with_id(
         app,
@@ -99,6 +114,8 @@ pub fn build_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
         .separator()
         .item(&meeting_toggle_item)
         .item(&meeting_folder_item)
+        .item(&open_notes_item)
+        .item(&toggle_interview_item)
         .item(&auto_submenu)
         .separator()
         .item(&settings_item)
@@ -107,6 +124,27 @@ pub fn build_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
         .separator()
         .item(&quit_item)
         .build()
+}
+
+/// The meeting toggle item's label and enabled state for a session's
+/// lifecycle. Pure so every state is testable without a Tauri app. `None`
+/// (no session yet, or the map has already retired a finished one) reads the
+/// same as `Completed`/`Failed` — there is nothing running to stop.
+///
+/// `Stopping`/`Finalizing` disable the item rather than offering "stop" a
+/// second time: the microphone is already closed by then (`meeting_ctl::
+/// is_active` treats both as not-active) and a second click can't do
+/// anything but confuse a summary/PDF export already in flight.
+pub fn meeting_toggle_label(state: Option<&SessionState>) -> (&'static str, bool) {
+    match state {
+        None | Some(SessionState::Completed) | Some(SessionState::Failed(_)) => {
+            ("Start meeting transcription", true)
+        }
+        Some(SessionState::Recording) => ("Stop meeting transcription (\u{25cf} recording)", true),
+        Some(SessionState::Stopping) | Some(SessionState::Finalizing { .. }) => {
+            ("Finalizing meeting\u{2026}", false)
+        }
+    }
 }
 
 /// A monochrome (alpha-only) mic glyph on a transparent background — the
@@ -161,6 +199,12 @@ fn handle_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
         "open_meetings" => {
             crate::meeting_ctl::open_folder(app);
         }
+        "open_notes" => {
+            open_notes(app);
+        }
+        "toggle_interview" => {
+            toggle_interview(app);
+        }
         "meeting_auto_ask" => {
             crate::meeting_ctl::set_auto_mode(app, MeetingAuto::Ask);
         }
@@ -202,6 +246,46 @@ fn handle_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
     }
 }
 
+/// Opens the notepad — the manual fallback for when the automatic open never
+/// fired (missing Screen Recording grant, or a title-match miss). Binds to
+/// the newest session if one exists so the notepad shows which meeting it
+/// belongs to; opens unbound (empty session id) otherwise. `notepad::open`
+/// (U11) owns the window itself and marshals every operation onto the main
+/// thread (gotcha (h)) — this is only the tray's dispatch point.
+fn open_notes(app: &AppHandle) {
+    let session_id = crate::meeting_ctl::current_session_id(app).unwrap_or_default();
+    crate::notepad::open(app, &session_id);
+}
+
+/// Toggles interview mode from the tray.
+///
+/// A live (or still-finalizing) session flips its slot's flag via
+/// `meeting_ctl::set_interview`, which also persists the new default and
+/// refreshes the tray itself. With no session in the map there is nothing to
+/// flip, so the config default is persisted directly here and the menu is
+/// refreshed to pick up the new checkbox state.
+fn toggle_interview(app: &AppHandle) {
+    let want = !crate::meeting_ctl::interview_enabled(app);
+    match crate::meeting_ctl::current_session_id(app) {
+        Some(session_id) => {
+            if let Err(e) = crate::meeting_ctl::set_interview(app, &session_id, want) {
+                eprintln!("[vzt-flow] failed to toggle interview mode: {e}");
+            }
+        }
+        None => {
+            let state = app.state::<AppState>();
+            {
+                let mut cfg = state.config.lock_or_recover();
+                cfg.meeting_interview = want;
+                if let Err(e) = cfg.save() {
+                    eprintln!("[vzt-flow] failed to save meeting_interview: {e}");
+                }
+            }
+            refresh_menu(app);
+        }
+    }
+}
+
 fn copy_last_transcript(app: &AppHandle, state: &State<AppState>) {
     if let Some(text) = state.last_transcript.lock_or_recover().clone() {
         if let Ok(mut clipboard) = arboard::Clipboard::new() {
@@ -209,5 +293,40 @@ fn copy_last_transcript(app: &AppHandle, state: &State<AppState>) {
         }
     } else {
         let _ = app; // nothing to copy yet; menu item stays a no-op
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// All five lifecycle states, plus the "no session yet" case, map to the
+    /// label/enabled pair the tray must show — in particular, `Stopping` and
+    /// `Finalizing` must read as "Finalizing meeting…" and disabled so the
+    /// item never offers "stop" a second time while a summary/PDF export is
+    /// in flight.
+    #[test]
+    fn meeting_toggle_label_reflects_each_session_state() {
+        assert_eq!(meeting_toggle_label(None), ("Start meeting transcription", true));
+        assert_eq!(
+            meeting_toggle_label(Some(&SessionState::Completed)),
+            ("Start meeting transcription", true)
+        );
+        assert_eq!(
+            meeting_toggle_label(Some(&SessionState::Failed("boom".to_string()))),
+            ("Start meeting transcription", true)
+        );
+        assert_eq!(
+            meeting_toggle_label(Some(&SessionState::Recording)),
+            ("Stop meeting transcription (\u{25cf} recording)", true)
+        );
+        assert_eq!(
+            meeting_toggle_label(Some(&SessionState::Stopping)),
+            ("Finalizing meeting\u{2026}", false)
+        );
+        assert_eq!(
+            meeting_toggle_label(Some(&SessionState::Finalizing { step: "writing pdf".to_string() })),
+            ("Finalizing meeting\u{2026}", false)
+        );
     }
 }
