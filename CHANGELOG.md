@@ -6,6 +6,42 @@ versioning](https://semver.org/). Numbers quoted below were measured on this
 repo's dev hardware (M5 MacBook Air) unless noted — see `README.md` /
 `docs/PRD.md` for the full methodology.
 
+## [Unreleased]
+
+**Meetings now leave you with your notes, a summary, and a PDF on the Desktop.**
+The desktop companion opens a notepad with the meeting, autosaves what you type
+to a `.notes.txt` sidecar, and merges it into the transcript under `## My notes`
+when you stop. Invisible marker comments delimit the typed section so headings
+inside your notes cannot cut it short. Closing the notepad hides it; clicking it
+activates VZT Flow so you can type. After a later edit, **Update files** refreshes
+the exports.
+
+The PDF brings together the summary, action items, explicitly labelled typed
+notes, and a full-transcript appendix. Its Latin-1-oriented Helvetica font uses
+WinAnsi encoding: unsupported characters are replaced and counted in the footer.
+The Markdown transcript remains the lossless Unicode original, and a failed PDF
+export does not discard it. Recording, Stopping, Finalizing, Completed, and
+Failed states make the session's progress visible.
+
+**Optional interview coaching runs entirely on your machine.** Put your resume,
+job description, and talking points in Settings' Interview mode editor
+(`~/.config/vzt-flow/interview.md`). Tips arrive after silence ends a recognized
+question; an uninterrupted monologue can delay them until the 30s chunk cap.
+On this M5, a roughly 600-token prompt measured **p50 2.15s / p95 2.76s** on a
+quiet machine, and **3.2–4.4s p50** under heavy build load. These are coaching
+benchmarks, not meeting-finalization timings. Context defaults to 2,400
+characters and the tip deadline to 5,000ms: at 4,800 characters, 3 of 8 tips
+failed to parse and one recited the resume. Invalid or context-reciting tips
+are discarded.
+
+Long meetings now use hierarchical summaries: up to **12 window passes plus
+one final merge pass**, with a full/partial coverage note replacing the old
+"summary of final portion" label. Dictation cleanup, coaching, and summaries
+share one resident LLM; dictation cleanup can preempt a summary and coaching
+requests are latest-only. Nine configuration keys control the notepad, PDF
+output, interview defaults and timing, context size, and summary windows and
+deadlines. See [Meeting mode](docs/MEETINGS.md) for defaults and output details.
+
 ## [0.3.5] — 2026-08-02
 
 **Dictation sometimes pasted your dictionary instead of what you said.** You
