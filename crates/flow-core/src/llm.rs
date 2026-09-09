@@ -65,6 +65,8 @@ pub struct GenRequest {
     /// spent queued or preempted does not count against it.
     pub timeout_ms: u64,
     pub priority: Priority,
+    /// Session-owned cancellation, checked while queued and during generation.
+    pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 /// Anything that can turn a [`GenRequest`] into text. Implementations must be
@@ -215,6 +217,7 @@ mod tests {
             user: "usr".into(),
             max_new_tokens: 90,
             timeout_ms: 1_000,
+            cancel: None,
             priority,
         }
     }

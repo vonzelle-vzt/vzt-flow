@@ -1,7 +1,7 @@
 //! Hierarchical meeting summary: splits a long transcript into bounded
 //! windows, summarizes each independently, then folds the partials into one
-//! final pass — so a 60-minute meeting's early decisions survive instead of
-//! being dropped by the old tail-only truncation.
+//! final pass. Early sections reach the model instead of being discarded by
+//! tail-only truncation; generation can still omit facts.
 
 use crate::cleanup::build_summary_prompt;
 use crate::llm::{GenRequest, Priority, TextGenerator};
@@ -53,7 +53,10 @@ pub struct SummaryResult {
 pub fn build_partial_prompt() -> String {
     "You compress one portion of a meeting transcript. Lines are labelled \
      \"Them:\" and \"Me:\". Keep names, numbers, decisions and commitments \
-     verbatim. Do NOT invent owners, dates or deadlines. Write at most 6 \
+     verbatim. Prioritize explicit decisions and commitments, even if stated \
+     only once, over repeated discussion. Combine repeated topics into one \
+     bullet and omit transcript item numbers. Them and Me are speaker labels, \
+     not named owners. Do NOT invent owners, dates or deadlines. Write at most 6 \
      terse bullets, no headings, no preamble. Output only the bullets."
         .to_string()
 }
@@ -124,9 +127,10 @@ pub fn summarize(
         progress(i + 1, total_calls);
         let req = GenRequest {
             system: build_partial_prompt(),
-            user: format!("{window} /no_think"),
+            user: format!("{window}\n\nSummarize this portion in at most six bullets. Preserve explicit decisions and commitments; combine repeated topics. Do not continue or copy the transcript. /no_think"),
             max_new_tokens: 220,
             timeout_ms: opts.partial_timeout_ms,
+            cancel: None,
             priority: Priority::Background,
         };
         let text = gen.generate(req).unwrap_or_default();
@@ -141,7 +145,7 @@ pub fn summarize(
     }
 
     progress(total_calls, total_calls);
-    let combined = partials.join("\n");
+    let combined = combine_partials(&partials);
     let markdown = run_final_pass(&combined, gen, opts);
 
     let coverage_note = if complete {
@@ -153,15 +157,27 @@ pub fn summarize(
     SummaryResult { markdown, sections, complete, coverage_note }
 }
 
+/// Keep each distinct partial summary once. Compare whole blocks, ignoring
+/// whitespace only: deduplicating individual lines could detach a task from
+/// its owner or a fact from its heading. Names, numbers and negations stay intact.
+fn combine_partials(partials: &[String]) -> String {
+    let mut seen = std::collections::HashSet::new();
+    partials.iter().filter_map(|partial| {
+        let key = partial.split_whitespace().collect::<Vec<_>>().join(" ");
+        (!key.is_empty() && seen.insert(key)).then_some(partial.trim())
+    }).collect::<Vec<_>>().join("\n\n")
+}
+
 /// Runs the final consolidation pass over `text` (either the sole window's
 /// raw text, or the concatenated partials) with the unchanged
 /// `build_summary_prompt`.
 fn run_final_pass(text: &str, gen: &dyn TextGenerator, opts: &SummaryOptions) -> String {
     let req = GenRequest {
         system: build_summary_prompt(),
-        user: format!("{text} /no_think"),
+        user: format!("{text}\n\nWrite the final meeting summary and action items now. Preserve explicit decisions from the beginning and end. Combine repetition, omit item numbers, and do not assign tasks to speaker labels. Output only the two requested sections. /no_think"),
         max_new_tokens: 420,
         timeout_ms: opts.final_timeout_ms,
+        cancel: None,
         priority: Priority::Background,
     };
     gen.generate(req).unwrap_or_default()
@@ -213,6 +229,19 @@ mod tests {
     }
 
     fn no_progress(_i: usize, _n: usize) {}
+
+    #[test]
+    fn merge_deduplicates_partials_without_detaching_owners_or_decisions() {
+        let partials = vec![
+            "- Test offline support.\nOwner: Ana".to_string(),
+            "- Test  offline support.\nOwner: Ana".to_string(),
+            "- Test offline support.\nOwner: Ben".to_string(),
+            "- Keep the database in Europe.\n- Ship on Friday.".to_string(),
+            "- Do not ship on Friday.\n- Budget: 10,000.\n- Budget: 100.00.".to_string(),
+        ];
+        assert_eq!(combine_partials(&partials),
+            "- Test offline support.\nOwner: Ana\n\n- Test offline support.\nOwner: Ben\n\n- Keep the database in Europe.\n- Ship on Friday.\n\n- Do not ship on Friday.\n- Budget: 10,000.\n- Budget: 100.00.");
+    }
 
     #[test]
     fn effective_window_chars_grows_to_cap_the_pass_count() {

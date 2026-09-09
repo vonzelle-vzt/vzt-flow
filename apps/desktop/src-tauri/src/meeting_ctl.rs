@@ -58,6 +58,7 @@ use flow_core::meeting::{
 };
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
+use flow_core::model_manager::ModelCommand;
 use tauri_plugin_notification::NotificationExt;
 
 use crate::state::{should_auto_stop, AppState, LockRecover, Meetings, SessionSlot};
@@ -403,8 +404,8 @@ pub fn start(app: &AppHandle, title: Option<String>, notify_start: bool, detecti
         })
     };
 
-    // Runs on the session thread while the transcript writer's mutex is held:
-    // a short lock and an emit, nothing that can block.
+    // Runs after the transcript has been flushed and its writer mutex released.
+    // Keep the session-store lock short and emit after releasing it too.
     let on_line = {
         let app = app.clone();
         Arc::new(move |line: &TranscriptLine| {
@@ -584,7 +585,7 @@ pub fn stop(app: &AppHandle) {
             Some(slot) => match slot.handle.take() {
                 Some(handle) => {
                     slot.state = SessionState::Stopping;
-                    Some((slot.session_id.clone(), handle))
+                    Some((slot.session_id.clone(), handle, slot.notes_rev))
                 }
                 // Already finalizing (or long finished) — nothing to stop.
                 None => None,
@@ -592,7 +593,7 @@ pub fn stop(app: &AppHandle) {
             None => None,
         }
     };
-    let Some((session_id, handle)) = taken else {
+    let Some((session_id, handle, notes_rev_at_stop)) = taken else {
         return;
     };
 
@@ -604,22 +605,21 @@ pub fn stop(app: &AppHandle) {
         .name("vzt-flow-meeting-stop".into())
         .spawn(move || {
             let result = handle.stop_detailed();
-            finish_session(&app, &session_id, result);
+            finish_session(&app, &session_id, result, notes_rev_at_stop);
         })
         .expect("failed to spawn meeting-stop thread");
 }
 
 /// Records a finished session: outcome into the slot, terminal state out to
 /// the notepad and the tray, and only then the notification.
-fn finish_session(app: &AppHandle, session_id: &str, result: anyhow::Result<MeetingOutcome>) {
+fn finish_session(app: &AppHandle, session_id: &str, result: anyhow::Result<MeetingOutcome>, notes_rev_at_stop: u64) {
     let state = app.state::<AppState>();
 
     let outcome = match result {
         Ok(mut outcome) => {
-            // flow-core has no notes revision counter (it always reports 0);
-            // the slot is the authority, so the outcome is corrected from it.
-            let rev = with_slot(app, Some(session_id), |slot| slot.notes_rev).unwrap_or(0);
-            outcome.notes_rev_used = rev;
+            // Edits during finalization may miss the export snapshot. Keep a
+            // conservative revision from stop, never the revision at completion.
+            outcome.notes_rev_used = notes_rev_at_stop;
             Some(outcome)
         }
         Err(e) => {
@@ -1098,6 +1098,16 @@ fn on_detected_start(app: &AppHandle, mode: MeetingAuto, which: MeetingApp) {
                 &format!("{} call detected", which.label()),
                 "Start transcribing? Click the VZT Flow menu-bar icon › Start meeting transcription.",
             );
+            // A call is up but we are not transcribing it — dictation during
+            // a call is common, so warm the speech model now rather than
+            // making the first dictation of the call pay the load. Only in
+            // Ask mode: the Auto arm is about to start a session that loads
+            // its own engine (flow-core/src/meeting/mod.rs:327), and two
+            // resident Parakeets would blow the PRD memory budget.
+            let tx = app.state::<AppState>().model_cmd_tx.lock_or_recover().clone();
+            if let Some(tx) = tx {
+                let _ = tx.send(ModelCommand::Warmup);
+            }
         }
         MeetingAuto::Off => {}
     }

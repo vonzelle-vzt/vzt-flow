@@ -13,6 +13,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use flow_core::config::Config;
+use flow_core::model_manager::ModelCommand;
 use state::{AppState, LockRecover};
 use tauri::Manager;
 
@@ -125,6 +126,8 @@ pub fn run() {
                 settings::show_settings(&handle);
             }
 
+            let config_preload = config.preload_models_at_launch;
+
             let (coordinator_tx, hotkey_active) =
                 coordinator::spawn(handle.clone(), config, is_recording);
             *app.state::<AppState>().coordinator_tx.lock_or_recover() = Some(coordinator_tx);
@@ -134,6 +137,26 @@ pub fn run() {
                      \"Start/Stop dictation\" item, then grant Input Monitoring permission \
                      and restart the app to enable the hardware hotkey."
                 );
+            }
+
+            // Optional launch-time preload (config: preload_models_at_launch,
+            // default false). Off by default because a resident Parakeet
+            // engine is ~2GB against a ~30-40MB idle baseline. Gated on the
+            // model actually being installed so a fresh install can't fire a
+            // doomed load, and skipped if a meeting session somehow already
+            // owns an engine. The idle-unload timer still applies, so an
+            // unused preload releases the memory after idle_unload_secs.
+            if config_preload
+                && flow_core::models::check_parakeet_model()
+                    .map(|s| s.present)
+                    .unwrap_or(false)
+                && !meeting_ctl::is_active(&handle)
+            {
+                let tx = app.state::<AppState>().model_cmd_tx.lock_or_recover().clone();
+                if let Some(tx) = tx {
+                    eprintln!("[vzt-flow] preloading the speech model at launch (preload_models_at_launch)");
+                    let _ = tx.send(ModelCommand::Warmup);
+                }
             }
 
             // Daemon control socket: started after the coordinator so

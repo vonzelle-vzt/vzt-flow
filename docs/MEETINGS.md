@@ -156,6 +156,14 @@ shipped defaults are **`interview_context_max_chars = 2400`** and
 failed to parse and one recited the resume**. A timeout or rejected response can
 leave a question without a tip; context-recitation output is discarded.
 
+A later integration run, with compilation stopped and the default 2,400-character
+context cap, used a built-in sample and a larger ~760-token prompt. All 8 tips
+parsed with no context echoes, but latency was **p50 3.83s / p95 6.57s**. This
+misses the 3-second p95 target. The benchmark measures raw generation, without
+the live coach's 5-second generation deadline, so that slow outlier may be
+omitted in live coaching. Model load and transcription add time in a live call;
+these numbers do not promise a tip within five seconds of the speaker stopping.
+
 The desktop uses a **single resident LLM**, owned by `cleanup_manager`, for
 dictation cleanup, coaching, and meeting summaries. Dictation cleanup can
 preempt a running summary, while pending coaching keeps only the latest request.
@@ -284,7 +292,18 @@ Ask finance about the revised budget.
   most 12 window passes, followed by one final merge pass (up to 13 model calls).
 - A coverage note reports full or partial coverage and the section count. It
   replaces the old `_(summary of final portion)_` label. Failed or timed-out
-  partials are marked as unavailable; they do not erase the transcript.
+  partials are marked as unavailable; they do not erase the transcript. Coverage
+  describes which windows were processed, not a guarantee that the model retained
+  every fact. Review decisions, owners, and deadlines against the transcript.
+
+An integration stress test summarized 56,273 characters in 10 window passes plus
+one merge, taking **51.8 seconds for summary generation** with one model manager
+that joined on completion. This is not a measurement of full meeting finalization.
+The highly repetitive synthetic input exposed a quality limit: the final summary
+retained the closing Friday decision but omitted the opening Europe database
+decision. The complete transcript remains the reference for decisions and tasks.
+The shorter two-question live smoke took **3.87 seconds from stop to CLI exit**,
+including notes, summary, and PDF; neither timing predicts a long live meeting.
 
 ## MCP tool
 
@@ -305,3 +324,35 @@ It returns the transcript text (truncated to a head + tail if longer than
 
 Example uses: "summarize my last meeting", "pull the action items from the
 design review", "what did we decide about the deadline?"
+
+## Measured transcript accuracy
+
+On seven frozen synthetic speech fixtures (252 reference words), all eight
+pipeline options reduced word error rate from **21.43% (54 errors)** to
+**17.06% (43 errors)**. The true baseline is commit `08f23f8`; the final
+measurement is pinned at `774d92d`, including live-worker LineBuffer wiring.
+This is an offline replay benchmark, not a measured live-call accuracy rate.
+
+The spelling-tolerant echo filter removed one echoed sentence while keeping
+“yes that works for me.” Hard-cut seam repair reduced the seam case from three
+errors to two (one substitution and one deletion, with no inserted repeats).
+The total improvement removes eleven inserted words. Reference-word alignment
+counts were harmful=0 and helpful=0: that metric counts lost/recovered matches,
+so it does not itself count removed insertions. Names and numbers remain
+challenging; those fixtures did not improve.
+
+The pipeline uses minimum voiced duration, quiet-audio normalization, low-information
+filtering, token and character-based echo matching with a one-second overlap
+tolerance, and overlap repair at hard chunk cuts. The other isolated switches
+showed no WER gain on this small corpus. Exact suffix/prefix dedup alone could
+not repair a boundary heard as “the” in one chunk and “that” in the next;
+seam repair holds the hard-cut line until its successor can resolve the boundary.
+The reproducible fixtures and per-change harness live in
+`scripts/make-accuracy-corpus.sh` and `crates/flow-core/examples/meeting_replay.rs`.
+
+Failure handling preserves already-written transcript lines and the notes
+sidecar. A transcript write error or audio-source disconnect ends the session
+as Failed; a PDF export error leaves a completed Markdown transcript available.
+Stopping cancels coaching and joins it before summary generation. Edits made
+during finalization remain marked for an export update rather than being
+claimed as already included in the PDF.

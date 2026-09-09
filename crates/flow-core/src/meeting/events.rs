@@ -49,14 +49,32 @@ pub struct TranscriptLine {
 /// Coarse lifecycle of a meeting session, mirroring `OverlayEvent`
 /// (`apps/desktop/src-tauri/src/overlay.rs:95-120`) in shape: a `kind` tag so
 /// the frontend can switch on it directly.
-#[derive(Debug, Clone, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[derive(Debug, Clone)]
 pub enum SessionState {
     Recording,
     Stopping,
     Finalizing { step: String },
     Completed,
     Failed(String),
+}
+
+// Internally tagged serde enums cannot serialize a string newtype variant.
+// Keep the public Failed(String) API while emitting the same object contract.
+impl Serialize for SessionState {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let (kind, detail) = match self {
+            Self::Recording => ("recording", None),
+            Self::Stopping => ("stopping", None),
+            Self::Finalizing { step } => ("finalizing", Some(("step", step))),
+            Self::Completed => ("completed", None),
+            Self::Failed(error) => ("failed", Some(("error", error))),
+        };
+        let mut state = serializer.serialize_struct("SessionState", if detail.is_some() { 2 } else { 1 })?;
+        state.serialize_field("kind", kind)?;
+        if let Some((key, value)) = detail { state.serialize_field(key, value)?; }
+        state.end()
+    }
 }
 
 /// Emitted once, synchronously, when a session is reserved and its files are
@@ -187,4 +205,10 @@ mod tests {
             serde_json::json!({"kind": "finalizing", "step": "summarizing 3/9"})
         );
     }
+    #[test]
+    fn failed_state_serializes_instead_of_silently_losing_the_event() {
+        assert_eq!(serde_json::to_value(SessionState::Failed("disk full".into())).unwrap(),
+            serde_json::json!({"kind":"failed", "error":"disk full"}));
+    }
+
 }

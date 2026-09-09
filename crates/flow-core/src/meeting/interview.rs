@@ -26,14 +26,10 @@
 //!    `cleanup_manager::Mailbox::file`/`requeue`). That is the actual
 //!    cancellation of work that has been handed to the model but not yet
 //!    started, or that was preempted mid-flight.
-//! 3. **The epoch check on the way out.** [`crate::llm::GenRequest`] carries
-//!    no cancel flag — the manager owns the `AtomicBool` it hands to
-//!    `generate_raw` and only trips it on *its* deadline — so a generation
-//!    that is already running to completion cannot be interrupted from here.
-//!    The coach instead stamps every question with an epoch and drops any
-//!    result whose epoch is behind the latest observed question (or behind a
-//!    [`Coach::clear`]). The tip is computed and thrown away; nothing stale
-//!    ever reaches `on_tip`.
+//! 3. **Cancellation and the epoch check.** Each in-flight question carries
+//!    a cancellation flag. A new question, clear, or shutdown cancels it;
+//!    the manager joins generation before answering. An epoch check also
+//!    rejects a result that raced cancellation, so no stale tip is emitted.
 //!
 //! # Prompt ordering
 //!
@@ -348,6 +344,7 @@ struct PendingQuestion {
 
 /// The 1-slot mailbox plus the bounded history rings, all under one lock.
 struct Mailbox {
+    active_cancel: Option<Arc<AtomicBool>>,
     pending: Option<PendingQuestion>,
     /// Bumped by every accepted question and by [`Coach::clear`]. A result
     /// whose epoch is behind this is stale — see the module docs.
@@ -408,6 +405,7 @@ impl Coach {
         let live = Arc::new(AtomicUsize::new(0));
         let shared = Arc::new(Shared {
             mailbox: Mutex::new(Mailbox {
+                active_cancel: None,
                 pending: None,
                 epoch: 0,
                 last_seq: 0,
@@ -486,6 +484,7 @@ impl Coach {
             return;
         }
 
+        if let Some(cancel) = mb.active_cancel.take() { cancel.store(true, Ordering::Relaxed); }
         mb.epoch += 1;
         mb.last_seq = line.seq;
         let epoch = mb.epoch;
@@ -505,7 +504,8 @@ impl Coach {
     pub fn clear(&self) {
         let seq = {
             let mut mb = self.shared.lock();
-            mb.epoch += 1;
+            if let Some(cancel) = mb.active_cancel.take() { cancel.store(true, Ordering::Relaxed); }
+        mb.epoch += 1;
             mb.pending = None;
             mb.last_seq
         };
@@ -533,6 +533,7 @@ impl Coach {
         {
             let mut mb = self.shared.lock();
             mb.stop = true;
+            if let Some(cancel) = mb.active_cancel.take() { cancel.store(true, Ordering::Relaxed); }
             mb.pending = None;
         }
         self.shared.wake.notify_all();
@@ -618,18 +619,23 @@ fn run_worker(
             continue;
         }
 
+        let cancel = Arc::new(AtomicBool::new(false));
+        {
+            let mut mb = shared.lock();
+            if mb.stop || mb.epoch != pending.epoch { continue; }
+            mb.active_cancel = Some(Arc::clone(&cancel));
+        }
         let user = build_coach_user_turn(&pending.recent, &pending.line.text);
         let generated = gen.generate(GenRequest {
             system: system.clone(),
             user,
             max_new_tokens: cfg.max_new_tokens,
             timeout_ms: cfg.timeout_ms,
+            cancel: Some(cancel),
             priority: Priority::Coaching,
         });
 
-        // The only cancellation available for a generation that actually ran
-        // to completion: throw the answer away. A newer question (or a
-        // `clear`) has already moved the epoch on.
+        // A result racing cancellation must still pass the epoch check.
         if !is_current(&shared, pending.epoch) {
             continue;
         }
@@ -683,7 +689,8 @@ fn run_worker(
 
 /// Whether `epoch` is still the latest question the coach has seen.
 fn is_current(shared: &Arc<Shared>, epoch: u64) -> bool {
-    shared.lock().epoch == epoch
+    let mb = shared.lock();
+    !mb.stop && mb.epoch == epoch
 }
 
 #[cfg(test)]

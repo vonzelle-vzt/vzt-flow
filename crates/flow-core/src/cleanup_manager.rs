@@ -366,6 +366,7 @@ fn await_generation(
     gen_rx: &mpsc::Receiver<anyhow::Result<String>>,
     handle: std::thread::JoinHandle<()>,
     cancel: &AtomicBool,
+    external_cancel: Option<&AtomicBool>,
     deadline: Instant,
     in_flight: Priority,
     preemptible: bool,
@@ -375,7 +376,7 @@ fn await_generation(
 ) -> Outcome {
     let outcome = loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
+        if remaining.is_zero() || external_cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
             // Deadline hit: ask the worker to stop, give it a short grace
             // period to notice and send its (now-irrelevant) result, which we
             // discard — then join below.
@@ -543,6 +544,7 @@ fn spawn_with_loader(
                             &gen_rx,
                             handle,
                             &cancel,
+                            None,
                             Instant::now() + Duration::from_millis(timeout_ms),
                             Priority::Interactive,
                             // A dictation is never preempted: the user is
@@ -591,6 +593,10 @@ fn spawn_with_loader(
                         let _ = reply.send(CleanupResult { text: final_text, used_llm });
                     }
                     Pick::Job(Job::Gen(pending)) => {
+                        if pending.req.cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
+                            pending.answer_empty();
+                            continue;
+                        }
                         last_used = Instant::now();
                         ensure_loaded(&mut provider, &mut load_failed_once, &mut load, &status_tx);
                         let Some(p) = provider.clone() else {
@@ -614,6 +620,7 @@ fn spawn_with_loader(
                             &gen_rx,
                             handle,
                             &cancel,
+                            req.cancel.as_deref(),
                             // The deadline starts now, not when the request
                             // was made: time spent queued or preempted does
                             // not count against it.
@@ -823,6 +830,7 @@ mod tests {
                     max_new_tokens: 90,
                     timeout_ms,
                     priority,
+                    cancel: None,
                 },
                 reply,
             });
@@ -1057,4 +1065,19 @@ mod tests {
         let cfg = Config::default();
         assert_eq!(cfg.cleanup_timeout_max_ms, 20_000);
     }
+    #[test]
+    fn session_cancellation_joins_an_active_generation() {
+        let h = Harness::new(FakeProvider::new("COACH", 1, Duration::from_secs(30)));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (reply, rx) = mpsc::channel();
+        h.send(CleanupCommand::Generate { req: GenRequest {
+            system: "sys".into(), user: "COACH question".into(), max_new_tokens: 90,
+            timeout_ms: 30_000, priority: Priority::Coaching, cancel: Some(cancel.clone()),
+        }, reply });
+        h.wait_until_live(1);
+        cancel.store(true, Ordering::Relaxed);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap().unwrap(), "");
+        assert_eq!(h.live.load(Ordering::SeqCst), 0, "reply must follow join");
+    }
+
 }

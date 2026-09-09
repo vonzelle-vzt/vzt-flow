@@ -195,6 +195,11 @@ mod llama_impl {
     use llama_cpp_2::sampling::LlamaSampler;
     use std::num::NonZeroU32;
 
+    // Bound each native decode and allow cancellation between prefill batches.
+    // Preserve the previous native logical batch size for short prompts.
+    // The backend still uses its smaller physical micro-batches internally.
+    const PROMPT_BATCH_TOKENS: usize = 2048;
+
     pub struct LlamaCleanupProvider {
         model: LlamaModel,
         backend: LlamaBackend,
@@ -248,7 +253,9 @@ mod llama_impl {
                 .apply_chat_template(&self.chat_template, &messages, true)
                 .context("failed to apply chat template")?;
 
-            let ctx_params = LlamaContextParams::default().with_n_ctx(NonZeroU32::new(CONTEXT_SIZE));
+            let ctx_params = LlamaContextParams::default()
+                .with_n_ctx(NonZeroU32::new(CONTEXT_SIZE))
+                .with_n_batch(PROMPT_BATCH_TOKENS as u32);
             let mut llama_ctx = self
                 .model
                 .new_context(&self.backend, ctx_params)
@@ -289,15 +296,26 @@ mod llama_impl {
                 Some(n) => explicit_new_tokens(n, prompt_tokens),
             };
 
-            let mut batch = LlamaBatch::new(tokens.len().max(512), 1);
+            let mut batch = LlamaBatch::new(PROMPT_BATCH_TOKENS, 1);
             let last_index = tokens.len() - 1;
-            for (i, token) in tokens.iter().enumerate() {
-                batch.add(*token, i as i32, &[0], i == last_index)?;
+            // Allocating a larger LlamaBatch does not enlarge the context's
+            // n_batch. Sending the whole merge prompt could abort in native
+            // code before Rust could return an error. Decode bounded slices,
+            // preserving absolute positions and requesting only final logits.
+            for (chunk_index, chunk) in tokens.chunks(PROMPT_BATCH_TOKENS).enumerate() {
+                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Ok(String::new());
+                }
+                batch.clear();
+                for (i, token) in chunk.iter().enumerate() {
+                    let position = chunk_index * PROMPT_BATCH_TOKENS + i;
+                    batch.add(*token, position as i32, &[0], position == last_index)?;
+                }
+                llama_ctx.decode(&mut batch).context("prompt prefill decode failed")?;
             }
-            llama_ctx.decode(&mut batch).context("initial prompt decode failed")?;
 
             let mut sampler = LlamaSampler::chain_simple([LlamaSampler::dist(1234), LlamaSampler::greedy()]);
-            let mut n_cur = batch.n_tokens();
+            let mut n_cur = tokens.len() as i32;
             let mut decoder = encoding_rs::UTF_8.new_decoder();
             let mut output = String::new();
 
@@ -599,6 +617,10 @@ pub fn build_summary_prompt() -> String {
      Base everything strictly on the transcript — do NOT invent participants, \
      decisions, or tasks that weren't said. Do NOT invent owners, dates or \
      deadlines. If an action item has no stated owner, give it no owner. \
+     Them and Me are speaker labels, not named owners. Omit transcript item \
+     numbers. Prioritize explicit decisions, dates and commitments, even when \
+     mentioned only once; merge repeated discussion topics into one bullet. \
+     Do not turn general discussion into assigned tasks. \
      Output only the two sections."
         .to_string()
 }
@@ -766,6 +788,18 @@ mod tests {
             let cancel = AtomicBool::new(false);
             let out = provider.clean("   \n\t  ", Mode::Polish, &ctx, &cancel).unwrap();
             assert_eq!(out, "");
+        }
+
+        #[test]
+        #[ignore = "loads the real model and prefills a multi-batch prompt"]
+        fn generate_raw_prefills_a_prompt_larger_than_the_native_batch() {
+            let Some(provider) = load_or_skip() else { return };
+            let user = format!("{}\nThe final codeword is cobalt. Return only that codeword.",
+                "This is background material that is not the answer. ".repeat(256));
+            assert!(user.split_whitespace().count() > 2048);
+            let out = provider.generate_raw("Return the final codeword from the end of the input. No explanation.",
+                &user, 12, &AtomicBool::new(false)).unwrap();
+            assert!(out.to_lowercase().contains("cobalt"), "tail of the prompt must survive prefill: {out:?}");
         }
 
         /// The free-form path against the real model. Everything else that

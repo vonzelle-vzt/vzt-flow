@@ -246,6 +246,13 @@ silently denied.** Loading the HTML and JavaScript is not proof the window can
 call commands. Include the label (for example, `notes`) in the capability's
 `windows` list and verify an actual invoke from that window.
 
+**(n) A `LlamaBatch` allocation does not enlarge a context's `n_batch`.**
+A long prompt sent in one decode can trigger a native `GGML_ASSERT` and abort
+the entire app. Keep prompt prefill within the configured batch limit, preserve
+absolute token positions across batches, and check cancellation between them.
+Test the multi-window summary's final merge with the real model; short prompts
+and mock-generator tests do not exercise this failure.
+
 ## Verification norms
 
 - **Test with real TTS audio**, not silence/noise: `say -o /tmp/clip.aiff
