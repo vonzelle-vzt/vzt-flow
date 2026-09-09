@@ -141,12 +141,84 @@ pub struct Config {
     /// it; only `apps/desktop`'s `.setup()` does.
     #[serde(default)]
     pub onboarded: bool,
+    /// Open the floating notes window when a meeting starts.
+    #[serde(default = "default_meeting_notepad")]
+    pub meeting_notepad: bool,
+    /// Write a PDF summary on stop.
+    #[serde(default = "default_meeting_pdf")]
+    pub meeting_pdf: bool,
+    /// Empty = `dirs::desktop_dir()`.
+    #[serde(default = "default_meeting_pdf_dir")]
+    pub meeting_pdf_dir: String,
+    /// Start new meetings with interview coaching on.
+    #[serde(default = "default_meeting_interview")]
+    pub meeting_interview: bool,
+    /// Hard deadline for one coaching tip.
+    #[serde(default = "default_interview_tip_timeout_ms")]
+    pub interview_tip_timeout_ms: u64,
+    /// Them-chunk silence hold while interview mode is on (default path stays 1.2).
+    #[serde(default = "default_interview_silence_hold_secs")]
+    pub interview_silence_hold_secs: f64,
+    /// Chars of `interview.md` fed to the coach.
+    #[serde(default = "default_interview_context_max_chars")]
+    pub interview_context_max_chars: usize,
+    /// Hierarchical summary window.
+    #[serde(default = "default_meeting_summary_window_chars")]
+    pub meeting_summary_window_chars: usize,
+    /// Deadline per partial pass.
+    #[serde(default = "default_meeting_summary_partial_timeout_ms")]
+    pub meeting_summary_partial_timeout_ms: u64,
 }
 
 /// Default for [`Config::rolling_transcription`] — a free fn so serde's
 /// `#[serde(default)]` populates it for configs written before the field.
 fn default_true() -> bool {
     true
+}
+
+/// Default for [`Config::meeting_notepad`].
+fn default_meeting_notepad() -> bool {
+    true
+}
+
+/// Default for [`Config::meeting_pdf`].
+fn default_meeting_pdf() -> bool {
+    true
+}
+
+/// Default for [`Config::meeting_pdf_dir`].
+fn default_meeting_pdf_dir() -> String {
+    String::new()
+}
+
+/// Default for [`Config::meeting_interview`].
+fn default_meeting_interview() -> bool {
+    false
+}
+
+/// Default for [`Config::interview_tip_timeout_ms`].
+fn default_interview_tip_timeout_ms() -> u64 {
+    3500
+}
+
+/// Default for [`Config::interview_silence_hold_secs`].
+fn default_interview_silence_hold_secs() -> f64 {
+    0.8
+}
+
+/// Default for [`Config::interview_context_max_chars`].
+fn default_interview_context_max_chars() -> usize {
+    4800
+}
+
+/// Default for [`Config::meeting_summary_window_chars`].
+fn default_meeting_summary_window_chars() -> usize {
+    6000
+}
+
+/// Default for [`Config::meeting_summary_partial_timeout_ms`].
+fn default_meeting_summary_partial_timeout_ms() -> u64 {
+    25000
 }
 
 impl Default for Config {
@@ -167,6 +239,15 @@ impl Default for Config {
             meeting_auto: default_meeting_auto(),
             rolling_transcription: true,
             onboarded: false,
+            meeting_notepad: true,
+            meeting_pdf: true,
+            meeting_pdf_dir: String::new(),
+            meeting_interview: false,
+            interview_tip_timeout_ms: 3500,
+            interview_silence_hold_secs: 0.8,
+            interview_context_max_chars: 4800,
+            meeting_summary_window_chars: 6000,
+            meeting_summary_partial_timeout_ms: 25000,
         }
     }
 }
@@ -175,6 +256,15 @@ impl Config {
     /// Typed view of [`Config::meeting_auto`].
     pub fn meeting_auto_mode(&self) -> MeetingAuto {
         MeetingAuto::parse(&self.meeting_auto)
+    }
+
+    /// Configured PDF directory, or `dirs::desktop_dir()` when empty.
+    pub fn meeting_pdf_dir_resolved(&self) -> Option<PathBuf> {
+        if self.meeting_pdf_dir.is_empty() {
+            dirs::desktop_dir()
+        } else {
+            Some(PathBuf::from(&self.meeting_pdf_dir))
+        }
     }
 }
 
@@ -312,5 +402,73 @@ mod tests {
         assert_eq!(MeetingAuto::parse("ask"), MeetingAuto::Ask);
         // Unrecognized values default to Ask, never silently disabling detection.
         assert_eq!(MeetingAuto::parse("banana"), MeetingAuto::Ask);
+    }
+
+    /// A `config.toml` written before the meeting companion fields existed
+    /// must still load with the new fields defaulting to their proper values
+    /// (the additive-field contract).
+    #[test]
+    fn old_config_without_the_meeting_companion_fields_loads_with_defaults() {
+        let old = r#"
+            hotkey_keycode = 61
+            hotkey_label = "Right Option"
+            hold_threshold_ms = 300
+            idle_unload_secs = 300
+            max_hold_secs = 600
+            max_handsfree_secs = 600
+            launch_at_login = false
+            cleanup_timeout_ms = 2500
+            cleanup_timeout_per_char_ms = 6
+            cleanup_timeout_max_ms = 20000
+            handsfree_silence_secs = 2.5
+            cleanup_enabled = true
+            meeting_auto = "ask"
+            rolling_transcription = true
+        "#;
+        let cfg: Config = toml::from_str(old).expect("old config must still parse");
+        assert_eq!(cfg.meeting_notepad, true);
+        assert_eq!(cfg.meeting_pdf, true);
+        assert_eq!(cfg.meeting_pdf_dir, "");
+        assert_eq!(cfg.meeting_interview, false);
+        assert_eq!(cfg.interview_tip_timeout_ms, 3500);
+        assert_eq!(cfg.interview_silence_hold_secs, 0.8);
+        assert_eq!(cfg.interview_context_max_chars, 4800);
+        assert_eq!(cfg.meeting_summary_window_chars, 6000);
+        assert_eq!(cfg.meeting_summary_partial_timeout_ms, 25000);
+    }
+
+    #[test]
+    fn meeting_companion_fields_round_trip() {
+        let mut cfg = Config::default();
+        cfg.meeting_notepad = false;
+        cfg.meeting_pdf = false;
+        cfg.meeting_pdf_dir = "/custom/path".to_string();
+        cfg.meeting_interview = true;
+        cfg.interview_tip_timeout_ms = 5000;
+        cfg.interview_silence_hold_secs = 1.5;
+        cfg.interview_context_max_chars = 8000;
+        cfg.meeting_summary_window_chars = 8000;
+        cfg.meeting_summary_partial_timeout_ms = 30000;
+
+        let raw = toml::to_string_pretty(&cfg).unwrap();
+        let back: Config = toml::from_str(&raw).unwrap();
+
+        assert_eq!(back.meeting_notepad, false);
+        assert_eq!(back.meeting_pdf, false);
+        assert_eq!(back.meeting_pdf_dir, "/custom/path");
+        assert_eq!(back.meeting_interview, true);
+        assert_eq!(back.interview_tip_timeout_ms, 5000);
+        assert_eq!(back.interview_silence_hold_secs, 1.5);
+        assert_eq!(back.interview_context_max_chars, 8000);
+        assert_eq!(back.meeting_summary_window_chars, 8000);
+        assert_eq!(back.meeting_summary_partial_timeout_ms, 30000);
+    }
+
+    #[test]
+    fn empty_pdf_dir_resolves_to_the_desktop() {
+        let cfg = Config::default();
+        assert_eq!(cfg.meeting_pdf_dir, "");
+        let resolved = cfg.meeting_pdf_dir_resolved();
+        assert_eq!(resolved, dirs::desktop_dir());
     }
 }
