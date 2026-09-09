@@ -172,6 +172,18 @@ fn max_new_tokens_for(input_char_len: usize, prompt_tokens: u32, context_size: u
         .min((context_size - prompt_tokens) as i32)
 }
 
+/// Clamps an explicitly-requested token budget to both the ceiling and the
+/// remaining context space. Unlike [`max_new_tokens_for`], this does NOT
+/// floor at [`MIN_NEW_TOKENS`] — a caller that requests 90 tokens (e.g. a
+/// coaching tip) means 90, not 300. Factored out of `generate` so it's
+/// unit-testable on every platform.
+fn explicit_new_tokens(requested: i32, prompt_tokens: u32) -> i32 {
+    requested
+        .min(MAX_NEW_TOKENS_CEILING)
+        .min((CONTEXT_SIZE - prompt_tokens) as i32)
+        .max(1)
+}
+
 #[cfg(target_os = "macos")]
 mod llama_impl {
     use super::*;
@@ -269,12 +281,12 @@ mod llama_impl {
             // still clamped to the remaining context room so it can never
             // overrun what's actually left after the prompt. An explicit
             // budget from the caller skips the sizing (and the floor) but
-            // gets the same context clamp — `prompt_fits_context` above
+            // still applies the ceiling — `prompt_fits_context` above
             // guarantees the subtraction leaves at least MIN_NEW_TOKENS, so
             // the `.max(1)` is belt-and-braces rather than load-bearing.
             let max_new_tokens = match max_new_tokens {
                 None => max_new_tokens_for(input_char_len, prompt_tokens, CONTEXT_SIZE),
-                Some(n) => n.min((CONTEXT_SIZE - prompt_tokens) as i32).max(1),
+                Some(n) => explicit_new_tokens(n, prompt_tokens),
             };
 
             let mut batch = LlamaBatch::new(tokens.len().max(512), 1);
@@ -1158,5 +1170,20 @@ mod tests {
     fn prompt_fits_context_never_panics_on_pathological_input() {
         assert!(!prompt_fits_context(u32::MAX, CONTEXT_SIZE));
         assert!(!prompt_fits_context(CONTEXT_SIZE, 0));
+    }
+
+    #[test]
+    fn explicit_budget_is_clamped_by_the_ceiling() {
+        // A request of 100_000 tokens should be clamped to MAX_NEW_TOKENS_CEILING,
+        // not silently allowed because the context has theoretical room for it.
+        assert_eq!(explicit_new_tokens(100_000, 500), MAX_NEW_TOKENS_CEILING);
+        // With a nearly-full context (8000 of 8192 tokens used), the remainder
+        // should be the limiting factor instead (8192 - 8000 = 192 < 3000).
+        let remainder = (CONTEXT_SIZE - 8000) as i32;
+        assert_eq!(explicit_new_tokens(100_000, 8000), remainder);
+        assert!(explicit_new_tokens(100_000, 8000) < MAX_NEW_TOKENS_CEILING);
+        // A modest explicit budget within the ceiling should pass through unchanged,
+        // clamped only to the context remainder.
+        assert_eq!(explicit_new_tokens(90, 500), 90);
     }
 }
