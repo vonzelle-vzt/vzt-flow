@@ -198,7 +198,7 @@ fn default_meeting_interview() -> bool {
 
 /// Default for [`Config::interview_tip_timeout_ms`].
 fn default_interview_tip_timeout_ms() -> u64 {
-    3500
+    5000
 }
 
 /// Default for [`Config::interview_silence_hold_secs`].
@@ -208,7 +208,7 @@ fn default_interview_silence_hold_secs() -> f64 {
 
 /// Default for [`Config::interview_context_max_chars`].
 fn default_interview_context_max_chars() -> usize {
-    4800
+    2400
 }
 
 /// Default for [`Config::meeting_summary_window_chars`].
@@ -243,9 +243,9 @@ impl Default for Config {
             meeting_pdf: true,
             meeting_pdf_dir: String::new(),
             meeting_interview: false,
-            interview_tip_timeout_ms: 3500,
+            interview_tip_timeout_ms: 5000,
             interview_silence_hold_secs: 0.8,
-            interview_context_max_chars: 4800,
+            interview_context_max_chars: 2400,
             meeting_summary_window_chars: 6000,
             meeting_summary_partial_timeout_ms: 25000,
         }
@@ -430,9 +430,9 @@ mod tests {
         assert_eq!(cfg.meeting_pdf, true);
         assert_eq!(cfg.meeting_pdf_dir, "");
         assert_eq!(cfg.meeting_interview, false);
-        assert_eq!(cfg.interview_tip_timeout_ms, 3500);
+        assert_eq!(cfg.interview_tip_timeout_ms, 5000);
         assert_eq!(cfg.interview_silence_hold_secs, 0.8);
-        assert_eq!(cfg.interview_context_max_chars, 4800);
+        assert_eq!(cfg.interview_context_max_chars, 2400);
         assert_eq!(cfg.meeting_summary_window_chars, 6000);
         assert_eq!(cfg.meeting_summary_partial_timeout_ms, 25000);
     }
