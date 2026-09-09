@@ -20,6 +20,7 @@
 use flow_core::config::MeetingAuto;
 use flow_core::meeting;
 use flow_core::meeting::detect::{self, Debouncer, DetectEvent, MeetingApp};
+use flow_core::model_manager::ModelCommand;
 use tauri::{AppHandle, Manager};
 use tauri_plugin_notification::NotificationExt;
 
@@ -265,6 +266,16 @@ fn on_detected_start(app: &AppHandle, mode: MeetingAuto, which: MeetingApp) {
                 &format!("{} call detected", which.label()),
                 "Start transcribing? Click the VZT Flow menu-bar icon › Start meeting transcription.",
             );
+            // A call is up but we are not transcribing it — dictation during
+            // a call is common, so warm the speech model now rather than
+            // making the first dictation of the call pay the load. Only in
+            // Ask mode: the Auto arm is about to start a session that loads
+            // its own engine (flow-core/src/meeting/mod.rs:327), and two
+            // resident Parakeets would blow the PRD memory budget.
+            let tx = app.state::<AppState>().model_cmd_tx.lock_or_recover().clone();
+            if let Some(tx) = tx {
+                let _ = tx.send(ModelCommand::Warmup);
+            }
         }
         MeetingAuto::Off => {}
     }
