@@ -71,10 +71,23 @@ extended (a concurrent workstream may be mid-merge)
 - **Cleanup (warm)**: ~0.3s for a short sentence; deadline formula
   (2500ms base + 6ms/char, capped 20000ms) guarantees a bounded worst case
   regardless of input length.
-- **First dictation of a session**: a few extra seconds for lazy Parakeet
-  model load; cleanup LLM pre-warms in parallel with speech (model load + a
-  throwaway generation to force Metal kernel JIT), so it's typically already
-  warm by the time cleanup actually runs.
+- **First dictation of a session**: measured on v0.3.5 (M5 MacBook Air,
+  before this fix), Parakeet load takes **4.79s** (median of 3 in-process
+  runs, range 4.11–6.48s) and the same cost shows up end-to-end over the
+  daemon socket on a 4.2s clip as **4.22s cold vs. 0.28s warm** (a ~3.9s
+  penalty). The speech model now starts loading the moment you press the
+  key, in parallel with your speech, the same way the cleanup model already
+  did (model load + a throwaway generation to force Metal kernel JIT) — a
+  hold longer than the load is fully covered, a hold shorter than it still
+  pays whatever's left uncovered at release. An opt-in
+  `preload_models_at_launch` config loads the speech model at app launch
+  instead (~2GB RSS while loaded) for a warm first press of the session, and
+  it also fires when a Zoom/Meet/Teams call is detected in Ask mode.
+  A throwaway warm-up *inference* (as opposed to just the model load) was
+  evaluated and **not** added: the first-inference cost is shape-dependent —
+  warming on a 4.2s clip left a 14.5s clip's first inference 42%/360ms
+  slower in RTF than warming on its own length — so a fixed warm-up clip
+  would not reliably pay for real dictations of varying length.
 
 ### Memory budget, including the quadratic-ASR lesson
 

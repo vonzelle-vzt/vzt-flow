@@ -579,6 +579,7 @@ Persisted at `~/.config/vzt-flow/config.toml`. Every field, with its default
 | `hotkey_label` | `"Right Option"` | Human-readable label shown in Settings |
 | `hold_threshold_ms` | `300` | Minimum hold duration (ms) before a press counts as "hold" rather than a tap that toggles hands-free |
 | `idle_unload_secs` | `300` | Seconds of transcriber/cleanup-model inactivity before it's unloaded from memory |
+| `preload_models_at_launch` | `false` | Load the speech model at app launch instead of waiting for the first recording, so the first dictation of a session is as fast as every later one. Costs ~2GB RSS while loaded (vs. a ~30-40MB idle baseline); still idle-unloads on `idle_unload_secs` if never used. **Applies at launch only — changing it requires an app restart.** |
 | `max_hold_secs` | `600` | Hard cap (seconds) on a single hold-to-talk recording (10min, for long-form dictation) |
 | `max_handsfree_secs` | `600` | Hard cap (seconds) on a single hands-free recording |
 | `launch_at_login` | `false` | Mirrors `tauri-plugin-autostart` state |

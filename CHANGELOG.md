@@ -6,6 +6,37 @@ versioning](https://semver.org/). Numbers quoted below were measured on this
 repo's dev hardware (M5 MacBook Air) unless noted — see `README.md` /
 `docs/PRD.md` for the full methodology.
 
+## [Unreleased]
+
+**The speech model now starts loading the moment you press the hotkey**,
+instead of waiting until you release it. On v0.3.5 (this repo's M5, before
+this change) Parakeet load measured **4.79s** (median of 3 in-process runs,
+range 4.11–6.48s), and that cost showed up end-to-end over the daemon socket
+on a 4.2s clip as **4.22s cold vs. 0.28s warm** — a ~3.9s penalty landing
+entirely after you finished speaking, because the load only began once
+`start_recording` returned. It now fires a fire-and-forget, idempotent
+`ModelCommand::Warmup` at the *end* of `start_recording`, the same way the
+cleanup LLM has pre-warmed since it shipped, so the load overlaps your
+speech instead of following it. A hold shorter than the load still pays
+whatever's left uncovered when you release the key — this doesn't eliminate
+the cost, it moves as much of it as possible off the critical path.
+
+Two more pieces ship alongside it. An opt-in `preload_models_at_launch`
+config (default `false`, applies at launch only, requires an app restart)
+loads the speech model when the app starts rather than on first use, so the
+very first dictation of a session is as fast as every later one — it costs
+roughly 2GB RSS while loaded and still idle-unloads on `idle_unload_secs` if
+you never dictate. And in Ask mode, detecting a Zoom/Meet/Teams call now
+triggers the same preload, so the model is typically warm before you start
+transcribing the meeting.
+
+A throwaway warm-up *inference* (beyond just the model load) was evaluated
+and **not** added: measurement showed the first-inference cost is
+shape-dependent, not a one-time JIT you can pay off with any clip — warming
+on a 4.2s clip left a 14.5s clip's first inference 42%/360ms slower in RTF
+than warming on its own length, so a fixed warm-up clip would not reliably
+pay for real dictations of varying length.
+
 ## [0.3.5] — 2026-08-02
 
 **Dictation sometimes pasted your dictionary instead of what you said.** You
