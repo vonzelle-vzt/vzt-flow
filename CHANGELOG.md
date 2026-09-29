@@ -22,8 +22,9 @@ so a 69-second dictation needed 163 seconds after release against a
 disappeared.
 
 - **A finished take is never thrown away.** Waiting is now bounded by
-  *progress* (it restarts every time a chunk finishes) rather than by the
-  recording's length. If transcription genuinely stalls, the part that
+  *progress* (it restarts every time a chunk finishes, and time spent loading
+  the speech model doesn't count — on a busy Mac a cold load was measured at
+  2 to 9 minutes) rather than by the recording's length. If transcription genuinely stalls, the part that
   finished is pasted ("Partial transcript — audio saved", or "Transcription
   slow — audio saved" if nothing had finished yet) and the rest is put on your
   clipboard, with a notification, if it completes later.

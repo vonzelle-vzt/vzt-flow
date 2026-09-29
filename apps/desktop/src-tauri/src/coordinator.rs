@@ -326,10 +326,17 @@ pub fn spawn(
         model_cmd_rx,
         model_status_tx,
     );
+    // Mirrors "the transcriber is loading" for the rolling workers' watchdog
+    // (a cold load is not a wedge — see `RollingConfig::model_loading`). Set
+    // here, on the forwarder, so it is current even while the coordinator
+    // loop is busy.
+    let model_loading = Arc::new(AtomicBool::new(false));
     {
         let tx = unified_tx.clone();
+        let loading = model_loading.clone();
         std::thread::spawn(move || {
             while let Ok(status) = model_status_rx.recv() {
+                loading.store(matches!(status, ModelStatusEvent::Loading), Ordering::Relaxed);
                 if tx.send(CoordinatorMsg::Model(status)).is_err() {
                     break;
                 }
@@ -430,6 +437,7 @@ pub fn spawn(
                     &unified_rx,
                     audio_cmd_tx.clone(),
                     model_cmd_tx.clone(),
+                    model_loading.clone(),
                 );
             }));
             match outcome {
@@ -664,6 +672,7 @@ fn run_coordinator(
     rx: &mpsc::Receiver<CoordinatorMsg>,
     audio_cmd_tx: Sender<AudioCommand>,
     model_cmd_tx: Sender<ModelCommand>,
+    model_loading: Arc<AtomicBool>,
 ) {
     let hold = HoldTracker {
         key_down: Arc::new(AtomicBool::new(false)),
@@ -852,8 +861,15 @@ fn run_coordinator(
                                 let _ = coord_tx.send(CoordinatorMsg::RollingWorkerLost { epoch });
                             }
                         });
-                        rolling_in =
-                            Some(rolling::spawn_rolling_worker(model_cmd_tx.clone(), out_tx));
+                        let cfg = rolling::RollingConfig {
+                            model_loading: Some(model_loading.clone()),
+                            ..rolling::RollingConfig::from_env()
+                        };
+                        rolling_in = Some(rolling::spawn_rolling_worker_with(
+                            cfg,
+                            model_cmd_tx.clone(),
+                            out_tx,
+                        ));
                     }
                 }
             }

@@ -20,7 +20,9 @@
 //!     [`crate::chunking::assemble`].
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -336,6 +338,14 @@ pub struct RollingConfig {
     /// After a partial Final, how long to keep waiting for the stragglers so
     /// they can be delivered as [`RollingOutput::Late`].
     pub late_wait_max: Duration,
+    /// Set while the model manager is loading the transcriber (the caller
+    /// mirrors `ModelStatusEvent::Loading`/`Loaded` into it). Time spent
+    /// loading is not a wedge, so it never counts against the no-progress
+    /// window — measured on the dev Mac under parallel builds, a cold load
+    /// took 123s, 372s and 544s, each far past any fixed allowance.
+    pub model_loading: Option<Arc<AtomicBool>>,
+    /// Ceiling on how long a load may hold the watchdog off in total.
+    pub max_load_wait: Duration,
     pub fault: FaultInjection,
 }
 
@@ -346,6 +356,8 @@ impl Default for RollingConfig {
             no_progress_per_audio_sec: 6.0,
             load_allowance: Duration::from_secs(60),
             late_wait_max: Duration::from_secs(600),
+            model_loading: None,
+            max_load_wait: Duration::from_secs(900),
             fault: FaultInjection::default(),
         }
     }
@@ -718,14 +730,31 @@ impl Worker {
 
         let mut last_progress = Instant::now();
         let mut timed_out = false;
+        // While the model manager reports a load in flight, the no-progress
+        // clock is held (polled every 250ms), up to `max_load_wait` in total.
+        let loading_flag = self.cfg.model_loading.clone();
+        let mut load_waited = Duration::ZERO;
         while self.outstanding() > 0 {
             let window = self.window();
             let deadline = last_progress + window;
-            match res_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            let mut wait = deadline.saturating_duration_since(Instant::now());
+            if loading_flag.is_some() {
+                wait = wait.min(Duration::from_millis(250));
+            }
+            let waited_from = Instant::now();
+            match res_rx.recv_timeout(wait) {
                 Ok(r) => {
                     self.on_result(r);
                     last_progress = Instant::now();
                 }
+                Err(_) if loading_flag.as_ref().is_some_and(|f| f.load(Ordering::Relaxed))
+                    && load_waited < self.cfg.max_load_wait =>
+                {
+                    // The engine is still loading: not a wedge.
+                    load_waited += waited_from.elapsed();
+                    last_progress = Instant::now();
+                }
+                Err(_) if Instant::now() < deadline => {} // a poll tick, not the deadline
                 Err(_) => {
                     eprintln!(
                         "[vzt-flow] rolling: no chunk answered for {:.0}s after release; delivering \
@@ -1006,8 +1035,47 @@ mod tests {
             no_progress_per_audio_sec: 0.0,
             load_allowance: Duration::ZERO,
             late_wait_max: Duration::from_secs(10),
+            model_loading: None,
+            max_load_wait: Duration::from_secs(10),
             fault: FaultInjection::default(),
         }
+    }
+
+    #[test]
+    fn a_model_load_in_progress_is_not_mistaken_for_a_wedge() {
+        // The engine answers only after a 1.8s "cold load" — three times the
+        // 600ms no-progress window. While the loading flag is up the worker
+        // must keep waiting and deliver the whole take, not a partial.
+        let loading = Arc::new(AtomicBool::new(true));
+        let l2 = loading.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(1500));
+            l2.store(false, Ordering::Relaxed);
+        });
+        let (engine, _) = fake_engine(|_, _| Answer::After(Duration::from_millis(1800), "all of it"));
+        let mut cfg = quick_cfg();
+        cfg.model_loading = Some(loading);
+        let (out_tx, out) = mpsc::channel();
+        let rin = spawn_rolling_worker_with(cfg, engine, out_tx);
+        rin.send(RollingInput::Samples(speech(10.0, 9))).unwrap();
+        rin.send(RollingInput::Finish).unwrap();
+        let f = wait_final(&out, Duration::from_secs(10));
+        assert!(!f.partial, "a loading model was treated as wedged");
+        assert_eq!(f.raw_text, "all of it");
+    }
+
+    #[test]
+    fn a_load_that_never_finishes_is_still_bounded() {
+        let (engine, _) = fake_engine(|_, _| Answer::Never);
+        let mut cfg = quick_cfg();
+        cfg.model_loading = Some(Arc::new(AtomicBool::new(true)));
+        cfg.max_load_wait = Duration::from_millis(1500);
+        let (out_tx, out) = mpsc::channel();
+        let rin = spawn_rolling_worker_with(cfg, engine, out_tx);
+        rin.send(RollingInput::Samples(speech(10.0, 9))).unwrap();
+        rin.send(RollingInput::Finish).unwrap();
+        let f = wait_final(&out, Duration::from_secs(10));
+        assert!(f.partial, "a load that never ends must still release the take");
     }
 
     /// Push `audio`, then keep trickling a little silence until the worker has
