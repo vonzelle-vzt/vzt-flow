@@ -67,6 +67,26 @@ pub fn run() -> Result<()> {
         Err(e) => println!("Cleanup model: error checking status ({e})"),
     }
 
+    // Where the desktop app's diagnostics go (one outcome line per dictation,
+    // every failure path included) — the first thing to read when a
+    // dictation went missing.
+    match flow_core::logfile::log_file_path() {
+        Some(path) => match std::fs::metadata(&path) {
+            Ok(m) => println!("Desktop app log: {} ({} KB)", path.display(), m.len() / 1024),
+            Err(_) => println!("Desktop app log: {} (not created yet — starts with the next app launch)", path.display()),
+        },
+        None => println!("Desktop app log: none on this platform"),
+    }
+    if let Ok(path) = flow_core::recovery::last_recording_path() {
+        if let Ok(m) = std::fs::metadata(&path) {
+            println!(
+                "Recovery recording: {} ({:.1} MB) — tray > \"Recover last recording\" transcribes it",
+                path.display(),
+                m.len() as f64 / 1_048_576.0
+            );
+        }
+    }
+
     // The configurable `hotkey_keycode` is a macOS CGEvent keycode driving the
     // CGEventTap monitor; on Windows/Linux the hotkey is the fixed
     // Ctrl+Shift+Space global shortcut registered by the desktop app

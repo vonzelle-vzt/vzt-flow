@@ -40,8 +40,55 @@ fn install_panic_hook() {
     }));
 }
 
+/// Points this process's stderr at the persistent log file
+/// (`flow_core::logfile::log_file_path`, `~/Library/Logs/VZT Flow/vzt-flow.log`
+/// on macOS), rotating it at launch past 5 MB.
+///
+/// Every diagnostic here is an `eprintln!`, and an app launched from Finder,
+/// the Dock or at login has stderr on `/dev/null` — so until now a normally
+/// launched VZT Flow recorded nothing about a dictation that failed. With fd 2
+/// redirected, every existing `eprintln!`, the panic hook and llama.cpp's own
+/// output land in the file with no call-site changes. Set
+/// `VZT_FLOW_LOG_STDERR=1` to keep stderr where the launcher put it.
+#[cfg(unix)]
+fn redirect_stderr_to_log() -> Option<std::path::PathBuf> {
+    use std::os::fd::AsRawFd;
+    if !flow_core::logfile::should_redirect(std::env::var_os(flow_core::logfile::LOG_STDERR_ENV).as_deref()) {
+        return None;
+    }
+    let path = flow_core::logfile::log_file_path()?;
+    match flow_core::logfile::open_for_append(&path) {
+        Ok(file) => {
+            // fd 2 now refers to the file; dropping `file` closes only the
+            // original descriptor.
+            if unsafe { libc::dup2(file.as_raw_fd(), libc::STDERR_FILENO) } == -1 {
+                eprintln!("[vzt-flow] could not redirect stderr to {}: {}", path.display(), std::io::Error::last_os_error());
+                return None;
+            }
+            Some(path)
+        }
+        Err(e) => {
+            eprintln!("[vzt-flow] could not open log file {}: {e}", path.display());
+            None
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn redirect_stderr_to_log() -> Option<std::path::PathBuf> {
+    None
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let log_path = redirect_stderr_to_log();
+    eprintln!(
+        "[vzt-flow] ==== VZT Flow {} starting (pid {}) at {} — log: {} ====",
+        env!("CARGO_PKG_VERSION"),
+        std::process::id(),
+        flow_core::logfile::timestamp(),
+        log_path.as_deref().map(|p| p.display().to_string()).unwrap_or_else(|| "stderr".to_string())
+    );
     install_panic_hook();
 
     #[allow(unused_mut)]

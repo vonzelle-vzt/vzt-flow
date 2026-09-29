@@ -109,6 +109,7 @@ pub fn run(file: &Path, speed: f64, skip_batch: bool) -> Result<()> {
             Ok(RollingOutput::Final { raw_text, .. }) => {
                 break (raw_text, release_instant.elapsed().as_secs_f64());
             }
+            Ok(RollingOutput::Late { .. }) => {}
             Err(_) => {
                 anyhow::bail!("rolling worker exited without producing a final transcript");
             }

@@ -5769,6 +5769,7 @@ dependencies = [
  "arboard",
  "core-foundation",
  "flow-core",
+ "libc",
  "objc2",
  "objc2-app-kit",
  "serde",

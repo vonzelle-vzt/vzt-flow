@@ -22,11 +22,12 @@
 use std::collections::VecDeque;
 use std::sync::mpsc::{self, Sender};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::chunking::{self, ChunkPlan, CutKind, OVERLAP_SECS, SAMPLE_RATE, SINGLE_PASS_MAX_SECS};
 use crate::engine::Transcript;
 use crate::model_manager::ModelCommand;
+use crate::recovery::AudioStats;
 
 /// Streaming linear resampler that reproduces [`crate::audio::resample_linear`]
 /// exactly, but incrementally: input is pushed a mic-callback chunk at a time,
@@ -271,13 +272,107 @@ pub enum RollingOutput {
     /// A chunk finished transcribing during recording. `chunk_text` is its raw
     /// (no-dictionary, no-LLM) text, for the live preview pill.
     Preview { chunk_text: String },
-    /// Every chunk plus the tail is transcribed and stitched. `raw_text` is the
-    /// assembled raw transcript; the caller runs the normal pipeline
-    /// (dictionary → cleanup → paste) on it.
+    /// Every chunk plus the tail is transcribed and stitched — or the
+    /// post-release watchdog gave up waiting and this is what finished
+    /// (`partial`). `raw_text` is the assembled raw transcript; the caller runs
+    /// the normal pipeline (dictionary → cleanup → paste) on it.
     Final {
         raw_text: String,
         audio_duration: Duration,
+        /// Chunks the recording was cut into (tail included).
+        chunks: usize,
+        /// Chunks whose words are missing from `raw_text`: errored twice, came
+        /// back empty despite speech-level audio (after a re-split), or were
+        /// still outstanding when the watchdog fired.
+        failed_chunks: usize,
+        /// The watchdog fired before every chunk finished. If the stragglers
+        /// complete later the full transcript follows as [`RollingOutput::Late`].
+        partial: bool,
+        /// Signal statistics over the whole recording.
+        stats: AudioStats,
+        /// Every sample of the recording (16 kHz mono), so the caller can save
+        /// it for recovery when the transcript is incomplete.
+        audio: Vec<f32>,
     },
+    /// Sent only after a `partial` Final: the chunks the watchdog abandoned
+    /// finished after all, and this is the complete transcript. Never pasted
+    /// (the user has moved on) — the caller puts it on the clipboard.
+    Late { raw_text: String, failed_chunks: usize },
+}
+
+/// Test-only fault injection for the rolling worker, read from the
+/// environment by [`RollingConfig::from_env`]. All `None` in production.
+#[derive(Debug, Clone, Default)]
+pub struct FaultInjection {
+    /// `VZT_FLOW_TEST_FAIL_CHUNK=<n>`: every transcription attempt of chunk
+    /// `n` (1-based, in cut order; the tail is the last chunk) fails.
+    pub fail_chunk: Option<usize>,
+    /// `VZT_FLOW_TEST_STALL_CHUNK=<n>`: chunk `n`'s first result is withheld
+    /// for `stall` (`VZT_FLOW_TEST_STALL_SECS`, default 30) — a wedged engine.
+    pub stall_chunk: Option<usize>,
+    pub stall: Duration,
+}
+
+/// Post-release watchdog tuning for [`spawn_rolling_worker_with`].
+#[derive(Debug, Clone)]
+pub struct RollingConfig {
+    /// After release, give up waiting once this long passes with no chunk
+    /// result arriving. Progress-based, not scaled to the recording: every
+    /// result restarts it, so a long backlog that is still moving is never
+    /// cut off, while a wedged engine is detected in bounded time.
+    pub no_progress: Duration,
+    /// The window also stretches to this many seconds per second of audio in
+    /// the longest outstanding chunk, so one legitimately slow chunk is not
+    /// mistaken for a wedge. Measured on the dev M5 while parallel builds held
+    /// the load average at 20–60: 33s chunks took 77.7s (RTF 2.34) and up to
+    /// 180s (RTF 5.2) — a flat 60s window would have abandoned a healthy
+    /// engine. 6.0 gives a 35s chunk 210s. Beyond that the take is delivered
+    /// as `partial` and the rest follows as `Late`, so a misjudged wedge
+    /// costs a second step, never words.
+    pub no_progress_per_audio_sec: f32,
+    /// Added once, while no chunk of this recording has completed yet — the
+    /// first chunk may be paying a (lazy, idle-unloaded) model load.
+    pub load_allowance: Duration,
+    /// After a partial Final, how long to keep waiting for the stragglers so
+    /// they can be delivered as [`RollingOutput::Late`].
+    pub late_wait_max: Duration,
+    pub fault: FaultInjection,
+}
+
+impl Default for RollingConfig {
+    fn default() -> Self {
+        Self {
+            no_progress: Duration::from_secs(60),
+            no_progress_per_audio_sec: 6.0,
+            load_allowance: Duration::from_secs(60),
+            late_wait_max: Duration::from_secs(600),
+            fault: FaultInjection::default(),
+        }
+    }
+}
+
+impl RollingConfig {
+    /// Production defaults plus the test-only `VZT_FLOW_TEST_*` knobs:
+    /// `VZT_FLOW_TEST_WATCHDOG_SECS=<s>` sets `no_progress` and drops the load
+    /// allowance; see [`FaultInjection`] for the others.
+    pub fn from_env() -> Self {
+        fn num(name: &str) -> Option<u64> {
+            std::env::var(name).ok().and_then(|v| v.trim().parse().ok())
+        }
+        let mut cfg = Self::default();
+        if let Some(s) = num("VZT_FLOW_TEST_WATCHDOG_SECS") {
+            cfg.no_progress = Duration::from_secs(s);
+            cfg.no_progress_per_audio_sec = 0.0;
+            cfg.load_allowance = Duration::ZERO;
+        }
+        cfg.fault.fail_chunk = num("VZT_FLOW_TEST_FAIL_CHUNK").map(|n| n as usize);
+        cfg.fault.stall_chunk = num("VZT_FLOW_TEST_STALL_CHUNK").map(|n| n as usize);
+        cfg.fault.stall = Duration::from_secs(num("VZT_FLOW_TEST_STALL_SECS").unwrap_or(30));
+        if cfg.fault.fail_chunk.is_some() || cfg.fault.stall_chunk.is_some() || num("VZT_FLOW_TEST_WATCHDOG_SECS").is_some() {
+            eprintln!("[vzt-flow] TEST fault injection active for rolling transcription: {cfg:?}");
+        }
+        cfg
+    }
 }
 
 /// Spawns the background thread that owns a [`RollingSession`], dispatches
@@ -293,121 +388,401 @@ pub fn spawn_rolling_worker(
     model_cmd_tx: Sender<ModelCommand>,
     output_tx: Sender<RollingOutput>,
 ) -> Sender<RollingInput> {
+    spawn_rolling_worker_with(RollingConfig::from_env(), model_cmd_tx, output_tx)
+}
+
+/// [`spawn_rolling_worker`] with explicit watchdog/fault configuration.
+pub fn spawn_rolling_worker_with(
+    cfg: RollingConfig,
+    model_cmd_tx: Sender<ModelCommand>,
+    output_tx: Sender<RollingOutput>,
+) -> Sender<RollingInput> {
     let (in_tx, in_rx) = mpsc::channel::<RollingInput>();
 
-    thread::spawn(move || {
-        let mut session = RollingSession::new();
-        let mut plans: Vec<ChunkPlan> = Vec::new();
-        let mut results: Vec<Option<Transcript>> = Vec::new();
-        // Completed chunk transcriptions, tagged with their plan index so they
-        // can be reassembled in order regardless of completion order.
-        let (res_tx, res_rx) = mpsc::channel::<(usize, Result<Transcript, String>)>();
-
-        let dispatch = |idx: usize, samples: Vec<f32>| {
-            let (rtx, rrx) = mpsc::channel();
-            if model_cmd_tx
-                .send(ModelCommand::TranscribeChunk { samples, reply: rtx })
-                .is_ok()
-            {
-                let res_tx = res_tx.clone();
-                thread::spawn(move || {
-                    let r = rrx
-                        .recv()
-                        .unwrap_or_else(|_| Err("chunk transcriber dropped".to_string()));
-                    let _ = res_tx.send((idx, r));
-                });
-            } else {
-                // Model manager gone: record an empty result so assembly never
-                // waits on a chunk that will never complete.
-                let _ = res_tx.send((idx, Err("transcriber unavailable".to_string())));
-            }
-        };
-
-        loop {
-            match in_rx.recv() {
-                Ok(RollingInput::Samples(s)) => {
-                    session.push(&s);
-                    while let Some((plan, chunk)) = session.try_cut() {
-                        let idx = plans.len();
-                        plans.push(plan);
-                        results.push(None);
-                        dispatch(idx, chunk);
-                    }
-                    // Non-blockingly collect any completed chunks and preview
-                    // the most recent one.
-                    while let Ok((idx, r)) = res_rx.try_recv() {
-                        if store_result(&mut results, idx, r) {
-                            if let Some(t) = &results[idx] {
-                                let _ = output_tx.send(RollingOutput::Preview {
-                                    chunk_text: t.text.trim().to_string(),
-                                });
+    thread::Builder::new()
+        .name("vzt-flow-rolling".into())
+        .spawn(move || {
+            let (res_tx, res_rx) = mpsc::channel::<ChunkResult>();
+            let mut w = Worker::new(cfg, model_cmd_tx, res_tx);
+            loop {
+                match in_rx.recv() {
+                    Ok(RollingInput::Samples(s)) => {
+                        w.push(&s);
+                        // Non-blockingly collect any completed chunks and
+                        // preview them.
+                        while let Ok(r) = res_rx.try_recv() {
+                            if let Some(text) = w.on_result(r) {
+                                let _ = output_tx.send(RollingOutput::Preview { chunk_text: text });
                             }
                         }
                     }
-                }
-                Ok(RollingInput::Finish) => {
-                    let (tail_plan, tail) = session.finish();
-                    let idx = plans.len();
-                    plans.push(tail_plan);
-                    results.push(None);
-                    dispatch(idx, tail);
-
-                    // Block until every dispatched chunk (incl. the tail) has a
-                    // result. No previews now — we're about to emit Final (the
-                    // tail itself is intentionally never previewed, which is why
-                    // preview lives only in the Samples arm above).
-                    while results.iter().any(|r| r.is_none()) {
-                        match res_rx.recv() {
-                            Ok((i, r)) => {
-                                store_result(&mut results, i, r);
-                            }
-                            Err(_) => break, // all forwarders gone; stop waiting
+                    Ok(RollingInput::Finish) => {
+                        // A panic while finishing must still hand the audio
+                        // back: without it the take is gone for good.
+                        let finished = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            w.finish(&res_rx, &output_tx)
+                        }));
+                        if finished.is_err() {
+                            eprintln!(
+                                "[vzt-flow] rolling worker panicked while finishing; returning the \
+                                 audio with no transcript so it can be recovered"
+                            );
+                            let audio = std::mem::take(&mut w.audio);
+                            let _ = output_tx.send(RollingOutput::Final {
+                                raw_text: String::new(),
+                                audio_duration: Duration::from_secs_f64(audio.len() as f64 / SAMPLE_RATE as f64),
+                                chunks: w.plans.len(),
+                                failed_chunks: w.plans.len(),
+                                partial: true,
+                                stats: AudioStats::from_samples(&audio, SAMPLE_RATE),
+                                audio,
+                            });
                         }
+                        break;
                     }
-
-                    let transcripts: Vec<Transcript> = results
-                        .into_iter()
-                        .map(|o| o.unwrap_or_else(|| Transcript { text: String::new(), segments: None }))
-                        .collect();
-                    let assembled = chunking::assemble(&plans, &transcripts, SAMPLE_RATE);
-                    let audio_duration =
-                        Duration::from_secs_f64(session.total_pushed() as f64 / SAMPLE_RATE as f64);
-                    let _ = output_tx.send(RollingOutput::Final {
-                        raw_text: assembled.text,
-                        audio_duration,
-                    });
-                    break;
+                    Err(_) => break, // input dropped: recording abandoned (cancel).
                 }
-                Err(_) => break, // input dropped: recording abandoned (cancel).
             }
-        }
-    });
+        })
+        .expect("failed to spawn rolling worker thread");
 
     in_tx
 }
 
-/// Stores a chunk result, turning an error into empty text (a single failed
-/// chunk degrades to a gap rather than failing the whole dictation). Returns
-/// whether the stored text is non-empty (worth previewing).
-fn store_result(
-    results: &mut [Option<Transcript>],
-    idx: usize,
-    r: Result<Transcript, String>,
-) -> bool {
-    let t = match r {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("[vzt-flow] rolling chunk {idx} failed: {e}");
-            Transcript { text: String::new(), segments: None }
-        }
-    };
-    let non_empty = !t.text.trim().is_empty();
-    if let Some(slot) = results.get_mut(idx) {
-        *slot = Some(t);
-    }
-    non_empty
+/// Shortest chunk worth re-splitting when it comes back empty.
+const RESPLIT_MIN_SECS: f32 = 8.0;
+
+/// A release tail shorter than this (0.25s) is not transcribed.
+const MIN_TAIL_SAMPLES: usize = SAMPLE_RATE as usize / 4;
+
+/// Which part of a chunk a transcription result is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Part {
+    Whole,
+    FirstHalf,
+    SecondHalf,
 }
 
+/// `(chunk index, part, result)` from a dispatch forwarder.
+type ChunkResult = (usize, Part, Result<Transcript, String>);
+
+/// One chunk's progress through transcription.
+enum Slot {
+    /// The whole chunk is in flight; `attempt` is 0, or 1 for the retry.
+    Whole { attempt: u8 },
+    /// The whole chunk came back empty despite speech-level audio, so it is
+    /// being transcribed as two halves split at `split`. Each half is `None`
+    /// while in flight, `Some(Ok(text))` / `Some(Err(()))` once answered.
+    Halves { split: usize, first: Option<Result<String, ()>>, second: Option<Result<String, ()>> },
+    /// Finished. `failed` means words from this chunk are missing.
+    Done { text: String, failed: bool },
+}
+
+struct Worker {
+    cfg: RollingConfig,
+    model_cmd_tx: Sender<ModelCommand>,
+    res_tx: Sender<ChunkResult>,
+    session: RollingSession,
+    /// Every sample pushed, kept for retries, re-splits and recovery (≤38MB
+    /// at the 600s cap).
+    audio: Vec<f32>,
+    plans: Vec<ChunkPlan>,
+    slots: Vec<Slot>,
+    /// Any result (success or error) has arrived, i.e. the model is loaded.
+    any_answer: bool,
+}
+
+impl Worker {
+    fn new(cfg: RollingConfig, model_cmd_tx: Sender<ModelCommand>, res_tx: Sender<ChunkResult>) -> Self {
+        Self {
+            cfg,
+            model_cmd_tx,
+            res_tx,
+            session: RollingSession::new(),
+            audio: Vec::new(),
+            plans: Vec::new(),
+            slots: Vec::new(),
+            any_answer: false,
+        }
+    }
+
+    fn push(&mut self, samples: &[f32]) {
+        self.audio.extend_from_slice(samples);
+        self.session.push(samples);
+        while let Some((plan, _chunk)) = self.session.try_cut() {
+            self.add_chunk(plan);
+        }
+    }
+
+    fn add_chunk(&mut self, plan: ChunkPlan) {
+        let idx = self.plans.len();
+        self.plans.push(plan);
+        self.slots.push(Slot::Whole { attempt: 0 });
+        self.dispatch(idx, Part::Whole, 0);
+    }
+
+    /// The samples of chunk `idx`, or of one of its halves.
+    fn span(&self, idx: usize, part: Part) -> &[f32] {
+        let p = self.plans[idx];
+        let chunk = &self.audio[p.start..p.start + p.len];
+        match (part, &self.slots[idx]) {
+            (Part::FirstHalf, Slot::Halves { split, .. }) => &chunk[..*split],
+            (Part::SecondHalf, Slot::Halves { split, .. }) => &chunk[*split..],
+            _ => chunk,
+        }
+    }
+
+    fn dispatch(&self, idx: usize, part: Part, attempt: u8) {
+        let chunk_no = idx + 1;
+        if self.cfg.fault.fail_chunk == Some(chunk_no) {
+            let _ = self.res_tx.send((
+                idx,
+                part,
+                Err("injected failure (VZT_FLOW_TEST_FAIL_CHUNK)".to_string()),
+            ));
+            return;
+        }
+        let stall = (self.cfg.fault.stall_chunk == Some(chunk_no) && part == Part::Whole && attempt == 0)
+            .then_some(self.cfg.fault.stall);
+        let samples = self.span(idx, part).to_vec();
+        let (rtx, rrx) = mpsc::channel();
+        if self
+            .model_cmd_tx
+            .send(ModelCommand::TranscribeChunk { samples, reply: rtx })
+            .is_ok()
+        {
+            let res_tx = self.res_tx.clone();
+            thread::spawn(move || {
+                let r = rrx
+                    .recv()
+                    .unwrap_or_else(|_| Err("chunk transcriber dropped".to_string()));
+                if let Some(d) = stall {
+                    eprintln!("[vzt-flow] TEST: withholding chunk {chunk_no}'s result for {d:?}");
+                    thread::sleep(d);
+                }
+                let _ = res_tx.send((idx, part, r));
+            });
+        } else {
+            // Model manager gone: answer immediately so nothing waits on a
+            // chunk that will never complete.
+            let _ = self.res_tx.send((idx, part, Err("transcriber unavailable".to_string())));
+        }
+    }
+
+    /// Applies one chunk result. Returns the chunk's text when it just
+    /// finished with words (for the live preview).
+    fn on_result(&mut self, (idx, part, r): ChunkResult) -> Option<String> {
+        self.any_answer = true;
+        let chunk_no = idx + 1;
+        match (part, self.slots.get(idx)?) {
+            (Part::Whole, Slot::Whole { attempt }) => {
+                let attempt = *attempt;
+                match r {
+                    Ok(t) if !t.text.trim().is_empty() => {
+                        let text = t.text.trim().to_string();
+                        self.slots[idx] = Slot::Done { text: text.clone(), failed: false };
+                        Some(text)
+                    }
+                    Ok(_) => {
+                        let chunk = self.span(idx, Part::Whole);
+                        let long_enough = chunk.len() as f32 >= RESPLIT_MIN_SECS * SAMPLE_RATE as f32;
+                        if long_enough && AudioStats::from_samples(chunk, SAMPLE_RATE).has_speech() {
+                            let split = chunking::quietest_split(chunk, SAMPLE_RATE);
+                            eprintln!(
+                                "[vzt-flow] rolling chunk {chunk_no} ({:.1}s) came back empty despite \
+                                 speech-level audio; re-transcribing it as two halves split at {:.1}s",
+                                chunk.len() as f32 / SAMPLE_RATE as f32,
+                                split as f32 / SAMPLE_RATE as f32
+                            );
+                            self.slots[idx] = Slot::Halves { split, first: None, second: None };
+                            self.dispatch(idx, Part::FirstHalf, 0);
+                            self.dispatch(idx, Part::SecondHalf, 0);
+                        } else {
+                            self.slots[idx] = Slot::Done { text: String::new(), failed: false };
+                        }
+                        None
+                    }
+                    Err(e) if attempt == 0 => {
+                        eprintln!("[vzt-flow] rolling chunk {chunk_no} failed ({e}); retrying once");
+                        self.slots[idx] = Slot::Whole { attempt: 1 };
+                        self.dispatch(idx, Part::Whole, 1);
+                        None
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[vzt-flow] rolling chunk {chunk_no} failed again ({e}); its audio is \
+                             missing from the transcript"
+                        );
+                        self.slots[idx] = Slot::Done { text: String::new(), failed: true };
+                        None
+                    }
+                }
+            }
+            (Part::FirstHalf | Part::SecondHalf, Slot::Halves { .. }) => {
+                let answer = match r {
+                    Ok(t) => Ok(t.text.trim().to_string()),
+                    Err(e) => {
+                        eprintln!("[vzt-flow] rolling chunk {chunk_no} half failed ({e})");
+                        Err(())
+                    }
+                };
+                let Slot::Halves { first, second, .. } = &mut self.slots[idx] else { unreachable!() };
+                if part == Part::FirstHalf {
+                    *first = Some(answer);
+                } else {
+                    *second = Some(answer);
+                }
+                let (Some(a), Some(b)) = (first.clone(), second.clone()) else { return None };
+                let text = [a.clone().unwrap_or_default(), b.clone().unwrap_or_default()]
+                    .into_iter()
+                    .filter(|t| !t.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let failed = a.is_err() || b.is_err() || text.is_empty();
+                if failed {
+                    eprintln!(
+                        "[vzt-flow] rolling chunk {chunk_no} is still incomplete after the re-split; \
+                         its audio is kept for recovery"
+                    );
+                }
+                self.slots[idx] = Slot::Done { text: text.clone(), failed };
+                (!text.is_empty()).then_some(text)
+            }
+            // A duplicate or stale answer (e.g. a withheld result arriving
+            // after the chunk was already settled) — nothing to update.
+            _ => None,
+        }
+    }
+
+    fn outstanding(&self) -> usize {
+        self.slots.iter().filter(|s| !matches!(s, Slot::Done { .. })).count()
+    }
+
+    /// The no-progress window while waiting on the current outstanding set:
+    /// long enough for the slowest one chunk to finish on a loaded machine,
+    /// plus the one-time load allowance until the engine has answered at all.
+    fn window(&self) -> Duration {
+        let longest = self
+            .plans
+            .iter()
+            .zip(&self.slots)
+            .filter(|(_, s)| !matches!(s, Slot::Done { .. }))
+            .map(|(p, _)| p.len as f32 / SAMPLE_RATE as f32)
+            .fold(0.0f32, f32::max);
+        let scaled = Duration::from_secs_f32(longest * self.cfg.no_progress_per_audio_sec);
+        let base = self.cfg.no_progress.max(scaled);
+        if self.any_answer {
+            base
+        } else {
+            base + self.cfg.load_allowance
+        }
+    }
+
+    /// Stitches every settled chunk; unsettled ones count as failed gaps.
+    fn assemble(&self) -> (String, usize) {
+        let mut failed = 0;
+        let transcripts: Vec<Transcript> = self
+            .slots
+            .iter()
+            .map(|s| {
+                let text = match s {
+                    Slot::Done { text, failed: f } => {
+                        failed += *f as usize;
+                        text.clone()
+                    }
+                    _ => {
+                        failed += 1;
+                        String::new()
+                    }
+                };
+                Transcript { text, segments: None }
+            })
+            .collect();
+        (chunking::assemble(&self.plans, &transcripts, SAMPLE_RATE).text, failed)
+    }
+
+    /// Release: transcribe the tail, wait (progress-bounded) for everything
+    /// outstanding, deliver, then — if the watchdog fired — keep waiting for
+    /// the stragglers and deliver them as `Late`.
+    fn finish(&mut self, res_rx: &mpsc::Receiver<ChunkResult>, out: &Sender<RollingOutput>) {
+        let (tail_plan, _tail) = self.session.finish();
+        if tail_plan.len < MIN_TAIL_SAMPLES {
+            // Released right after a cut: a few milliseconds hold no word, and
+            // sending them to the engine only risks an error that would be
+            // reported as a lost chunk.
+            self.plans.push(tail_plan);
+            self.slots.push(Slot::Done { text: String::new(), failed: false });
+        } else {
+            self.add_chunk(tail_plan);
+        }
+
+        let mut last_progress = Instant::now();
+        let mut timed_out = false;
+        while self.outstanding() > 0 {
+            let window = self.window();
+            let deadline = last_progress + window;
+            match res_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(r) => {
+                    self.on_result(r);
+                    last_progress = Instant::now();
+                }
+                Err(_) => {
+                    eprintln!(
+                        "[vzt-flow] rolling: no chunk answered for {:.0}s after release; delivering \
+                         the {} of {} chunks that finished (partial) and keeping the audio",
+                        window.as_secs_f32(),
+                        self.plans.len() - self.outstanding(),
+                        self.plans.len()
+                    );
+                    timed_out = true;
+                    break;
+                }
+            }
+        }
+
+        let (raw_text, failed_chunks) = self.assemble();
+        let audio_duration = Duration::from_secs_f64(self.audio.len() as f64 / SAMPLE_RATE as f64);
+        let stats = AudioStats::from_samples(&self.audio, SAMPLE_RATE);
+        // Keep our copy while stragglers may still need re-splitting.
+        let audio = if timed_out { self.audio.clone() } else { std::mem::take(&mut self.audio) };
+        let _ = out.send(RollingOutput::Final {
+            raw_text,
+            audio_duration,
+            chunks: self.plans.len(),
+            failed_chunks,
+            partial: timed_out,
+            stats,
+            audio,
+        });
+        if !timed_out {
+            return;
+        }
+
+        let give_up = Instant::now() + self.cfg.late_wait_max;
+        while self.outstanding() > 0 {
+            match res_rx.recv_timeout(give_up.saturating_duration_since(Instant::now())) {
+                Ok(r) => {
+                    self.on_result(r);
+                }
+                Err(_) => {
+                    eprintln!(
+                        "[vzt-flow] rolling: {} chunk(s) never finished; the saved recording is the \
+                         only copy of those words",
+                        self.outstanding()
+                    );
+                    return;
+                }
+            }
+        }
+        let (raw_text, failed_chunks) = self.assemble();
+        eprintln!(
+            "[vzt-flow] rolling: the chunks abandoned at the watchdog finished late; delivering the \
+             complete transcript ({} chars)",
+            raw_text.chars().count()
+        );
+        let _ = out.send(RollingOutput::Late { raw_text, failed_chunks });
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -544,5 +919,315 @@ mod tests {
         assert_eq!(c0.len() + tail.len(), samples.len());
         let cut_secs = plan0.len as f32 / SAMPLE_RATE as f32;
         assert!((cut_secs - 30.0).abs() < 0.3, "cut at {cut_secs}s");
+    }
+
+    // ---- worker: never discard a finished take (B2/B3) ----
+    //
+    // These drive the real worker against a scripted stand-in for the model
+    // manager, so every failure mode of a live engine (an error, an empty
+    // result, a wedge, a late answer) is reproducible on demand.
+
+    use std::sync::{Arc, Mutex};
+    use std::time::Instant;
+
+    /// What the fake engine does with one `TranscribeChunk`.
+    enum Answer {
+        Text(&'static str),
+        Fail,
+        /// Hold the reply open and never answer (a wedged inference).
+        Never,
+        /// Answer, but only after this delay.
+        After(Duration, &'static str),
+    }
+
+    /// Speech-level (RMS ≈ 0.07) deterministic noise, distinct per sample
+    /// index so chunks of equal length are still distinguishable.
+    fn speech(n_secs: f32, seed: u32) -> Vec<f32> {
+        let mut x = seed.wrapping_mul(2_654_435_761).wrapping_add(1);
+        (0..secs(n_secs))
+            .map(|_| {
+                x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                0.12 * ((x >> 8) as f32 / (1u32 << 24) as f32 * 2.0 - 1.0)
+            })
+            .collect()
+    }
+
+    /// 40s of speech with a pause at 30s: exactly one silence cut (chunk 1 ≈
+    /// 30s) plus a ~10s tail (chunk 2).
+    fn forty_seconds_one_cut() -> Vec<f32> {
+        let mut s = speech(40.0, 7);
+        for x in &mut s[secs(29.9)..secs(30.1)] {
+            *x = 0.0;
+        }
+        s
+    }
+
+    /// Fake model manager. `script(call_index, samples)` decides each answer;
+    /// every call's sample count is recorded.
+    fn fake_engine(
+        script: impl Fn(usize, &[f32]) -> Answer + Send + 'static,
+    ) -> (Sender<ModelCommand>, Arc<Mutex<Vec<usize>>>) {
+        let (tx, rx) = mpsc::channel::<ModelCommand>();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let calls2 = calls.clone();
+        thread::spawn(move || {
+            let mut parked = Vec::new(); // replies held open for `Never`
+            let mut n = 0usize;
+            while let Ok(cmd) = rx.recv() {
+                let ModelCommand::TranscribeChunk { samples, reply } = cmd else {
+                    panic!("the rolling worker must only send bounded chunks");
+                };
+                calls2.lock().unwrap().push(samples.len());
+                let ok = |t: &str| Ok(Transcript { text: t.to_string(), segments: None });
+                match script(n, &samples) {
+                    Answer::Text(t) => {
+                        let _ = reply.send(ok(t));
+                    }
+                    Answer::Fail => {
+                        let _ = reply.send(Err("engine error".to_string()));
+                    }
+                    Answer::Never => parked.push(reply),
+                    Answer::After(d, t) => {
+                        // Inline, like the real manager: one inference at a
+                        // time, later requests queue behind this one.
+                        thread::sleep(d);
+                        let _ = reply.send(ok(t));
+                    }
+                }
+                n += 1;
+            }
+        });
+        (tx, calls)
+    }
+
+    fn quick_cfg() -> RollingConfig {
+        RollingConfig {
+            no_progress: Duration::from_millis(600),
+            no_progress_per_audio_sec: 0.0,
+            load_allowance: Duration::ZERO,
+            late_wait_max: Duration::from_secs(10),
+            fault: FaultInjection::default(),
+        }
+    }
+
+    /// Push `audio`, then keep trickling a little silence until the worker has
+    /// collected (and previewed) `previews` chunk results, so the test controls
+    /// exactly which chunks finished *before* release.
+    fn record(
+        rin: &Sender<RollingInput>,
+        out: &mpsc::Receiver<RollingOutput>,
+        audio: &[f32],
+        previews: usize,
+    ) {
+        rin.send(RollingInput::Samples(audio.to_vec())).unwrap();
+        let mut seen = 0;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while seen < previews {
+            assert!(Instant::now() < deadline, "chunk previews never arrived");
+            rin.send(RollingInput::Samples(vec![0.0; 16])).unwrap();
+            while let Ok(o) = out.try_recv() {
+                if matches!(o, RollingOutput::Preview { .. }) {
+                    seen += 1;
+                }
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    struct FinalMsg {
+        raw_text: String,
+        chunks: usize,
+        failed_chunks: usize,
+        partial: bool,
+        audio_len: usize,
+    }
+
+    fn wait_final(out: &mpsc::Receiver<RollingOutput>, within: Duration) -> FinalMsg {
+        let deadline = Instant::now() + within;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match out.recv_timeout(left) {
+                Ok(RollingOutput::Final { raw_text, chunks, failed_chunks, partial, audio, .. }) => {
+                    return FinalMsg { raw_text, chunks, failed_chunks, partial, audio_len: audio.len() }
+                }
+                Ok(_) => continue,
+                Err(e) => panic!("no Final within {within:?} ({e}) — the take was stranded"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_failed_chunk_is_retried_once_before_it_becomes_a_gap() {
+        // Chunk 1 (~30s) errors on its first attempt only; the tail is fine.
+        let attempts = Arc::new(Mutex::new(0usize));
+        let a2 = attempts.clone();
+        let (engine, calls) = fake_engine(move |_, s| {
+            if s.len() > secs(20.0) {
+                let mut a = a2.lock().unwrap();
+                *a += 1;
+                if *a == 1 { Answer::Fail } else { Answer::Text("alpha") }
+            } else {
+                Answer::Text("omega")
+            }
+        });
+        let (out_tx, out) = mpsc::channel();
+        let rin = spawn_rolling_worker_with(quick_cfg(), engine, out_tx);
+        rin.send(RollingInput::Samples(forty_seconds_one_cut())).unwrap();
+        rin.send(RollingInput::Finish).unwrap();
+        let f = wait_final(&out, Duration::from_secs(10));
+        assert_eq!(f.raw_text, "alpha omega", "the first chunk's words were dropped");
+        assert_eq!(f.failed_chunks, 0);
+        assert_eq!(calls.lock().unwrap().len(), 3, "one retry, no more");
+    }
+
+    #[test]
+    fn a_chunk_that_fails_twice_is_counted_and_the_rest_still_delivered() {
+        let (engine, _) = fake_engine(|_, s| if s.len() > secs(20.0) { Answer::Fail } else { Answer::Text("omega") });
+        let (out_tx, out) = mpsc::channel();
+        let rin = spawn_rolling_worker_with(quick_cfg(), engine, out_tx);
+        let audio = forty_seconds_one_cut();
+        rin.send(RollingInput::Samples(audio.clone())).unwrap();
+        rin.send(RollingInput::Finish).unwrap();
+        let f = wait_final(&out, Duration::from_secs(10));
+        assert_eq!(f.raw_text, "omega");
+        assert_eq!((f.chunks, f.failed_chunks), (2, 1), "the lost chunk must be reported");
+        assert!(!f.partial);
+        assert_eq!(f.audio_len, audio.len(), "the whole take must come back for recovery");
+    }
+
+    #[test]
+    fn an_empty_result_for_a_long_speech_chunk_is_resplit_and_recovered() {
+        // A 12s single-chunk dictation of speech-level audio for which the
+        // engine returns nothing (the 11–31s empty entries in history), but
+        // which it can transcribe in halves.
+        let (engine, calls) = fake_engine(|_, s| {
+            if s.len() >= secs(11.0) {
+                Answer::Text("")
+            } else if s[0] == speech(12.0, 3)[0] {
+                Answer::Text("first half")
+            } else {
+                Answer::Text("second half")
+            }
+        });
+        let (out_tx, out) = mpsc::channel();
+        let rin = spawn_rolling_worker_with(quick_cfg(), engine, out_tx);
+        rin.send(RollingInput::Samples(speech(12.0, 3))).unwrap();
+        rin.send(RollingInput::Finish).unwrap();
+        let f = wait_final(&out, Duration::from_secs(10));
+        assert_eq!(f.raw_text, "first half second half");
+        assert_eq!(f.failed_chunks, 0);
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 3, "whole + two halves: {calls:?}");
+        assert!(calls[1] >= secs(3.0) && calls[2] >= secs(3.0), "halves must be real halves: {calls:?}");
+        assert_eq!(calls[1] + calls[2], calls[0], "the halves must cover the chunk exactly");
+    }
+
+    #[test]
+    fn an_empty_result_for_silence_is_accepted_without_a_resplit() {
+        let (engine, calls) = fake_engine(|_, _| Answer::Text(""));
+        let (out_tx, out) = mpsc::channel();
+        let rin = spawn_rolling_worker_with(quick_cfg(), engine, out_tx);
+        rin.send(RollingInput::Samples(vec![0.0; secs(12.0)])).unwrap();
+        rin.send(RollingInput::Finish).unwrap();
+        let f = wait_final(&out, Duration::from_secs(10));
+        assert_eq!(f.raw_text, "");
+        assert_eq!(f.failed_chunks, 0, "silence transcribing to nothing is not a failure");
+        assert_eq!(calls.lock().unwrap().len(), 1, "no re-split for a silent chunk");
+    }
+
+    #[test]
+    fn a_wedged_chunk_trips_the_progress_watchdog_and_salvages_the_rest() {
+        // Chunk 1 finishes during recording; the tail never comes back. The
+        // old worker blocked forever here (and the coordinator discarded the
+        // take at `duration + 60s`).
+        let (engine, _) = fake_engine(|_, s| if s.len() > secs(20.0) { Answer::Text("alpha") } else { Answer::Never });
+        let (out_tx, out) = mpsc::channel();
+        let rin = spawn_rolling_worker_with(quick_cfg(), engine, out_tx);
+        let audio = forty_seconds_one_cut();
+        record(&rin, &out, &audio, 1);
+        let released = Instant::now();
+        rin.send(RollingInput::Finish).unwrap();
+        let f = wait_final(&out, Duration::from_secs(5));
+        let waited = released.elapsed();
+        assert!(f.partial, "must be flagged partial");
+        assert_eq!(f.raw_text, "alpha", "the finished chunk must be delivered");
+        assert_eq!(f.failed_chunks, 1);
+        assert!(f.audio_len >= audio.len(), "the whole take must come back for recovery");
+        assert!(waited >= Duration::from_millis(500), "fired early: {waited:?}");
+    }
+
+    #[test]
+    fn a_result_that_lands_after_the_watchdog_is_delivered_late_not_dropped() {
+        let (engine, _) = fake_engine(|_, s| {
+            if s.len() > secs(20.0) { Answer::Text("alpha") } else { Answer::After(Duration::from_millis(1500), "omega") }
+        });
+        let (out_tx, out) = mpsc::channel();
+        let rin = spawn_rolling_worker_with(quick_cfg(), engine, out_tx);
+        record(&rin, &out, &forty_seconds_one_cut(), 1);
+        rin.send(RollingInput::Finish).unwrap();
+        let f = wait_final(&out, Duration::from_secs(5));
+        assert!(f.partial);
+        assert_eq!(f.raw_text, "alpha");
+        match out.recv_timeout(Duration::from_secs(10)) {
+            Ok(RollingOutput::Late { raw_text, failed_chunks }) => {
+                assert_eq!(raw_text, "alpha omega");
+                assert_eq!(failed_chunks, 0);
+            }
+            Ok(_) => panic!("expected Late"),
+            Err(e) => panic!("the late result was dropped ({e})"),
+        }
+    }
+
+    #[test]
+    fn progress_restarts_the_watchdog_so_a_slow_but_moving_backlog_is_not_cut_off() {
+        // Three queued chunks at release, each taking 400ms — longer in total
+        // (1.2s) than the 600ms no-progress window, but never 600ms silent.
+        let (engine, _) = fake_engine(|_, _| Answer::After(Duration::from_millis(400), "x"));
+        let (out_tx, out) = mpsc::channel();
+        let rin = spawn_rolling_worker_with(quick_cfg(), engine, out_tx);
+        rin.send(RollingInput::Samples(speech(80.0, 11))).unwrap();
+        rin.send(RollingInput::Finish).unwrap();
+        let f = wait_final(&out, Duration::from_secs(10));
+        assert!(!f.partial, "a moving backlog must not be treated as a wedge");
+        assert_eq!(f.failed_chunks, 0);
+        assert!(f.chunks >= 3);
+    }
+
+    #[test]
+    fn a_sliver_of_tail_after_a_cut_is_not_reported_as_lost_audio() {
+        // 35.05s of speech with a pause in the last frame of the cut window
+        // (34.9–35.0s): the cut lands at 34.95s, leaving a 0.1s tail. The
+        // engine errors on it. That must not turn into "some audio couldn't be
+        // transcribed".
+        let (engine, calls) = fake_engine(|_, s| if s.len() < secs(1.0) { Answer::Fail } else { Answer::Text("alpha") });
+        let (out_tx, out) = mpsc::channel();
+        let rin = spawn_rolling_worker_with(quick_cfg(), engine, out_tx);
+        let mut audio = speech(35.05, 5);
+        for x in &mut audio[secs(34.9)..secs(35.0)] {
+            *x = 0.0;
+        }
+        rin.send(RollingInput::Samples(audio)).unwrap();
+        let f = wait_final_after_finish(&rin, &out);
+        assert_eq!(f.failed_chunks, 0, "{:?}", calls.lock().unwrap());
+        assert!(f.raw_text.starts_with("alpha"));
+    }
+
+    fn wait_final_after_finish(rin: &Sender<RollingInput>, out: &mpsc::Receiver<RollingOutput>) -> FinalMsg {
+        rin.send(RollingInput::Finish).unwrap();
+        wait_final(out, Duration::from_secs(10))
+    }
+
+    #[test]
+    fn fault_injection_fails_the_named_chunk_every_attempt() {
+        let (engine, calls) = fake_engine(|_, _| Answer::Text("ok"));
+        let mut cfg = quick_cfg();
+        cfg.fault.fail_chunk = Some(1);
+        let (out_tx, out) = mpsc::channel();
+        let rin = spawn_rolling_worker_with(cfg, engine, out_tx);
+        rin.send(RollingInput::Samples(forty_seconds_one_cut())).unwrap();
+        rin.send(RollingInput::Finish).unwrap();
+        let f = wait_final(&out, Duration::from_secs(10));
+        assert_eq!((f.raw_text.as_str(), f.failed_chunks), ("ok", 1));
+        assert_eq!(calls.lock().unwrap().len(), 1, "an injected failure never reaches the engine");
     }
 }

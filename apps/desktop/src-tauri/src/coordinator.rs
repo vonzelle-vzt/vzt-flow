@@ -6,7 +6,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use flow_core::audio::{AudioCommand, AudioReply};
 use flow_core::cleanup::{CleanupContext, Mode};
@@ -15,6 +15,7 @@ use flow_core::config::Config;
 use flow_core::hotkey::HotkeyEvent;
 use flow_core::model_manager::{ModelCommand, ModelStatusEvent};
 use flow_core::profiles::ProfileRule;
+use flow_core::recovery::AudioStats;
 use flow_core::rolling::{self, RollingInput, RollingOutput};
 use flow_core::{codemode, dictionary, history, insert, permissions, snippets};
 use tauri::{AppHandle, Manager};
@@ -42,6 +43,10 @@ pub enum CoordinatorMsg {
         /// `listen` command: the pipeline finishes by replying here instead
         /// of pasting.
         listen_reply: Option<Sender<Result<ListenOutcome, String>>>,
+        /// The recording itself, kept so a failed or empty transcription can
+        /// be saved for recovery instead of vanishing.
+        samples: Vec<f32>,
+        stats: AudioStats,
     },
     /// The cleanup pipeline (LLM or timeout/fallback) finished; carries
     /// everything needed to paste + log history.
@@ -52,15 +57,20 @@ pub enum CoordinatorMsg {
         audio_duration: Duration,
         app_bundle_id: Option<String>,
         listen_reply: Option<Sender<Result<ListenOutcome, String>>>,
+        meta: DictationMeta,
     },
-    /// A message from the current recording's rolling-transcription worker
-    /// (Feature B), tagged with the recording `epoch` so any output from an
-    /// abandoned or older recording is ignored.
+    /// A message from a recording's rolling-transcription worker (Feature B),
+    /// tagged with the recording `epoch`. Previews from an older recording
+    /// are ignored; a `Final`/`Late` never is (see [`route_rolling_final`]).
     Rolling { epoch: u64, output: RollingOutput },
-    /// Watchdog: a rolling finalize for `epoch` has taken too long; force the
-    /// state machine out of Transcribing (the rolling counterpart of the batch
-    /// path's F2 never-hang timeout).
-    RollingTimeout { epoch: u64 },
+    /// The rolling worker for `epoch` exited without ever sending a `Final`
+    /// (it panicked outside its own recovery, or was abandoned). Replaces the
+    /// old `duration + 60s` timer, which discarded healthy-but-slow takes: the
+    /// worker now bounds its own wait by *progress* and always answers, so
+    /// the coordinator only has to notice the worker disappearing.
+    RollingWorkerLost { epoch: u64 },
+    /// Tray "Recover last recording": re-transcribe the saved recording.
+    RecoverLastRecording,
     /// Manual toggle from the tray menu item — behaves like a hotkey tap.
     TrayToggleDictation,
     /// Cycles the overlay through its states for visual verification,
@@ -542,6 +552,95 @@ fn should_start_after_hold(same_press: bool, still_down: bool, consumed: bool) -
     same_press && still_down && !consumed
 }
 
+/// How far into a hold a keyDown of some other key still reads as a shortcut
+/// chord (Option+e = ´ on the default Right Option binding) rather than a
+/// stray key during a long dictation.
+const CHORD_WINDOW: Duration = Duration::from_millis(1500);
+
+/// Whether an `OtherKeyDuringHold` `since_press` into the hold should cancel it
+/// as an accidental chord.
+fn other_key_is_chord(since_press: Option<Duration>) -> bool {
+    since_press.is_some_and(|d| d < CHORD_WINDOW)
+}
+
+/// Where a rolling `Final` goes.
+#[derive(Debug, PartialEq, Eq)]
+enum FinalRoute {
+    /// Normal path: dictionary → cleanup → paste.
+    Pipeline,
+    /// No dictation is waiting for it any more: clipboard + notification.
+    ClipboardOnly,
+    /// Nothing worth keeping.
+    Ignore,
+}
+
+/// Routes a rolling `Final` tagged `msg_epoch`, given the epoch of the
+/// dictation currently waiting for one (if any).
+fn route_rolling_final(pending_epoch: Option<u64>, msg_epoch: u64, has_text: bool) -> FinalRoute {
+    if pending_epoch == Some(msg_epoch) {
+        FinalRoute::Pipeline
+    } else if has_text {
+        // Nobody is waiting for these words any more (a newer recording
+        // started, or the dictation was already resolved). They used to be
+        // dropped without a trace; they are the user's words, so keep them.
+        FinalRoute::ClipboardOnly
+    } else {
+        FinalRoute::Ignore
+    }
+}
+
+/// What the transcription stage learned about a dictation, carried through
+/// cleanup to [`finalize_dictation`] for the overlay message and log line.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) struct DictationMeta {
+    chunks: usize,
+    failed_chunks: usize,
+    partial: bool,
+    stats: AudioStats,
+    audio_saved: bool,
+}
+
+/// Whether a finished dictation's audio should be written to the recovery
+/// slot: anything short of a complete transcript of audible speech. An empty
+/// result only qualifies with real speech energy, so an accidental tap never
+/// overwrites a recording worth recovering (there is one slot).
+fn should_save_recovery(transcript_empty: bool, meta: &DictationMeta) -> bool {
+    meta.partial || meta.failed_chunks > 0 || (transcript_empty && meta.stats.has_speech())
+}
+
+/// For an empty final transcript: the overlay line to show *instead of*
+/// pasting. `None` means "not empty, paste normally".
+fn empty_result_message(final_text: &str, meta: &DictationMeta) -> Option<String> {
+    if !final_text.trim().is_empty() {
+        return None;
+    }
+    Some(if meta.stats.mic_silent() {
+        "Mic was silent — check your input".to_string()
+    } else if meta.audio_saved {
+        "No speech recognized — audio saved".to_string()
+    } else {
+        "No speech recognized".to_string()
+    })
+}
+
+/// The overlay line after a paste: paste problems first (they say where the
+/// text is), then incompleteness, else `None` for the plain Done check.
+fn overlay_message(meta: &DictationMeta, paste_message: Option<String>) -> Option<String> {
+    if paste_message.is_some() {
+        paste_message
+    } else if meta.partial {
+        Some(if meta.audio_saved {
+            "Partial transcript — audio saved".to_string()
+        } else {
+            "Partial transcript".to_string()
+        })
+    } else if meta.failed_chunks > 0 {
+        Some("Some audio couldn't be transcribed".to_string())
+    } else {
+        None
+    }
+}
+
 /// Drains the coordinator channel until it closes.
 ///
 /// `rx` is borrowed, not owned, so the supervisor in [`spawn`] can re-enter
@@ -569,10 +668,18 @@ fn run_coordinator(
     let mut rolling_epoch: u64 = 0;
     let mut rolling_preview = String::new();
     let mut pending_rolling: Option<PendingRollingFinal> = None;
+    // When the current hold began (for the stray-key chord window, B5), and
+    // whether a stray key during it was already logged.
+    let mut press_at: Option<Instant> = None;
+    let mut stray_logged = false;
+    // Why the in-flight cancel was requested, for its outcome log line.
+    let mut cancel_reason: Option<&'static str> = None;
     while let Ok(msg) = rx.recv() {
         let state = app.state::<AppState>();
         match msg {
             CoordinatorMsg::Hotkey(HotkeyEvent::HoldKeyPressed) => {
+                press_at = Some(Instant::now());
+                stray_logged = false;
                 hold.key_down.store(true, Ordering::Relaxed);
                 let gen = hold.generation.fetch_add(1, Ordering::Relaxed) + 1;
                 // Fresh press: nothing resolved yet, and no accidental-press
@@ -650,7 +757,12 @@ fn run_coordinator(
                 // typing, not push-to-talking. Only act while a hold is
                 // genuinely in flight; a late/stale event after release must
                 // not disturb a subsequent press.
-                if hold.key_down.load(Ordering::Relaxed) {
+                //
+                // B5: only inside the chord window. Past it the user is
+                // plainly dictating, and a brushed key used to throw away
+                // the whole take (minutes of speech) without a word.
+                let since_press = press_at.map(|t| t.elapsed());
+                if hold.key_down.load(Ordering::Relaxed) && other_key_is_chord(since_press) {
                     hold.other_key.store(true, Ordering::Relaxed);
                     // Mark consumed so the delayed hold-check won't start a
                     // recording and the release won't arm hands-free.
@@ -660,8 +772,17 @@ fn run_coordinator(
                         // threshold before the special char was typed):
                         // discard it — the user is typing, not dictating.
                         state.hands_free_active.store(false, Ordering::Relaxed);
+                        cancel_reason = Some("chord");
                         let _ = audio_cmd_tx.send(AudioCommand::Cancel);
                     }
+                } else if hold.key_down.load(Ordering::Relaxed) && !stray_logged {
+                    stray_logged = true;
+                    eprintln!(
+                        "[vzt-flow] a key was pressed {:.1}s into the hold — past the {:.1}s \
+                         chord window, so the dictation continues",
+                        since_press.unwrap_or_default().as_secs_f64(),
+                        CHORD_WINDOW.as_secs_f64()
+                    );
                 }
             }
             CoordinatorMsg::Hotkey(HotkeyEvent::CancelRequested) => {
@@ -670,6 +791,7 @@ fn run_coordinator(
                     // press consumed so its release doesn't arm hands-free (F4).
                     hold.consumed.store(true, Ordering::Relaxed);
                     state.hands_free_active.store(false, Ordering::Relaxed);
+                    cancel_reason = Some("escape-or-flow-cancel");
                     let _ = audio_cmd_tx.send(AudioCommand::Cancel);
                 }
             }
@@ -702,15 +824,22 @@ fn run_coordinator(
                     if let Some(coord_tx) = state.coordinator_tx.lock_or_recover().clone() {
                         // Forward the worker's output onto the coordinator
                         // channel, epoch-tagged. Exits when the worker drops
-                        // `out_tx` (recording finalized or abandoned).
+                        // `out_tx` (recording finalized or abandoned); if that
+                        // happens before any `Final`, say so, so a dictation
+                        // waiting in Transcribing is never stranded.
                         std::thread::spawn(move || {
+                            let mut saw_final = false;
                             while let Ok(output) = out_rx.recv() {
+                                saw_final |= matches!(output, RollingOutput::Final { .. });
                                 if coord_tx
                                     .send(CoordinatorMsg::Rolling { epoch, output })
                                     .is_err()
                                 {
-                                    break;
+                                    return;
                                 }
+                            }
+                            if !saw_final {
+                                let _ = coord_tx.send(CoordinatorMsg::RollingWorkerLost { epoch });
                             }
                         });
                         rolling_in =
@@ -772,9 +901,13 @@ fn run_coordinator(
                 // Rolling path (Feature B): the worker already holds the audio
                 // and has transcribed everything but the tail. Tell it to
                 // finalize; the assembled transcript comes back as
-                // `RollingOutput::Final`. A watchdog guards against a wedged
-                // engine stranding us in Transcribing (F2), mirroring the batch
-                // timeout below. `samples` is empty in rolling mode.
+                // `RollingOutput::Final`. There is deliberately no timer here
+                // any more: the old `duration + 60s` one fired while a healthy
+                // but loaded engine was still working (measured: RTF 2.3 under
+                // parallel builds → a 69s take needed 163s after release) and
+                // threw the take away. The worker bounds its own wait by
+                // progress and always answers; `RollingWorkerLost` covers the
+                // worker vanishing. `samples` is empty in rolling mode.
                 if let Some(rin) = rolling_in.take() {
                     let _ = rin.send(RollingInput::Finish);
                     pending_rolling = Some(PendingRollingFinal {
@@ -783,17 +916,11 @@ fn run_coordinator(
                         listen_reply,
                         epoch: rolling_epoch,
                     });
-                    if let Some(tx) = state.coordinator_tx.lock_or_recover().clone() {
-                        let epoch = rolling_epoch;
-                        let timeout = duration + Duration::from_secs(60);
-                        std::thread::spawn(move || {
-                            std::thread::sleep(timeout);
-                            let _ = tx.send(CoordinatorMsg::RollingTimeout { epoch });
-                        });
-                    }
                     continue;
                 }
 
+                let stats = AudioStats::from_samples(&samples, flow_core::audio::TARGET_SAMPLE_RATE);
+                let kept = samples.clone();
                 let (reply_tx, reply_rx) = mpsc::channel();
                 let sent = model_cmd_tx.send(ModelCommand::Transcribe {
                     samples,
@@ -814,17 +941,15 @@ fn run_coordinator(
                     // channel (panicked worker) surfaces as RecvError; a wedged
                     // inference trips the timeout. Either way synthesize an
                     // error result so the state machine leaves Transcribing and
-                    // the overlay is dismissed instead of hanging (F2).
-                    //
-                    // Scaled with audio duration (+60s margin) rather than a
-                    // flat 60s: Parakeet's measured real-time factor is well
-                    // under 1x, but a flat cap sized for short dictations
-                    // would falsely time out a legitimate 10min long-form
-                    // recording if RTF is ever not tiny.
-                    let transcribe_timeout = duration + Duration::from_secs(60);
+                    // the overlay is dismissed instead of hanging (F2) — and
+                    // the audio travels with it, to be saved for recovery.
+                    let transcribe_timeout = batch_transcribe_timeout(duration);
                     let result = match reply_rx.recv_timeout(transcribe_timeout) {
                         Ok(result) => result,
-                        Err(_) => Err("transcription failed".to_string()),
+                        Err(_) => Err(format!(
+                            "transcription timed out after {:.0}s",
+                            transcribe_timeout.as_secs_f64()
+                        )),
                     };
                     if let Some(tx) = forward_tx {
                         let _ = tx.send(CoordinatorMsg::TranscribeResult {
@@ -833,6 +958,8 @@ fn run_coordinator(
                             app_bundle_id,
                             profile,
                             listen_reply,
+                            samples: kept,
+                            stats,
                         });
                     }
                 });
@@ -923,6 +1050,13 @@ fn run_coordinator(
                 if let Some((tx, _)) = state.pending_listen.lock_or_recover().take() {
                     let _ = tx.send(Err("recording cancelled".to_string()));
                 }
+                log_outcome(
+                    "cancelled",
+                    Some(cancel_reason.take().unwrap_or("cancel")),
+                    recording_elapsed(&state),
+                    &DictationMeta::default(),
+                    0,
+                );
                 state.set_dictation_state(DictationState::Idle);
                 overlay::hide_overlay(&app);
             }
@@ -958,6 +1092,7 @@ fn run_coordinator(
             }
             CoordinatorMsg::Audio(AudioReply::Error(e)) => {
                 eprintln!("[vzt-flow] audio error: {e}");
+                log_outcome("failed", Some("audio-error"), recording_elapsed(&state), &DictationMeta::default(), 0);
                 rolling_in = None;
                 rolling_epoch = rolling_epoch.wrapping_add(1);
                 rolling_preview.clear();
@@ -974,16 +1109,16 @@ fn run_coordinator(
                 });
             }
             CoordinatorMsg::Rolling { epoch, output } => {
-                // Discard output from an abandoned or older recording.
-                if epoch != rolling_epoch {
-                    continue;
-                }
                 match output {
                     RollingOutput::Preview { chunk_text } => {
                         // Live preview (Feature B): only while still recording,
                         // dictionary-corrected (no LLM) for display. Appended to
                         // the running raw tail; the overlay shows its last chars.
-                        if *state.dictation_state.lock_or_recover() == DictationState::Recording {
+                        // Previews from an abandoned or older recording are
+                        // dropped — they carry nothing that isn't in its Final.
+                        if epoch == rolling_epoch
+                            && *state.dictation_state.lock_or_recover() == DictationState::Recording
+                        {
                             let corrected = {
                                 let dict = state.dictionary.lock_or_recover().clone();
                                 dictionary::correct(&chunk_text, &dict)
@@ -1001,80 +1136,126 @@ fn run_coordinator(
                             }
                         }
                     }
-                    RollingOutput::Final { raw_text, audio_duration } => {
-                        rolling_preview.clear();
-                        if let Some(p) = pending_rolling.take() {
-                            if p.epoch == epoch {
-                                run_pipeline(
-                                    &app,
-                                    raw_text,
-                                    audio_duration,
-                                    p.app_bundle_id,
-                                    p.profile,
-                                    p.listen_reply,
-                                );
+                    RollingOutput::Final { raw_text, audio_duration, chunks, failed_chunks, partial, stats, audio } => {
+                        let pending_epoch = pending_rolling.as_ref().map(|p| p.epoch);
+                        let mut meta = DictationMeta { chunks, failed_chunks, partial, stats, audio_saved: false };
+                        if should_save_recovery(raw_text.trim().is_empty(), &meta) {
+                            meta.audio_saved = save_recovery_audio(&audio);
+                        }
+                        drop(audio);
+                        match route_rolling_final(pending_epoch, epoch, !raw_text.trim().is_empty()) {
+                            FinalRoute::Pipeline => {
+                                rolling_preview.clear();
+                                if let Some(p) = pending_rolling.take() {
+                                    run_pipeline(
+                                        &app,
+                                        raw_text,
+                                        audio_duration,
+                                        p.app_bundle_id,
+                                        p.profile,
+                                        p.listen_reply,
+                                        meta,
+                                    );
+                                }
                                 tray::refresh_menu(&app);
                             }
+                            FinalRoute::ClipboardOnly => {
+                                eprintln!(
+                                    "[vzt-flow] a transcript arrived for a dictation that was no longer \
+                                     waiting (epoch {epoch}); putting it on the clipboard instead of \
+                                     dropping it"
+                                );
+                                deliver_to_clipboard(
+                                    &app,
+                                    &raw_text,
+                                    "An earlier dictation finished late — its transcript is on your clipboard.",
+                                    "late-final",
+                                    audio_duration,
+                                    &meta,
+                                );
+                            }
+                            FinalRoute::Ignore => {}
+                        }
+                    }
+                    RollingOutput::Late { raw_text, failed_chunks } => {
+                        // The chunks the watchdog abandoned finished after all.
+                        // The partial text was already pasted and the user has
+                        // moved on, so the complete transcript goes to the
+                        // clipboard rather than being pasted a second time.
+                        if !raw_text.trim().is_empty() {
+                            let meta = DictationMeta { failed_chunks, ..Default::default() };
+                            deliver_to_clipboard(
+                                &app,
+                                &raw_text,
+                                "Your last dictation finished transcribing — the complete transcript is on your clipboard.",
+                                "late-complete",
+                                Duration::ZERO,
+                                &meta,
+                            );
                         }
                     }
                 }
             }
-            CoordinatorMsg::RollingTimeout { epoch } => {
-                // A rolling finalize wedged (F2). Only act if it's still the
-                // current recording and hasn't finalized in the meantime.
-                if epoch == rolling_epoch {
-                    if let Some(p) = pending_rolling.take() {
-                        eprintln!("[vzt-flow] rolling transcription timed out; leaving Transcribing (F2)");
-                        rolling_in = None;
-                        rolling_preview.clear();
-                        if let Some(tx) = p.listen_reply {
-                            let _ = tx.send(Err("transcription timed out".to_string()));
-                        }
-                        state.set_dictation_state(DictationState::Idle);
-                        overlay::emit_overlay(
-                            &app,
-                            OverlayEvent::Message { text: "Transcription failed".to_string() },
-                        );
-                        let app2 = app.clone();
-                        std::thread::spawn(move || {
-                            std::thread::sleep(Duration::from_millis(1500));
-                            overlay::hide_overlay(&app2);
-                        });
+            CoordinatorMsg::RollingWorkerLost { epoch } => {
+                // The worker died without answering. Only matters if the
+                // dictation is still waiting on it.
+                if pending_rolling.as_ref().map(|p| p.epoch) == Some(epoch) {
+                    let p = pending_rolling.take().expect("checked above");
+                    eprintln!(
+                        "[vzt-flow] the rolling transcription worker exited without a result; \
+                         leaving Transcribing"
+                    );
+                    log_outcome("failed", Some("worker-lost"), recording_elapsed(&state), &DictationMeta::default(), 0);
+                    rolling_preview.clear();
+                    if let Some(tx) = p.listen_reply {
+                        let _ = tx.send(Err("transcription failed".to_string()));
                     }
+                    state.set_dictation_state(DictationState::Idle);
+                    tray::refresh_menu(&app);
+                    show_message_then_hide(&app, "Transcription failed".to_string(), 2500);
                 }
             }
-            CoordinatorMsg::TranscribeResult { result, audio_duration, app_bundle_id, profile, listen_reply } => {
+            CoordinatorMsg::RecoverLastRecording => {
+                spawn_recovery(&app, model_cmd_tx.clone());
+            }
+            CoordinatorMsg::TranscribeResult { result, audio_duration, app_bundle_id, profile, listen_reply, samples, stats } => {
                 match result {
                     Ok(transcript) => {
-                        run_pipeline(&app, transcript.text, audio_duration, app_bundle_id, profile, listen_reply);
+                        let mut meta = DictationMeta { chunks: 1, stats, ..Default::default() };
+                        if should_save_recovery(transcript.text.trim().is_empty(), &meta) {
+                            meta.audio_saved = save_recovery_audio(&samples);
+                        }
+                        drop(samples);
+                        run_pipeline(&app, transcript.text, audio_duration, app_bundle_id, profile, listen_reply, meta);
                     }
                     Err(e) => {
                         eprintln!("[vzt-flow] transcription error: {e}");
+                        // The whole take failed: keep it unless the mic heard
+                        // nothing at all.
+                        let saved = !stats.mic_silent() && save_recovery_audio(&samples);
+                        let meta = DictationMeta { chunks: 1, failed_chunks: 1, stats, audio_saved: saved, ..Default::default() };
+                        log_outcome("failed", Some("transcription-error"), audio_duration, &meta, 0);
                         // Map the real engine error to user-facing text before
                         // moving `e` into the listen reply — a missing-model
                         // failure becomes an actionable "download it" prompt
                         // instead of the old hard-coded "Transcription failed".
-                        let text = transcription_error_message(&e);
+                        let mut text = transcription_error_message(&e);
+                        if saved {
+                            text = "Transcription failed — audio saved".to_string();
+                            notify_audio_saved(&app);
+                        }
                         if let Some(tx) = listen_reply {
                             let _ = tx.send(Err(e));
                         }
                         state.set_dictation_state(DictationState::Idle);
-                        // Surface the failure briefly instead of silently
-                        // vanishing, then dismiss (F2).
-                        overlay::emit_overlay(
-                            &app,
-                            OverlayEvent::Message { text },
-                        );
-                        let app2 = app.clone();
-                        std::thread::spawn(move || {
-                            std::thread::sleep(Duration::from_millis(1500));
-                            overlay::hide_overlay(&app2);
-                        });
+                        // Surface the failure instead of silently vanishing,
+                        // then dismiss (F2).
+                        show_message_then_hide(&app, text, 2500);
                     }
                 }
                 tray::refresh_menu(&app);
             }
-            CoordinatorMsg::CleanupDone { raw_text, result, mode_label, audio_duration, app_bundle_id, listen_reply } => {
+            CoordinatorMsg::CleanupDone { raw_text, result, mode_label, audio_duration, app_bundle_id, listen_reply, meta } => {
                 finalize_dictation(
                     &app,
                     &raw_text,
@@ -1083,6 +1264,7 @@ fn run_coordinator(
                     audio_duration,
                     app_bundle_id,
                     listen_reply,
+                    meta,
                 );
             }
             CoordinatorMsg::Model(ModelStatusEvent::Loading) => {
@@ -1291,14 +1473,22 @@ fn run_pipeline(
     app_bundle_id: Option<String>,
     profile: ProfileRule,
     listen_reply: Option<Sender<Result<ListenOutcome, String>>>,
+    meta: DictationMeta,
 ) {
     let state = app.state::<AppState>();
     let dict = state.dictionary.lock_or_recover().clone();
     let corrected = dictionary::correct(&raw_text, &dict);
 
+    // Nothing was recognized: skip code mode / the LLM entirely and let
+    // `finalize_dictation` say so instead of pasting an empty string (B4).
+    if corrected.trim().is_empty() {
+        finalize_dictation(app, &raw_text, "", &profile.mode, audio_duration, app_bundle_id, listen_reply, meta);
+        return;
+    }
+
     if profile.mode == "code" {
         let final_text = codemode::transform(&corrected);
-        finalize_dictation(app, &raw_text, &final_text, "code", audio_duration, app_bundle_id, listen_reply);
+        finalize_dictation(app, &raw_text, &final_text, "code", audio_duration, app_bundle_id, listen_reply, meta);
         return;
     }
 
@@ -1307,7 +1497,7 @@ fn run_pipeline(
 
     if mode == Mode::Raw {
         // No LLM involved at all in raw mode; finish synchronously.
-        finalize_dictation(app, &raw_text, &corrected, &mode_label, audio_duration, app_bundle_id, listen_reply);
+        finalize_dictation(app, &raw_text, &corrected, &mode_label, audio_duration, app_bundle_id, listen_reply, meta);
         return;
     }
 
@@ -1320,7 +1510,7 @@ fn run_pipeline(
     let cleanup_tx = state.cleanup_cmd_tx.lock_or_recover().clone();
 
     let Some(cleanup_tx) = cleanup_tx else {
-        finalize_dictation(app, &raw_text, &corrected, &mode_label, audio_duration, app_bundle_id, listen_reply);
+        finalize_dictation(app, &raw_text, &corrected, &mode_label, audio_duration, app_bundle_id, listen_reply, meta);
         return;
     };
 
@@ -1333,7 +1523,7 @@ fn run_pipeline(
         reply: reply_tx,
     });
     if sent.is_err() {
-        finalize_dictation(app, &raw_text, &corrected, &mode_label, audio_duration, app_bundle_id, listen_reply);
+        finalize_dictation(app, &raw_text, &corrected, &mode_label, audio_duration, app_bundle_id, listen_reply, meta);
         return;
     }
 
@@ -1353,11 +1543,43 @@ fn run_pipeline(
                 audio_duration,
                 app_bundle_id,
                 listen_reply,
+                meta,
             });
         }
     });
 }
 
+/// The overlay line for a paste outcome that needs the user's attention
+/// (the transcript is on the clipboard rather than in the field), firing the
+/// matching notification. `None` for a clean paste.
+fn paste_message(app: &AppHandle, outcome: &anyhow::Result<insert::PasteOutcome>) -> Option<String> {
+    match outcome {
+        Ok(insert::PasteOutcome::Pasted) => None,
+        Ok(insert::PasteOutcome::SkippedSecureField) => Some("Secure field — transcript on clipboard".to_string()),
+        Ok(insert::PasteOutcome::SkippedNoAccessibility) => {
+            Some("No Accessibility permission — transcript on clipboard".to_string())
+        }
+        Ok(insert::PasteOutcome::ClipboardOnly) => {
+            // Linux/Wayland: no X server for the synthetic Ctrl+V. The
+            // overlay pill is brief, so also fire a desktop notification
+            // making the "paste manually" instruction discoverable.
+            notify_clipboard_only(app);
+            Some("Transcript on clipboard — press Ctrl+V".to_string())
+        }
+        Ok(insert::PasteOutcome::VerificationFailed) => {
+            // Feature C: Cmd+V was sent but Accessibility verification found
+            // the transcript wasn't in the focused field even after a
+            // retry. The transcript is left on the clipboard (not
+            // restored); surface that plus a notification since the overlay
+            // pill is brief.
+            notify_paste_maybe_failed(app);
+            Some("Paste may have failed — transcript on clipboard".to_string())
+        }
+        Err(e) => Some(format!("Paste failed: {e}")),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn finalize_dictation(
     app: &AppHandle,
     raw_text: &str,
@@ -1366,54 +1588,55 @@ fn finalize_dictation(
     audio_duration: Duration,
     app_bundle_id: Option<String>,
     listen_reply: Option<Sender<Result<ListenOutcome, String>>>,
+    meta: DictationMeta,
 ) {
     let state = app.state::<AppState>();
 
     let snips = state.snippets.lock_or_recover().clone();
     let final_text = snippets::expand(cleaned_text, &snips).unwrap_or_else(|| cleaned_text.to_string());
 
+    // B4: an empty result is never a silent "Done". Nothing is pasted (an
+    // empty paste used to flash the success check), nothing goes into
+    // history, and the overlay says what happened. A daemon `listen` still
+    // gets its (empty) reply so the caller isn't left waiting.
+    if let Some(text) = empty_result_message(&final_text, &meta) {
+        if let Some(tx) = listen_reply {
+            let _ = tx.send(Ok(ListenOutcome {
+                raw: raw_text.to_string(),
+                text: String::new(),
+                mode: mode_label.to_string(),
+                duration_s: audio_duration.as_secs_f64(),
+            }));
+        }
+        if meta.audio_saved {
+            notify_audio_saved(app);
+        }
+        log_outcome("empty", None, audio_duration, &meta, 0);
+        state.set_dictation_state(DictationState::Done);
+        tray::refresh_menu(app);
+        finish_with(app, Some(text));
+        return;
+    }
+
     *state.last_transcript.lock_or_recover() = Some(final_text.clone());
 
     // A daemon `listen` command never pastes — it hands the text back over
     // the socket instead. Everything else (history logging, overlay
     // Done flash, state reset) is identical to a normal dictation.
-    let message = if let Some(tx) = listen_reply {
+    let (outcome, pasted_msg) = if let Some(tx) = listen_reply {
         let _ = tx.send(Ok(ListenOutcome {
             raw: raw_text.to_string(),
             text: final_text.clone(),
             mode: mode_label.to_string(),
             duration_s: audio_duration.as_secs_f64(),
         }));
-        None
+        ("returned", None)
     } else {
         let outcome = insert::paste_text(&final_text);
-        match &outcome {
-            Ok(insert::PasteOutcome::Pasted) => None,
-            Ok(insert::PasteOutcome::SkippedSecureField) => {
-                Some("Secure field — transcript on clipboard".to_string())
-            }
-            Ok(insert::PasteOutcome::SkippedNoAccessibility) => {
-                Some("No Accessibility permission — transcript on clipboard".to_string())
-            }
-            Ok(insert::PasteOutcome::ClipboardOnly) => {
-                // Linux/Wayland: no X server for the synthetic Ctrl+V. The
-                // overlay pill is brief, so also fire a desktop notification
-                // making the "paste manually" instruction discoverable.
-                notify_clipboard_only(app);
-                Some("Transcript on clipboard — press Ctrl+V".to_string())
-            }
-            Ok(insert::PasteOutcome::VerificationFailed) => {
-                // Feature C: Cmd+V was sent but Accessibility verification found
-                // the transcript wasn't in the focused field even after a
-                // retry. The transcript is left on the clipboard (not
-                // restored); surface that plus a notification since the overlay
-                // pill is brief.
-                notify_paste_maybe_failed(app);
-                Some("Paste may have failed — transcript on clipboard".to_string())
-            }
-            Err(e) => Some(format!("Paste failed: {e}")),
-        }
+        let msg = paste_message(app, &outcome);
+        (if msg.is_none() { "pasted" } else { "clipboard" }, msg)
     };
+    let outcome = if meta.partial { "partial" } else { outcome };
 
     let entry = history::HistoryEntry {
         ts: history::now_unix(),
@@ -1421,27 +1644,242 @@ fn finalize_dictation(
         raw_text: raw_text.to_string(),
         duration_s: audio_duration.as_secs_f64(),
         rtf: 0.0, // logged to stderr by the model manager; not recomputed here
-        clean_text: final_text,
+        clean_text: final_text.clone(),
         mode: mode_label.to_string(),
     };
     if let Err(e) = history::append(&entry) {
         eprintln!("[vzt-flow] failed to append history: {e}");
     }
 
-    state.set_dictation_state(DictationState::Done);
-    if let Some(text) = message {
-        overlay::emit_overlay(app, OverlayEvent::Message { text });
-    } else {
-        overlay::emit_overlay(app, OverlayEvent::Done);
+    if meta.partial || meta.failed_chunks > 0 {
+        notify_incomplete(app, &meta);
     }
+    log_outcome(outcome, None, audio_duration, &meta, final_text.chars().count());
 
+    state.set_dictation_state(DictationState::Done);
+    finish_with(app, overlay_message(&meta, pasted_msg));
+}
+
+/// Shows `message` (or the Done check), returns to Idle after 900ms as
+/// before, and keeps a message on screen long enough to read (2.5s) — unless
+/// a new recording has taken the overlay over in the meantime.
+fn finish_with(app: &AppHandle, message: Option<String>) {
+    let linger = if message.is_some() { Duration::from_millis(2500) } else { Duration::from_millis(900) };
+    match message {
+        Some(text) => overlay::emit_overlay(app, OverlayEvent::Message { text }),
+        None => overlay::emit_overlay(app, OverlayEvent::Done),
+    }
     let app2 = app.clone();
     std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(900));
+        let idle_after = Duration::from_millis(900);
+        std::thread::sleep(idle_after);
         let state = app2.state::<AppState>();
-        state.set_dictation_state(DictationState::Idle);
-        overlay::hide_overlay(&app2);
+        {
+            let mut ds = state.dictation_state.lock_or_recover();
+            if *ds == DictationState::Done {
+                *ds = DictationState::Idle;
+            }
+        }
+        state.is_recording.store(false, Ordering::Relaxed);
+        std::thread::sleep(linger.saturating_sub(idle_after));
+        if *state.dictation_state.lock_or_recover() == DictationState::Idle {
+            overlay::hide_overlay(&app2);
+        }
     });
+}
+
+/// Shows a transient overlay message and hides it after `ms`, unless a new
+/// recording has started meanwhile.
+fn show_message_then_hide(app: &AppHandle, text: String, ms: u64) {
+    overlay::show_overlay(app);
+    overlay::emit_overlay(app, OverlayEvent::Message { text });
+    let app2 = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(ms));
+        if *app2.state::<AppState>().dictation_state.lock_or_recover() == DictationState::Idle {
+            overlay::hide_overlay(&app2);
+        }
+    });
+}
+
+/// How long the batch (non-rolling) path waits for a whole-recording
+/// transcription. Was `duration + 60s`, which a loaded machine exceeds for
+/// any take over ~45s (RTF > 2 measured under parallel builds); now it
+/// allows the same 6× real time the rolling watchdog does, plus the one-time
+/// model-load allowance. A timeout still keeps the audio (it is saved for
+/// recovery), so this bounds waiting, not the user's words.
+fn batch_transcribe_timeout(duration: Duration) -> Duration {
+    duration.mul_f32(6.0) + Duration::from_secs(120)
+}
+
+/// How long the current (or just-ended) recording has been running.
+fn recording_elapsed(state: &AppState) -> Duration {
+    state
+        .recording_started
+        .lock_or_recover()
+        .map(|s| s.elapsed())
+        .unwrap_or_default()
+}
+
+/// Writes the recovery recording, logging (not failing) on error. Returns
+/// whether it is actually on disk, so no message claims "audio saved" falsely.
+fn save_recovery_audio(samples: &[f32]) -> bool {
+    if samples.is_empty() {
+        return false;
+    }
+    match flow_core::recovery::save_last_recording(samples) {
+        Ok(path) => {
+            eprintln!(
+                "[vzt-flow] saved the recording ({:.1}s) to {} — tray > Recover last recording",
+                samples.len() as f64 / flow_core::audio::TARGET_SAMPLE_RATE as f64,
+                path.display()
+            );
+            true
+        }
+        Err(e) => {
+            eprintln!("[vzt-flow] failed to save the recording for recovery: {e}");
+            false
+        }
+    }
+}
+
+/// One line per dictation in the log, whatever happened to it, so a take
+/// that produced nothing still leaves a record (history is written on
+/// success only).
+fn format_outcome_line(
+    outcome: &str,
+    reason: Option<&str>,
+    duration: Duration,
+    meta: &DictationMeta,
+    chars: usize,
+) -> String {
+    format!(
+        "[vzt-flow] {} dictation outcome={outcome}{} duration={:.1}s chunks={} failed_chunks={} \
+         peak={:.3} speech={:.1}s chars={chars} audio_saved={}",
+        flow_core::logfile::timestamp(),
+        reason.map(|r| format!(" reason={r}")).unwrap_or_default(),
+        duration.as_secs_f64(),
+        meta.chunks,
+        meta.failed_chunks,
+        meta.stats.peak,
+        meta.stats.speech_secs,
+        meta.audio_saved,
+    )
+}
+
+fn log_outcome(outcome: &str, reason: Option<&str>, duration: Duration, meta: &DictationMeta, chars: usize) {
+    eprintln!("{}", format_outcome_line(outcome, reason, duration, meta, chars));
+}
+
+/// Puts a transcript that no dictation is waiting for any more on the
+/// clipboard (dictionary-corrected, no LLM) and says so with a notification.
+fn deliver_to_clipboard(
+    app: &AppHandle,
+    raw_text: &str,
+    body: &str,
+    reason: &str,
+    duration: Duration,
+    meta: &DictationMeta,
+) {
+    let dict = app.state::<AppState>().dictionary.lock_or_recover().clone();
+    let text = dictionary::correct(raw_text, &dict);
+    match arboard::Clipboard::new().and_then(|mut c| c.set_text(text.clone())) {
+        Ok(()) => {
+            log_outcome("clipboard", Some(reason), duration, meta, text.chars().count());
+            notify(app, body);
+        }
+        Err(e) => eprintln!("[vzt-flow] could not put the {reason} transcript on the clipboard: {e}"),
+    }
+}
+
+/// Best-effort desktop notification (failures are logged, never fatal).
+fn notify(app: &AppHandle, body: &str) {
+    if let Err(e) = app.notification().builder().title("VZT Flow").body(body).show() {
+        eprintln!("[vzt-flow] notification failed: {e}");
+    }
+}
+
+fn notify_audio_saved(app: &AppHandle) {
+    notify(
+        app,
+        "The recording was saved. Use \"Recover last recording\" in the menu bar to transcribe it again.",
+    );
+}
+
+fn notify_incomplete(app: &AppHandle, meta: &DictationMeta) {
+    let lead = if meta.partial {
+        "Transcription was taking too long, so the part that finished was pasted; the rest will be put on your clipboard if it completes."
+    } else {
+        "Part of the dictation couldn't be transcribed."
+    };
+    let tail = if meta.audio_saved {
+        " The recording is saved — use \"Recover last recording\" in the menu bar."
+    } else {
+        ""
+    };
+    notify(app, &format!("{lead}{tail}"));
+}
+
+/// Guards against two recoveries running at once.
+static RECOVERY_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// Tray "Recover last recording": re-transcribes the saved recording off the
+/// main thread, through the model manager in ≤35s chunks (never one >35s
+/// engine call — gotcha b), and puts the text on the clipboard.
+fn spawn_recovery(app: &AppHandle, model_cmd_tx: Sender<ModelCommand>) {
+    if RECOVERY_RUNNING.swap(true, Ordering::SeqCst) {
+        notify(app, "Already recovering the last recording.");
+        return;
+    }
+    let app = app.clone();
+    std::thread::Builder::new()
+        .name("vzt-flow-recovery".into())
+        .spawn(move || {
+            let result = (|| -> anyhow::Result<flow_core::recovery::Recovered> {
+                let path = flow_core::recovery::last_recording_path()?;
+                anyhow::ensure!(path.is_file(), "no saved recording at {}", path.display());
+                let (samples, _) = flow_core::audio::load_audio_file_as_f32(&path)?;
+                eprintln!(
+                    "[vzt-flow] recovering {} ({:.1}s)",
+                    path.display(),
+                    samples.len() as f64 / flow_core::audio::TARGET_SAMPLE_RATE as f64
+                );
+                flow_core::recovery::transcribe_paced(&model_cmd_tx, &samples)
+            })();
+            let idle = *app.state::<AppState>().dictation_state.lock_or_recover() == DictationState::Idle;
+            match result {
+                Ok(r) if !r.text.trim().is_empty() => {
+                    let state = app.state::<AppState>();
+                    let dict = state.dictionary.lock_or_recover().clone();
+                    let text = dictionary::correct(&r.text, &dict);
+                    let copied = arboard::Clipboard::new().and_then(|mut c| c.set_text(text.clone())).is_ok();
+                    *state.last_transcript.lock_or_recover() = Some(text.clone());
+                    let meta = DictationMeta { chunks: r.chunks, failed_chunks: r.failed_chunks, ..Default::default() };
+                    log_outcome("recovered", None, r.duration, &meta, text.chars().count());
+                    let words = text.split_whitespace().count();
+                    let body = if copied {
+                        format!("Recovered {words} words from the last recording — they're on your clipboard.")
+                    } else {
+                        format!("Recovered {words} words — use \"Copy last transcript\" to copy them.")
+                    };
+                    notify(&app, &body);
+                    if idle {
+                        show_message_then_hide(&app, "Recovered — transcript on clipboard".to_string(), 2500);
+                    }
+                }
+                Ok(r) => {
+                    let meta = DictationMeta { chunks: r.chunks, failed_chunks: r.failed_chunks, ..Default::default() };
+                    log_outcome("recovered", Some("no-speech"), r.duration, &meta, 0);
+                    notify(&app, "No speech could be recognized in the last recording.");
+                }
+                Err(e) => {
+                    eprintln!("[vzt-flow] recovery failed: {e}");
+                    notify(&app, &format!("Couldn't recover the last recording: {e}"));
+                }
+            }
+            RECOVERY_RUNNING.store(false, Ordering::SeqCst);
+        })
+        .expect("failed to spawn recovery thread");
 }
 
 /// Best-effort desktop notification for the Linux/Wayland clipboard-only
@@ -1635,6 +2073,134 @@ mod tests {
             transcription_error_message("some totally unrelated failure"),
             "Transcription failed"
         );
+    }
+
+    // ---- B5: a stray key cancels only a chord, not a long dictation ----
+
+    #[test]
+    fn a_stray_key_early_in_a_hold_is_still_treated_as_a_chord() {
+        // Option+e typed right after pressing Right Option: cancel, as before.
+        assert!(other_key_is_chord(Some(Duration::from_millis(400))));
+        assert!(other_key_is_chord(Some(Duration::from_millis(1499))));
+    }
+
+    #[test]
+    fn a_stray_key_late_in_a_long_hold_does_not_discard_the_dictation() {
+        // Brushing a key 30s into a dictation used to cancel it silently.
+        assert!(!other_key_is_chord(Some(Duration::from_secs(30))));
+        assert!(!other_key_is_chord(Some(CHORD_WINDOW)));
+        assert!(!other_key_is_chord(None), "no known press: nothing to cancel");
+    }
+
+    // ---- B2: a finished take is never dropped on the floor ----
+
+    #[test]
+    fn a_final_for_the_waiting_dictation_runs_the_pipeline() {
+        assert_eq!(route_rolling_final(Some(7), 7, true), FinalRoute::Pipeline);
+        assert_eq!(route_rolling_final(Some(7), 7, false), FinalRoute::Pipeline);
+    }
+
+    #[test]
+    fn a_final_nobody_is_waiting_for_goes_to_the_clipboard_not_the_void() {
+        // The old coordinator discarded a Final that arrived after its
+        // watchdog had given up, or after a newer recording had started.
+        assert_eq!(route_rolling_final(None, 7, true), FinalRoute::ClipboardOnly);
+        assert_eq!(route_rolling_final(Some(8), 7, true), FinalRoute::ClipboardOnly);
+        assert_eq!(route_rolling_final(None, 7, false), FinalRoute::Ignore);
+    }
+
+    fn speech_stats() -> AudioStats {
+        AudioStats { peak: 0.4, speech_secs: 60.0, duration_secs: 70.0 }
+    }
+
+    #[test]
+    fn an_incomplete_transcript_saves_the_audio_for_recovery() {
+        let partial = DictationMeta { partial: true, stats: speech_stats(), ..Default::default() };
+        assert!(should_save_recovery(false, &partial));
+        let failed = DictationMeta { failed_chunks: 1, stats: speech_stats(), ..Default::default() };
+        assert!(should_save_recovery(false, &failed));
+        let empty_speech = DictationMeta { stats: speech_stats(), ..Default::default() };
+        assert!(should_save_recovery(true, &empty_speech), "speech in, nothing out");
+    }
+
+    #[test]
+    fn a_complete_dictation_or_an_empty_silent_one_saves_nothing() {
+        let ok = DictationMeta { chunks: 3, stats: speech_stats(), ..Default::default() };
+        assert!(!should_save_recovery(false, &ok));
+        let quiet = DictationMeta { stats: AudioStats { peak: 0.02, speech_secs: 0.3, duration_secs: 5.0 }, ..Default::default() };
+        assert!(!should_save_recovery(true, &quiet), "an accidental tap must not overwrite a real recording");
+    }
+
+    // ---- B4: an empty result is never a silent "Done" ----
+
+    #[test]
+    fn an_empty_transcript_is_not_pasted_and_says_why() {
+        let saved = DictationMeta { stats: speech_stats(), audio_saved: true, ..Default::default() };
+        assert_eq!(
+            empty_result_message("  ", &saved).as_deref(),
+            Some("No speech recognized — audio saved")
+        );
+        let silent = DictationMeta { stats: AudioStats { peak: 0.0, speech_secs: 0.0, duration_secs: 30.0 }, ..Default::default() };
+        assert_eq!(empty_result_message("", &silent).as_deref(), Some("Mic was silent — check your input"));
+        let quiet = DictationMeta { stats: AudioStats { peak: 0.03, speech_secs: 0.0, duration_secs: 4.0 }, ..Default::default() };
+        assert_eq!(empty_result_message("", &quiet).as_deref(), Some("No speech recognized"));
+    }
+
+    #[test]
+    fn a_real_transcript_is_pasted() {
+        assert_eq!(empty_result_message("Hello there.", &DictationMeta::default()), None);
+    }
+
+    // ---- B2/B3: an incomplete paste says so ----
+
+    #[test]
+    fn a_partial_transcript_is_labelled_as_partial() {
+        let m = DictationMeta { partial: true, failed_chunks: 1, audio_saved: true, ..Default::default() };
+        assert_eq!(overlay_message(&m, None).as_deref(), Some("Partial transcript — audio saved"));
+        let f = DictationMeta { failed_chunks: 2, audio_saved: true, ..Default::default() };
+        assert_eq!(overlay_message(&f, None).as_deref(), Some("Some audio couldn't be transcribed"));
+    }
+
+    #[test]
+    fn a_paste_problem_still_takes_precedence_and_a_clean_run_shows_done() {
+        let m = DictationMeta { partial: true, ..Default::default() };
+        let p = Some("Secure field — transcript on clipboard".to_string());
+        assert_eq!(overlay_message(&m, p.clone()), p);
+        assert_eq!(overlay_message(&DictationMeta::default(), None), None);
+    }
+
+    // ---- B1: one log line per dictation ----
+
+    #[test]
+    fn the_outcome_line_carries_everything_needed_to_diagnose_a_lost_take() {
+        let meta = DictationMeta {
+            chunks: 3,
+            failed_chunks: 1,
+            partial: true,
+            stats: AudioStats { peak: 0.4123, speech_secs: 58.34, duration_secs: 70.0 },
+            audio_saved: true,
+        };
+        let line = format_outcome_line("partial", Some("timeout"), Duration::from_secs_f64(70.06), &meta, 812);
+        for field in [
+            "dictation outcome=partial reason=timeout",
+            "duration=70.1s",
+            "chunks=3",
+            "failed_chunks=1",
+            "peak=0.412",
+            "speech=58.3s",
+            "chars=812",
+            "audio_saved=true",
+        ] {
+            assert!(line.contains(field), "missing {field:?} in {line}");
+        }
+        assert!(line.starts_with("[vzt-flow] 20"), "must be timestamped: {line}");
+    }
+
+    #[test]
+    fn the_batch_path_allows_a_loaded_machine_six_times_real_time() {
+        // The old `duration + 60s` expired for a 69s take at RTF 1.9.
+        assert_eq!(batch_transcribe_timeout(Duration::from_secs(69)), Duration::from_secs(69 * 6 + 120));
+        assert!(batch_transcribe_timeout(Duration::from_secs(600)) >= Duration::from_secs(3600));
     }
 
     #[test]
