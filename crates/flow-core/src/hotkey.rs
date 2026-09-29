@@ -148,6 +148,133 @@ pub fn rearm_tick(
     try_arm()
 }
 
+/// The tap's latched view of the hold key.
+///
+/// `down` is the edge-detection latch. `validated` records that, during the
+/// current press, the CoreGraphics key-state table (`CGEventSourceKeyState`)
+/// has *also* reported the key as down. Only a validated press may be ended by
+/// a physical-state reading, because that table is not updated by synthetic
+/// (posted) events — measured on this machine: a posted Right Option /
+/// Right Control `flagsChanged` down reaches the tap, yet both the HID and the
+/// combined-session key state keep reading "up" for the whole hold. Trusting
+/// an unvalidated "up" would cut every synthetic hold (automation tools,
+/// remappers, our own end-to-end harness) at the next watchdog tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HoldLatch {
+    pub down: bool,
+    pub validated: bool,
+}
+
+/// What prompted a physical-state resync of the hold latch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResyncCause {
+    /// macOS disabled the tap (`TapDisabledByTimeout`/`ByUserInput`) and it was
+    /// just re-armed: events may have been missed in either direction.
+    TapReenabled,
+    /// The periodic 5s watchdog tick while the tap was believed healthy.
+    Watchdog,
+}
+
+/// Reconciles the latch with the key's physical state after a moment when
+/// events may have been lost. Pure, so the policy is testable without a tap.
+pub fn resync_hold_latch(
+    latch: HoldLatch,
+    physically_down: bool,
+    cause: ResyncCause,
+) -> (HoldLatch, Option<HotkeyEvent>) {
+    const HELD: HoldLatch = HoldLatch { down: true, validated: true };
+    match (latch.down, physically_down) {
+        // Held, and the key-state table agrees: (re)confirm the hold. This is
+        // the fix for the swallowed release — the old handler reset the latch
+        // to "up" here, so the real key-up produced no edge.
+        (true, true) => (HELD, None),
+        // Latched down but physically up: a missed release — but only a hold
+        // the table has already confirmed can be ended on its say-so.
+        (true, false) if latch.validated => (HoldLatch::default(), Some(HotkeyEvent::HoldKeyReleased)),
+        (true, false) => match cause {
+            // Can't tell a missed release from a reading that never tracks
+            // this press: keep the legacy reset (the next key-down is then
+            // seen as a press, never swallowed).
+            ResyncCause::TapReenabled => (HoldLatch::default(), None),
+            ResyncCause::Watchdog => (latch, None),
+        },
+        // Latched up but physically down: the press happened while the tap
+        // was dead. Only a re-arm reports it; the watchdog never starts a
+        // recording on its own.
+        (false, true) => match cause {
+            ResyncCause::TapReenabled => (HELD, Some(HotkeyEvent::HoldKeyPressed)),
+            ResyncCause::Watchdog => (latch, None),
+        },
+        (false, false) => (HoldLatch::default(), None),
+    }
+}
+
+#[cfg(test)]
+mod resync_tests {
+    use super::*;
+
+    const DOWN_VALIDATED: HoldLatch = HoldLatch { down: true, validated: true };
+    const DOWN_UNVALIDATED: HoldLatch = HoldLatch { down: true, validated: false };
+
+    #[test]
+    fn tap_reenabled_mid_hold_keeps_the_hold_when_the_key_is_still_down() {
+        // The swallowed-release bug: the old handler reset the latch to "up"
+        // while the key was still held, so the real release produced no edge
+        // and the recording ran on to the 600s cap.
+        let (latch, ev) = resync_hold_latch(DOWN_VALIDATED, true, ResyncCause::TapReenabled);
+        assert_eq!(latch, DOWN_VALIDATED);
+        assert_eq!(ev, None);
+    }
+
+    #[test]
+    fn tap_reenabled_after_a_missed_release_emits_the_release() {
+        let (latch, ev) = resync_hold_latch(DOWN_VALIDATED, false, ResyncCause::TapReenabled);
+        assert_eq!(latch, HoldLatch::default());
+        assert_eq!(ev, Some(HotkeyEvent::HoldKeyReleased));
+    }
+
+    #[test]
+    fn tap_reenabled_after_a_missed_press_emits_the_press() {
+        let (latch, ev) = resync_hold_latch(HoldLatch::default(), true, ResyncCause::TapReenabled);
+        assert_eq!(latch, DOWN_VALIDATED);
+        assert_eq!(ev, Some(HotkeyEvent::HoldKeyPressed));
+    }
+
+    #[test]
+    fn watchdog_ends_a_validated_hold_whose_key_is_physically_up() {
+        let (latch, ev) = resync_hold_latch(DOWN_VALIDATED, false, ResyncCause::Watchdog);
+        assert_eq!(latch, HoldLatch::default());
+        assert_eq!(ev, Some(HotkeyEvent::HoldKeyReleased));
+    }
+
+    #[test]
+    fn watchdog_validates_a_hold_the_key_state_confirms() {
+        let (latch, ev) = resync_hold_latch(DOWN_UNVALIDATED, true, ResyncCause::Watchdog);
+        assert_eq!(latch, DOWN_VALIDATED);
+        assert_eq!(ev, None);
+    }
+
+    #[test]
+    fn an_unvalidated_hold_is_never_ended_by_a_physical_up_reading() {
+        // Synthetic presses never validate (the key-state table ignores posted
+        // events), so neither path may end them on an "up" reading.
+        assert_eq!(
+            resync_hold_latch(DOWN_UNVALIDATED, false, ResyncCause::Watchdog),
+            (DOWN_UNVALIDATED, None)
+        );
+        let (_, ev) = resync_hold_latch(DOWN_UNVALIDATED, false, ResyncCause::TapReenabled);
+        assert_eq!(ev, None, "an unvalidated hold must not be released by a resync");
+    }
+
+    #[test]
+    fn watchdog_never_originates_a_press() {
+        assert_eq!(
+            resync_hold_latch(HoldLatch::default(), true, ResyncCause::Watchdog),
+            (HoldLatch::default(), None)
+        );
+    }
+}
+
 #[cfg(test)]
 mod rearm_tests {
     use super::{rearm_tick, should_attempt_arm};
@@ -282,6 +409,34 @@ mod macos {
     // `core-graphics`, so no extra `#[link]` is required.
     extern "C" {
         fn CGEventTapEnable(tap: CFMachPortRef, enable: bool);
+        // CoreGraphics' key-state table (`CGEventSource.h`). Not exposed by
+        // `core-graphics` 0.25, so declared here like `CGEventTapEnable`.
+        fn CGEventSourceKeyState(state_id: i32, key: u16) -> bool;
+    }
+
+    /// `kCGEventSourceStateHIDSystemState`: the state of the physical keys.
+    const HID_SYSTEM_STATE: i32 = 1;
+
+    /// Whether `keycode` is physically down, per CoreGraphics.
+    ///
+    /// Gotcha (h) check: this is a CoreGraphics (window-server) query, not a
+    /// TSM/HIToolbox input-source call — it does no layout lookup and has no
+    /// main-queue assertion; `key_state_is_safe_to_read_off_the_main_thread`
+    /// hammers it from 8 threads at once to pin that. It is called on the tap
+    /// thread only. Caveat measured on this machine: posted (synthetic)
+    /// events do not update this table, which is why [`super::HoldLatch`]
+    /// only trusts it for a press it has confirmed.
+    pub(crate) fn key_is_down(keycode: u16) -> bool {
+        unsafe { CGEventSourceKeyState(HID_SYSTEM_STATE, keycode) }
+    }
+
+    fn load_latch(down: &AtomicBool, validated: &AtomicBool) -> super::HoldLatch {
+        super::HoldLatch { down: down.load(Ordering::Relaxed), validated: validated.load(Ordering::Relaxed) }
+    }
+
+    fn store_latch(down: &AtomicBool, validated: &AtomicBool, latch: super::HoldLatch) {
+        down.store(latch.down, Ordering::Relaxed);
+        validated.store(latch.validated, Ordering::Relaxed);
     }
 
     /// How often the watchdog wakes to unconditionally re-arm the tap, as a
@@ -356,12 +511,19 @@ pub fn spawn_monitor(
     thread::Builder::new()
         .name("vzt-flow-hotkey-tap".into())
         .spawn(move || {
-            // Edge-detection latch for the hold key, plus the keycode it
-            // currently pertains to. Both live entirely inside the callback;
-            // `latch_keycode` lets us notice a live binding change and drop a
-            // now-meaningless latch (F7).
-            let hold_was_down = AtomicBool::new(false);
-            let latch_keycode = AtomicU16::new(initial_keycode);
+            // Edge-detection latch for the hold key (see `HoldLatch`), plus
+            // the keycode it currently pertains to. Shared between the
+            // callback and the watchdog loop below — both run on this one
+            // thread, so the atomics only satisfy the callback's `Send`
+            // bound. `latch_keycode` lets us notice a live binding change and
+            // drop a now-meaningless latch (F7).
+            let hold_was_down = Arc::new(AtomicBool::new(false));
+            let hold_validated = Arc::new(AtomicBool::new(false));
+            let latch_keycode = Arc::new(AtomicU16::new(initial_keycode));
+            let (wd_down, wd_validated, wd_latch_kc) =
+                (hold_was_down.clone(), hold_validated.clone(), latch_keycode.clone());
+            let wd_keycode = keycode_for_thread.clone();
+            let wd_tx = tx.clone();
 
             // Raw `CFMachPortRef` of the tap, shared into the callback so it
             // can re-arm the tap the moment macOS delivers a
@@ -378,16 +540,35 @@ pub fn spawn_monitor(
                     match event_type {
                         // macOS disabled the tap (it timed out under load, or
                         // the user's input momentarily suspended it). Re-arm
-                        // immediately, and reset the edge latch: while the tap
-                        // was dead we may have missed a key-up, so a stale
-                        // "down" latch would otherwise swallow the next press.
-                        // This is also the path a wake-from-sleep takes.
+                        // immediately, then resync the latch from the key's
+                        // physical state: while the tap was dead we may have
+                        // missed a key-up *or* a key-down. The old handler
+                        // forced the latch to "up", which swallowed the real
+                        // release of a key still held — under heavy load
+                        // (when timeouts happen) a long hold then ran on to
+                        // the 600s cap. This is also the path a
+                        // wake-from-sleep takes.
                         CGEventType::TapDisabledByTimeout
                         | CGEventType::TapDisabledByUserInput => {
-                            hold_was_down.store(false, Ordering::Relaxed);
                             let port = tap_port_for_cb.load(Ordering::Acquire);
                             if !port.is_null() {
                                 unsafe { CGEventTapEnable(port as CFMachPortRef, true) };
+                            }
+                            let kc = keycode_for_thread.load(Ordering::Relaxed);
+                            let before = load_latch(&hold_was_down, &hold_validated);
+                            let (after, ev) = super::resync_hold_latch(
+                                before,
+                                key_is_down(kc),
+                                super::ResyncCause::TapReenabled,
+                            );
+                            store_latch(&hold_was_down, &hold_validated, after);
+                            eprintln!(
+                                "[vzt-flow] hotkey tap disabled by macOS ({event_type:?}); re-armed, \
+                                 latch {before:?} -> {after:?}{}",
+                                ev.map(|e| format!(", emitting {e:?}")).unwrap_or_default()
+                            );
+                            if let Some(ev) = ev {
+                                let _ = tx.send(ev);
                             }
                         }
                         CGEventType::FlagsChanged => {
@@ -402,12 +583,21 @@ pub fn spawn_monitor(
                             // the previous key's up/down state says nothing
                             // about this one, so drop it (F7).
                             if latch_keycode.swap(this_keycode, Ordering::Relaxed) != this_keycode {
-                                hold_was_down.store(false, Ordering::Relaxed);
+                                store_latch(&hold_was_down, &hold_validated, super::HoldLatch::default());
                             }
                             let down = modifier_bit_for_keycode(physical_key)
                                 .map(|b| event.get_flags().contains(b))
                                 .unwrap_or(false);
                             let was_down = hold_was_down.swap(down, Ordering::Relaxed);
+                            if down && !was_down {
+                                // Does the key-state table see this press?
+                                // Hardware presses: normally yes (else the
+                                // watchdog confirms within 5s). Posted ones:
+                                // never — so they are never resync-released.
+                                hold_validated.store(key_is_down(this_keycode), Ordering::Relaxed);
+                            } else if !down {
+                                hold_validated.store(false, Ordering::Relaxed);
+                            }
                             if let Some(ev) = hold_edge(was_down, down) {
                                 let _ = tx.send(ev);
                             }
@@ -479,6 +669,12 @@ pub fn spawn_monitor(
             // is a cheap safety net beneath the in-callback re-enable. The tap
             // is held for the whole loop, so it is never dropped (which would
             // invalidate the mach port).
+            //
+            // Each wake also checks a latched-down hold against the key's
+            // physical state and releases it if the key is up (a release that
+            // never reached us — including the Left/Right twin-modifier quirk
+            // documented on `hold_edge`). Only a validated press qualifies;
+            // see `resync_hold_latch`.
             loop {
                 CFRunLoop::run_in_mode(
                     unsafe { kCFRunLoopDefaultMode },
@@ -486,6 +682,23 @@ pub fn spawn_monitor(
                     false,
                 );
                 tap.enable();
+                let kc = wd_keycode.load(Ordering::Relaxed);
+                if wd_latch_kc.load(Ordering::Relaxed) != kc {
+                    continue; // binding changed; the callback resets on the next event
+                }
+                let before = load_latch(&wd_down, &wd_validated);
+                if !before.down {
+                    continue;
+                }
+                let (after, ev) = super::resync_hold_latch(before, key_is_down(kc), super::ResyncCause::Watchdog);
+                store_latch(&wd_down, &wd_validated, after);
+                if let Some(ev) = ev {
+                    eprintln!(
+                        "[vzt-flow] hotkey watchdog: the hold key is physically up but its release \
+                         never arrived; emitting {ev:?}"
+                    );
+                    let _ = wd_tx.send(ev);
+                }
             }
         })
         .expect("failed to spawn hotkey monitor thread");
@@ -524,6 +737,29 @@ mod tests {
         // tap re-arm / binding change. After the reset the same press is seen.
         let after_reset = false;
         assert_eq!(hold_edge(after_reset, true), Some(HotkeyEvent::HoldKeyPressed));
+    }
+
+    /// Gotcha (h): HIToolbox/TSM input-source APIs abort the process when
+    /// called off the main queue, and that is a race — one background caller
+    /// usually survives. `CGEventSourceKeyState` runs on the tap thread, so
+    /// prove it is not in that class the same way the paste fix was proven:
+    /// concurrently, from 8 threads.
+    #[test]
+    fn key_state_is_safe_to_read_off_the_main_thread() {
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    let mut downs = 0;
+                    for _ in 0..500 {
+                        downs += key_is_down(61) as u32;
+                    }
+                    downs
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("key-state read panicked off the main thread");
+        }
     }
 
     #[test]
