@@ -6,6 +6,55 @@ versioning](https://semver.org/). Numbers quoted below were measured on this
 repo's dev hardware (M5 MacBook Air) unless noted — see `README.md` /
 `docs/PRD.md` for the full methodology.
 
+## Unreleased
+
+**Dictations over about a minute could vanish after you let go.** You would
+hold the key, talk for a minute or more, see "Transcribing", and then nothing
+was pasted — and nothing was recorded anywhere, not even in history.
+
+Transcription runs *while* you talk, in ~30s chunks, so only the last few
+seconds are left at release. At release the app started a timer of
+"recording length + 60 seconds" and, when it ran out, threw the whole take
+away. On a busy Mac that timer is far too short: with other heavy work
+running, the speech model was measured at about 2.4× slower than real time,
+so a 69-second dictation needed 163 seconds after release against a
+129-second timer. Short dictations never hit it, which is why only long ones
+disappeared.
+
+- **A finished take is never thrown away.** Waiting is now bounded by
+  *progress* (it restarts every time a chunk finishes) rather than by the
+  recording's length. If transcription genuinely stalls, the part that
+  finished is pasted ("Partial transcript — audio saved", or "Transcription
+  slow — audio saved" if nothing had finished yet) and the rest is put on your
+  clipboard, with a notification, if it completes later.
+- **The audio is kept when anything goes wrong.** An incomplete or empty
+  result saves the recording to `~/.config/vzt-flow/recovery/last.wav` (one
+  recording, on this Mac only, replaced by the next). The new menu-bar item
+  **Recover last recording** transcribes it again and puts the text on your
+  clipboard.
+- **A failed chunk is retried**, and a chunk that comes back blank even
+  though you were clearly speaking is retried in two halves. If words are
+  still missing, the overlay says "Some audio couldn't be transcribed".
+- **No more silent "Done" with nothing pasted.** An empty result says "No
+  speech recognized" or, if the microphone delivered silence, "Mic was
+  silent — check your input".
+- **Brushing a key during a long dictation no longer cancels it.** Another
+  key cancels only in the first 1.5 seconds of a hold (Option+e and friends);
+  after that the dictation continues.
+- **The hotkey no longer loses its release under load.** When macOS pauses
+  the key monitor mid-hold, it now re-reads whether the key is still down
+  instead of assuming it was released — which used to leave the recording
+  running until the 10-minute cap.
+- **Long dictations are cleaned up in pieces**, so the cleanup model can't
+  quietly drop sentences. Output that is much shorter or longer than what you
+  said is rejected in favour of your raw words (a real 51-word dictation had
+  been pasted as 9).
+- **There is a log now.** The app writes to
+  `~/Library/Logs/VZT Flow/vzt-flow.log` — one line per dictation, including
+  the ones that failed. `flow doctor` prints the path.
+- `flow listen` and the daemon waited 300 seconds even though the app records
+  for up to 600; they now follow the app's own limit.
+
 ## [0.3.5] — 2026-08-02
 
 **Dictation sometimes pasted your dictionary instead of what you said.** You
