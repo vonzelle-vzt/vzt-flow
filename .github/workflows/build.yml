@@ -315,10 +315,13 @@ jobs:
   # runtime, and the hold-to-talk hotkey uses tauri-plugin-global-shortcut's
   # X11 backend (Wayland is degraded to XWayland-only / tray-toggle).
   linux:
-    # Do NOT pin ubuntu-22.04 here: the prebuilt onnxruntime that ort-sys downloads
-    # references glibc 2.38 symbols (__isoc23_strtol*), so linking fails on glibc 2.35
-    # (verified in CI, PR #31). The AppImage therefore needs glibc 2.39 (Ubuntu 24.04+).
-    runs-on: ubuntu-latest
+    # glibc 2.35 baseline: the AppImage catalog wants the oldest supported Ubuntu
+    # LTS, and everything bundled (GTK/WebKit/libc symbols) inherits this runner's
+    # glibc. The 22.04 image retires 2027-04-17: before then move this job into an
+    # `ubuntu:22.04` container (same apt package set). onnxruntime comes from
+    # Microsoft's official build (scripts/ci/linux-onnxruntime.sh), because the
+    # prebuilt one ort-sys downloads needs glibc 2.38 and cannot link here.
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -327,7 +330,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
-          key: x86_64-unknown-linux-gnu
+          key: x86_64-unknown-linux-gnu-ubuntu2204
       - uses: actions/setup-node@v4
         with:
           node-version: 24
@@ -346,6 +349,8 @@ jobs:
             libxdo-dev \
             libssl-dev \
             libgtk-3-dev
+      - name: Install official onnxruntime (glibc-2.35-compatible, dynamic link)
+        run: scripts/ci/linux-onnxruntime.sh
       - name: Install frontend/MCP dependencies
         run: |
           npm ci --prefix apps/desktop
@@ -407,6 +412,25 @@ jobs:
           fi
           echo "AppImage permission gate passed"
 
+      - name: Verify glibc floor (max GLIBC 2.35, GLIBCXX 3.4.30) and bundled onnxruntime
+        run: |
+          set -eu
+          sudo rm -rf "$RUNNER_TEMP/gate"; mkdir -p "$RUNNER_TEMP/gate"
+          sudo unsquashfs -q -o "$("$APPIMAGE" --appimage-offset)" -d "$RUNNER_TEMP/gate/appimage" "$APPIMAGE" >/dev/null
+          echo "== AppImage =="
+          ls -l "$RUNNER_TEMP"/gate/appimage/usr/lib/libonnxruntime.so* \
+            || { echo "::error::libonnxruntime.so* not bundled in the AppImage"; exit 1; }
+          scripts/ci/linux-glibc-gate.sh "$RUNNER_TEMP/gate/appimage"
+          DEB=$(find "$PWD/target/x86_64-unknown-linux-gnu/release/bundle/deb" -name '*.deb' | head -n1)
+          echo "== $DEB =="
+          dpkg-deb -c "$DEB" | grep -E 'usr/bin/|libonnxruntime' \
+            || { echo "::error::deb is missing binary or libonnxruntime"; exit 1; }
+          dpkg-deb -x "$DEB" "$RUNNER_TEMP/gate/deb"
+          test -f "$RUNNER_TEMP/gate/deb/usr/lib/vzt-flow/libonnxruntime.so.1"
+          scripts/ci/linux-glibc-gate.sh "$RUNNER_TEMP/gate/deb"
+          echo "== rpath of the desktop binary =="
+          readelf -d "$RUNNER_TEMP/gate/deb/usr/bin/vzt-flow-desktop" | grep -E 'RPATH|RUNPATH|NEEDED.*onnx'
+
       - name: Smoke-launch AppImage as non-root
         run: |
           sudo apt-get install -y xvfb dbus dbus-x11
@@ -438,6 +462,24 @@ jobs:
           fi
           sudo pkill -u smoke || true
           exit $RC
+
+      - name: Smoke-launch extracted AppImage in a clean ubuntu:22.04 container
+        # The host step above runs on 22.04 but with GTK/WebKit -dev packages
+        # installed system-wide, which can mask a missing bundled lib. A bare
+        # jammy container with only xvfb/dbus/alsa/appindicator proves the
+        # bundled GTK/WebKit + onnxruntime are what actually load.
+        run: |
+          docker run --rm -v /opt/vzt-extract:/opt/vzt-extract:ro ubuntu:22.04 bash -euc '
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update -qq
+            apt-get install -y -qq --no-install-recommends xvfb xauth procps dbus dbus-x11 libasound2 libayatana-appindicator3-1 ca-certificates >/dev/null
+            ldd --version | head -1
+            useradd -m smoke
+            su smoke -c "cd ~ && env -u XDG_RUNTIME_DIR xvfb-run -a dbus-run-session -- /opt/vzt-extract/squashfs-root/AppRun >/tmp/smoke.log 2>&1 &
+              sleep 12
+              if pgrep -u smoke -f vzt-flow-desktop >/dev/null; then echo \"still running after 12s in ubuntu:22.04: OK\"; exit 0; fi
+              echo \"DIED within 12s\"; cat /tmp/smoke.log; exit 1"
+          '
 
       - name: Locate deb/AppImage artifacts
         id: find_installers

@@ -1,0 +1,11 @@
+{
+  "bundle": {
+    "linux": {
+      "deb": {
+        "files": {
+          "/usr/lib/vzt-flow/libonnxruntime.so.1": "linux-libs/libonnxruntime.so.1"
+        }
+      }
+    }
+  }
+}

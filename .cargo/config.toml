@@ -12,3 +12,14 @@
 # machines/toolchains where the loader already finds it.
 [target.'cfg(target_os = "macos")']
 rustflags = ["-C", "link-arg=-Wl,-rpath,/usr/lib/swift"]
+
+# Linux: onnxruntime is linked dynamically (Microsoft's official build, see
+# scripts/ci/linux-onnxruntime.sh), so the runtime must find libonnxruntime.so.1
+# next to the install. Literal $ORIGIN: no shell expands it, rustc hands the
+# args to the linker driver directly. Covers the AppImage (usr/lib), the .deb
+# (/usr/lib/vzt-flow) and the CLI tarball (lib/, or lib/vzt-flow via install.sh).
+[target.'cfg(target_os = "linux")']
+rustflags = [
+  "-C", "link-arg=-Wl,-rpath,$ORIGIN/../lib",
+  "-C", "link-arg=-Wl,-rpath,$ORIGIN/../lib/vzt-flow",
+]

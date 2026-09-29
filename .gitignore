@@ -3,3 +3,4 @@
 node_modules/
 apps/desktop/src-tauri/gen/
 mcp/dist/
+apps/desktop/src-tauri/linux-libs/
