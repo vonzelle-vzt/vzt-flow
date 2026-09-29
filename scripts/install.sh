@@ -222,6 +222,11 @@ install_linux() {
       # apt-get resolves the runtime deps (webkit2gtk, libayatana-appindicator,
       # alsa) from the package's control file; dpkg -i + apt-get -f is the
       # fallback if the direct-file install form isn't supported.
+      # Refresh the package index first: with a stale index those deps
+      # resolve to versions the mirror has already dropped (404) and the
+      # whole install fails. Best-effort — an offline/partial update should
+      # not stop us from trying with what's cached.
+      sudo apt-get update || warn "apt-get update failed; trying the install with the cached package index"
       sudo apt-get install -y "$bundle" \
         || { sudo dpkg -i "$bundle" || true; sudo apt-get -f install -y; }
     else
