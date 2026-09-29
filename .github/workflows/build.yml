@@ -412,8 +412,12 @@ jobs:
           sudo apt-get install -y xvfb dbus dbus-x11
           # Extract as root (like the catalog's root-owned AppDir) so the stored
           # modes are preserved exactly.
-          sudo rm -rf /opt/vzt-extract; sudo mkdir /opt/vzt-extract
-          ( cd /opt/vzt-extract && sudo "$APPIMAGE" --appimage-extract >/dev/null )
+          # unsquashfs as root keeps the stored modes exactly (the same modes the
+          # gate checked and the catalog's mount sees); the runtime's own
+          # --appimage-extract does not preserve directory modes.
+          sudo rm -rf /opt/vzt-extract; sudo mkdir -m 0755 /opt/vzt-extract
+          sudo unsquashfs -q -o "$("$APPIMAGE" --appimage-offset)" -d /opt/vzt-extract/squashfs-root "$APPIMAGE" >/dev/null
+          ls -ld /opt/vzt-extract/squashfs-root
           ls -l /opt/vzt-extract/squashfs-root/AppRun /opt/vzt-extract/squashfs-root/AppRun.wrapped
           sudo useradd -m smoke
           LOG=/tmp/smoke-launch.log
