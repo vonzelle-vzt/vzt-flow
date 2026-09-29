@@ -315,7 +315,9 @@ jobs:
   # runtime, and the hold-to-talk hotkey uses tauri-plugin-global-shortcut's
   # X11 backend (Wayland is degraded to XWayland-only / tray-toggle).
   linux:
-    runs-on: ubuntu-latest
+    # glibc 2.35 baseline so the AppImage runs on Ubuntu 22.04 / Debian 12; GitHub
+    # retires this image 2027-04-17 -- move to an ubuntu:22.04 container job before then.
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -354,9 +356,68 @@ jobs:
       - name: Install Tauri CLI
         run: cargo install tauri-cli --version "^2" --locked
 
+      - name: Seed tauri AppRun cache with 0755 (tauri#16155)
+        # tauri-bundler caches AppRun-x86_64 with mode 0770 (root-only on a
+        # fresh runner), and linuxdeploy copies it into the AppImage as
+        # AppRun.wrapped -- non-root users then get "Permission denied".
+        # Pre-seeding the cache makes the bundler skip its own download.
+        run: |
+          dir="${XDG_CACHE_HOME:-$HOME/.cache}/tauri"; mkdir -p "$dir"
+          curl -fsSL --retry 3 -o "$dir/AppRun-x86_64" https://github.com/tauri-apps/binary-releases/releases/download/apprun-old/AppRun-x86_64
+          chmod 0755 "$dir/AppRun-x86_64"
+
       - name: tauri build (x64, .deb + .AppImage)
         working-directory: apps/desktop
         run: cargo tauri build --target x86_64-unknown-linux-gnu
+
+      - name: Verify AppImage permissions
+        run: |
+          set -eu
+          APPIMAGE=$(find target/x86_64-unknown-linux-gnu/release/bundle/appimage -name '*.AppImage' | head -n1)
+          if [ -z "$APPIMAGE" ]; then
+            echo "::error::No .AppImage found under bundle/appimage"
+            exit 1
+          fi
+          chmod +x "$APPIMAGE"
+          EXTRACT_DIR="$RUNNER_TEMP/appimage-check"
+          rm -rf "$EXTRACT_DIR"; mkdir -p "$EXTRACT_DIR"
+          ( cd "$EXTRACT_DIR" && "$GITHUB_WORKSPACE/$APPIMAGE" --appimage-extract >/dev/null )
+          echo "APPIMAGE_EXTRACT_DIR=$EXTRACT_DIR" >> "$GITHUB_ENV"
+          cd "$EXTRACT_DIR/squashfs-root"
+          ls -l AppRun AppRun.wrapped usr/bin/ 2>&1 || true
+          bad=$( { find AppRun -maxdepth 0 ! -perm -o+x
+                   [ -e AppRun.wrapped ] && find AppRun.wrapped -maxdepth 0 ! -perm -o+x
+                   find usr/bin -type f ! -perm -o+x; } )
+          if [ -n "$bad" ]; then
+            echo "::error::AppImage files missing the other-execute bit (non-root users cannot launch it):"
+            echo "$bad"
+            exit 1
+          fi
+          echo "AppImage permission gate passed"
+
+      - name: Smoke-launch AppImage as non-root
+        run: |
+          sudo apt-get install -y xvfb dbus dbus-x11
+          sudo rm -rf /opt/vzt-appdir
+          sudo cp -a "$APPIMAGE_EXTRACT_DIR/squashfs-root" /opt/vzt-appdir
+          sudo chown -R root:root /opt/vzt-appdir
+          sudo useradd -m smoke
+          LOG=/tmp/smoke-launch.log
+          : > "$LOG"; chmod 666 "$LOG"
+          set +e
+          sudo -u smoke -H xvfb-run -a dbus-run-session -- /opt/vzt-appdir/AppRun >"$LOG" 2>&1 &
+          sleep 12
+          if pgrep -u smoke -f vzt-flow-desktop >/dev/null; then
+            echo "App still running after 12s as non-root user: OK"
+            RC=0
+          else
+            RC=1
+            echo "::error::AppImage died within 12s when launched as a non-root user"
+            echo "----- captured output -----"
+            cat "$LOG"
+          fi
+          sudo pkill -u smoke || true
+          exit $RC
 
       - name: Locate deb/AppImage artifacts
         id: find_installers
