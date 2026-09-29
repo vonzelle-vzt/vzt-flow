@@ -6,7 +6,7 @@ versioning](https://semver.org/). Numbers quoted below were measured on this
 repo's dev hardware (M5 MacBook Air) unless noted — see `README.md` /
 `docs/PRD.md` for the full methodology.
 
-## Unreleased
+## [0.3.6] — 2026-09-29
 
 **Dictations over about a minute could vanish after you let go.** You would
 hold the key, talk for a minute or more, see "Transcribing", and then nothing
