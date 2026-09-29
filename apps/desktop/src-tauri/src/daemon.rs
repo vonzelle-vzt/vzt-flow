@@ -163,10 +163,12 @@ fn handle_listen(app: &AppHandle, mode: Option<String>, timeout_secs: Option<u64
 
     // The coordinator only replies once the recording has stopped (via VAD
     // auto-stop or the duration cap) and the full pipeline has finished, so
-    // this can legitimately take up to ~`effective_cap` seconds plus
+    // this can legitimately take up to the recording cap plus
     // transcription/cleanup time. Bound the wait generously rather than
-    // block forever if something upstream wedges.
-    let wait_budget = Duration::from_secs(effective_cap.unwrap_or(300) + 60);
+    // block forever if something upstream wedges. A cap-less request records
+    // for the configured `max_handsfree_secs` (see `DaemonListen`).
+    let configured_cap = app.state::<AppState>().config.lock_or_recover().max_handsfree_secs;
+    let wait_budget = flow_core::ipc::listen_wait_budget(effective_cap, configured_cap);
     match reply_rx.recv_timeout(wait_budget) {
         Ok(Ok(outcome)) => Response {
             ok: true,

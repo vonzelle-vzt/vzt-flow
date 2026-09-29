@@ -21,10 +21,12 @@ pub fn run(mode: Option<String>, max_secs: Option<u64>) -> Result<()> {
 
 fn run_via_daemon(mode: Option<String>, max_secs: Option<u64>) -> Result<()> {
     let req = Request::Listen { mode, timeout_secs: None, max_secs };
-    // Generous read timeout: recording (up to max_secs, default 300s in the
-    // daemon's own config) plus transcription plus cleanup, with headroom.
-    let budget = max_secs.unwrap_or(300) + 60;
-    let resp = daemon_client::call_required(&req, Some(Duration::from_secs(budget)))?;
+    // Generous read timeout: recording (up to max_secs, else the app's own
+    // `max_handsfree_secs` — same config file, same machine) plus
+    // transcription plus cleanup, with headroom. Shared with the daemon.
+    let configured_cap = flow_core::Config::load().map(|c| c.max_handsfree_secs).unwrap_or(600);
+    let budget: Duration = flow_core::ipc::listen_wait_budget(max_secs, configured_cap);
+    let resp = daemon_client::call_required(&req, Some(budget))?;
     if !resp.ok {
         anyhow::bail!("daemon error: {}", resp.error.as_deref().unwrap_or("unknown error"));
     }
