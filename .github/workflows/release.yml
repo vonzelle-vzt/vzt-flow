@@ -889,7 +889,11 @@ jobs:
 
       - name: tauri build (x64, .deb + .AppImage)
         working-directory: apps/desktop
-        run: cargo tauri build --target x86_64-unknown-linux-gnu
+        run: |
+          echo "umask before build: $(umask)"
+          # Pin a sane umask so the AppDir (and squashfs) directories stay world-readable.
+          umask 022
+          cargo tauri build --target x86_64-unknown-linux-gnu
 
       - name: Build flow CLI (release)
         run: cargo build --release --target x86_64-unknown-linux-gnu -p flow-cli
@@ -909,6 +913,8 @@ jobs:
           echo "APPIMAGE_EXTRACT_DIR=$EXTRACT_DIR" >> "$GITHUB_ENV"
           cd "$EXTRACT_DIR/squashfs-root"
           ls -l AppRun AppRun.wrapped usr/bin/ 2>&1 || true
+          ls -ld . usr usr/share 2>&1 || true
+          echo "dirs lacking o+rx: $(find . -type d ! -perm -o+rx | wc -l)"
           bad=$( { find AppRun -maxdepth 0 ! -perm -o+x
                    [ -e AppRun.wrapped ] && find AppRun.wrapped -maxdepth 0 ! -perm -o+x
                    find usr/bin -type f ! -perm -o+x
