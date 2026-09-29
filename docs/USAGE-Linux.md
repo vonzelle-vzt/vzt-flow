@@ -72,6 +72,10 @@ security-model constraint, not a bug we can paper over.
 
 ## Runtime dependencies
 
+**Minimum glibc 2.39** — the `.deb` and `.AppImage` are built on Ubuntu 24.04 (the
+bundled onnxruntime needs glibc 2.38+ to link), so you need glibc 2.39 or newer,
+e.g. Ubuntu 24.04+, Debian 13+, Fedora 40+. Older distros (Ubuntu 22.04, Debian 12) are not supported.
+
 The desktop app is a Tauri 2 (WebKitGTK) menu-bar app. On a fresh desktop
 install you need:
 

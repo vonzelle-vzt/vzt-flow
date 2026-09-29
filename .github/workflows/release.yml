@@ -837,6 +837,9 @@ jobs:
   # hardware; X11 full, Wayland degraded). Ships a .deb, an .AppImage, and a
   # standalone CLI tarball (flow binary + MCP server) mirroring the macOS one.
   linux:
+    # Do NOT pin ubuntu-22.04 here: the prebuilt onnxruntime that ort-sys downloads
+    # references glibc 2.38 symbols (__isoc23_strtol*), so linking fails on glibc 2.35
+    # (verified in CI, PR #31). The AppImage therefore needs glibc 2.39 (Ubuntu 24.04+).
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -874,12 +877,90 @@ jobs:
       - name: Install Tauri CLI
         run: cargo install tauri-cli --version "^2" --locked
 
+      - name: Seed tauri AppRun cache with 0755 (tauri#16155)
+        # tauri-bundler caches AppRun-x86_64 with mode 0770 (root-only on a
+        # fresh runner), and linuxdeploy copies it into the AppImage as
+        # AppRun.wrapped -- non-root users then get "Permission denied".
+        # Pre-seeding the cache makes the bundler skip its own download.
+        run: |
+          dir="${XDG_CACHE_HOME:-$HOME/.cache}/tauri"; mkdir -p "$dir"
+          curl -fsSL --retry 3 -o "$dir/AppRun-x86_64" https://github.com/tauri-apps/binary-releases/releases/download/apprun-old/AppRun-x86_64
+          chmod 0755 "$dir/AppRun-x86_64"
+
       - name: tauri build (x64, .deb + .AppImage)
         working-directory: apps/desktop
         run: cargo tauri build --target x86_64-unknown-linux-gnu
 
       - name: Build flow CLI (release)
         run: cargo build --release --target x86_64-unknown-linux-gnu -p flow-cli
+
+      - name: Verify AppImage permissions
+        # Inspect the modes STORED in the squashfs (unsquashfs -ll), not an
+        # --appimage-extract tree: extraction as a normal user rewrites directory
+        # modes to 0700, which says nothing about what users get when it mounts.
+        run: |
+          set -eu
+          sudo apt-get install -y squashfs-tools
+          APPIMAGE=$(find "$PWD/target/x86_64-unknown-linux-gnu/release/bundle/appimage" -name '*.AppImage' | head -n1)
+          if [ -z "$APPIMAGE" ]; then
+            echo "::error::No .AppImage found under bundle/appimage"
+            exit 1
+          fi
+          chmod +x "$APPIMAGE"
+          echo "APPIMAGE=$APPIMAGE" >> "$GITHUB_ENV"
+          OFFSET=$("$APPIMAGE" --appimage-offset)
+          unsquashfs -o "$OFFSET" -ll "$APPIMAGE" > "$RUNNER_TEMP/appimage-listing.txt"
+          echo "Launcher files (stored modes):"
+          grep -E ' squashfs-root/(AppRun|AppRun\.wrapped|usr/bin/[^/]+)$' "$RUNNER_TEMP/appimage-listing.txt" || true
+          # Column 1 is the mode string (e.g. drwxr-xr-x); chars 8-10 are "other".
+          # Fail on: any dir/file without other-read, any dir without other-exec,
+          # and AppRun / AppRun.wrapped / usr/bin/* without other-exec.
+          bad=$(awk '
+            { m=$1; t=substr(m,1,1); if (t=="l") next
+              path=$0; sub(/^[^ ]+ +[^ ]+ +[0-9]+ +[0-9-]+ +[0-9:]+ +/, "", path)
+              orb=substr(m,8,1); oxb=substr(m,10,1); isx=(oxb=="x"||oxb=="t"||oxb=="s")
+              if (orb!="r") print "no other-read:  " m " " path
+              else if (t=="d" && !isx) print "no other-exec:  " m " " path
+              else if (t=="-" && !isx && (path ~ /squashfs-root\/AppRun(\.wrapped)?$/ || path ~ /squashfs-root\/usr\/bin\//)) print "no other-exec:  " m " " path
+            }' "$RUNNER_TEMP/appimage-listing.txt")
+          if [ -n "$bad" ]; then
+            echo "::error::AppImage entries not accessible to other users (non-root users cannot launch it):"
+            echo "$bad" | head -50
+            exit 1
+          fi
+          echo "AppImage permission gate passed"
+
+      - name: Smoke-launch AppImage as non-root
+        run: |
+          sudo apt-get install -y xvfb dbus dbus-x11
+          # Extract as root (like the catalog's root-owned AppDir) so the stored
+          # modes are preserved exactly.
+          # unsquashfs as root keeps the stored modes exactly (the same modes the
+          # gate checked and the catalog's mount sees); the runtime's own
+          # --appimage-extract does not preserve directory modes.
+          sudo rm -rf /opt/vzt-extract; sudo mkdir -m 0755 /opt/vzt-extract
+          sudo unsquashfs -q -o "$("$APPIMAGE" --appimage-offset)" -d /opt/vzt-extract/squashfs-root "$APPIMAGE" >/dev/null
+          ls -ld /opt/vzt-extract/squashfs-root
+          ls -l /opt/vzt-extract/squashfs-root/AppRun /opt/vzt-extract/squashfs-root/AppRun.wrapped
+          sudo useradd -m smoke
+          LOG=/tmp/smoke-launch.log
+          : > "$LOG"; chmod 666 "$LOG"
+          set +e
+          # A private XDG_RUNTIME_DIR: the runner's own one belongs to another uid.
+          sudo -u smoke -H env -u XDG_RUNTIME_DIR xvfb-run -a dbus-run-session -- /opt/vzt-extract/squashfs-root/AppRun >"$LOG" 2>&1 &
+          sleep 12
+          if pgrep -u smoke -f vzt-flow-desktop >/dev/null; then
+            echo "App still running after 12s as non-root user: OK"
+            RC=0
+          else
+            RC=1
+            echo "::error::AppImage died within 12s when launched as a non-root user"
+            echo "----- captured output -----"
+            cat "$LOG"
+            namei -l /opt/vzt-extract/squashfs-root/AppRun || true
+          fi
+          sudo pkill -u smoke || true
+          exit $RC
 
       - name: Collect deb/AppImage artifacts
         run: |
