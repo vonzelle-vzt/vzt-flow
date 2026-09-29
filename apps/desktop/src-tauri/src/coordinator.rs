@@ -1481,6 +1481,16 @@ fn start_recording(app: &AppHandle, max_secs: u64) {
     if let Some(cleanup_tx) = cleanup_tx {
         let _ = cleanup_tx.send(CleanupCommand::Warmup);
     }
+
+    // Same for the speech model: load Parakeet now, while the user talks,
+    // instead of at the first rolling chunk (~35s in) or the release tail. A
+    // cold load has taken minutes on a loaded machine. The manager is a serial
+    // queue, so a chunk dispatched meanwhile just waits behind the load; and
+    // it emits the same Loading/Loaded events the rolling watchdog keys off.
+    let model_tx = state.model_cmd_tx.lock_or_recover().clone();
+    if let Some(model_tx) = model_tx {
+        let _ = model_tx.send(ModelCommand::Warmup);
+    }
 }
 
 fn stop_and_transcribe(audio_cmd_tx: &Sender<AudioCommand>) {

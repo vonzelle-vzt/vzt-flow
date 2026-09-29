@@ -21,6 +21,9 @@ so a 69-second dictation needed 163 seconds after release against a
 129-second timer. Short dictations never hit it, which is why only long ones
 disappeared.
 
+- **The speech model now loads the moment you start talking**, not ~35 seconds
+  in or at release, so a cold load (minutes on a busy Mac) overlaps with your
+  speech instead of delaying the paste.
 - **A finished take is never thrown away.** Waiting is now bounded by
   *progress* (it restarts every time a chunk finishes, and time spent loading
   the speech model doesn't count — on a busy Mac a cold load was measured at
