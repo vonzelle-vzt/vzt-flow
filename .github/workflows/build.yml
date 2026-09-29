@@ -369,36 +369,40 @@ jobs:
 
       - name: tauri build (x64, .deb + .AppImage)
         working-directory: apps/desktop
-        run: |
-          echo "umask before build: $(umask)"
-          # Pin a sane umask so the AppDir (and squashfs) directories stay world-readable.
-          umask 022
-          cargo tauri build --target x86_64-unknown-linux-gnu
+        run: cargo tauri build --target x86_64-unknown-linux-gnu
 
       - name: Verify AppImage permissions
+        # Inspect the modes STORED in the squashfs (unsquashfs -ll), not an
+        # --appimage-extract tree: extraction as a normal user rewrites directory
+        # modes to 0700, which says nothing about what users get when it mounts.
         run: |
           set -eu
-          APPIMAGE=$(find target/x86_64-unknown-linux-gnu/release/bundle/appimage -name '*.AppImage' | head -n1)
+          sudo apt-get install -y squashfs-tools
+          APPIMAGE=$(find "$PWD/target/x86_64-unknown-linux-gnu/release/bundle/appimage" -name '*.AppImage' | head -n1)
           if [ -z "$APPIMAGE" ]; then
             echo "::error::No .AppImage found under bundle/appimage"
             exit 1
           fi
           chmod +x "$APPIMAGE"
-          EXTRACT_DIR="$RUNNER_TEMP/appimage-check"
-          rm -rf "$EXTRACT_DIR"; mkdir -p "$EXTRACT_DIR"
-          ( cd "$EXTRACT_DIR" && "$GITHUB_WORKSPACE/$APPIMAGE" --appimage-extract >/dev/null )
-          echo "APPIMAGE_EXTRACT_DIR=$EXTRACT_DIR" >> "$GITHUB_ENV"
-          cd "$EXTRACT_DIR/squashfs-root"
-          ls -l AppRun AppRun.wrapped usr/bin/ 2>&1 || true
-          ls -ld . usr usr/share 2>&1 || true
-          echo "dirs lacking o+rx: $(find . -type d ! -perm -o+rx | wc -l)"
-          bad=$( { find AppRun -maxdepth 0 ! -perm -o+x
-                   [ -e AppRun.wrapped ] && find AppRun.wrapped -maxdepth 0 ! -perm -o+x
-                   find usr/bin -type f ! -perm -o+x
-                   find . -type d ! -perm -o+rx; } )
+          echo "APPIMAGE=$APPIMAGE" >> "$GITHUB_ENV"
+          OFFSET=$("$APPIMAGE" --appimage-offset)
+          unsquashfs -o "$OFFSET" -ll "$APPIMAGE" > "$RUNNER_TEMP/appimage-listing.txt"
+          echo "Launcher files (stored modes):"
+          grep -E ' squashfs-root/(AppRun|AppRun\.wrapped|usr/bin/[^/]+)$' "$RUNNER_TEMP/appimage-listing.txt" || true
+          # Column 1 is the mode string (e.g. drwxr-xr-x); chars 8-10 are "other".
+          # Fail on: any dir/file without other-read, any dir without other-exec,
+          # and AppRun / AppRun.wrapped / usr/bin/* without other-exec.
+          bad=$(awk '
+            { m=$1; t=substr(m,1,1); if (t=="l") next
+              path=$0; sub(/^[^ ]+ +[^ ]+ +[0-9]+ +[0-9-]+ +[0-9:]+ +/, "", path)
+              orb=substr(m,8,1); oxb=substr(m,10,1); isx=(oxb=="x"||oxb=="t"||oxb=="s")
+              if (orb!="r") print "no other-read:  " m " " path
+              else if (t=="d" && !isx) print "no other-exec:  " m " " path
+              else if (t=="-" && !isx && (path ~ /squashfs-root\/AppRun(\.wrapped)?$/ || path ~ /squashfs-root\/usr\/bin\//)) print "no other-exec:  " m " " path
+            }' "$RUNNER_TEMP/appimage-listing.txt")
           if [ -n "$bad" ]; then
-            echo "::error::AppImage files/dirs not accessible to other users (non-root users cannot launch it):"
-            echo "$bad"
+            echo "::error::AppImage entries not accessible to other users (non-root users cannot launch it):"
+            echo "$bad" | head -50
             exit 1
           fi
           echo "AppImage permission gate passed"
@@ -406,15 +410,17 @@ jobs:
       - name: Smoke-launch AppImage as non-root
         run: |
           sudo apt-get install -y xvfb dbus dbus-x11
-          sudo rm -rf /opt/vzt-appdir
-          sudo cp -a "$APPIMAGE_EXTRACT_DIR/squashfs-root" /opt/vzt-appdir
-          sudo chown -R root:root /opt/vzt-appdir
+          # Extract as root (like the catalog's root-owned AppDir) so the stored
+          # modes are preserved exactly.
+          sudo rm -rf /opt/vzt-extract; sudo mkdir /opt/vzt-extract
+          ( cd /opt/vzt-extract && sudo "$APPIMAGE" --appimage-extract >/dev/null )
+          ls -l /opt/vzt-extract/squashfs-root/AppRun /opt/vzt-extract/squashfs-root/AppRun.wrapped
           sudo useradd -m smoke
           LOG=/tmp/smoke-launch.log
           : > "$LOG"; chmod 666 "$LOG"
           set +e
           # A private XDG_RUNTIME_DIR: the runner's own one belongs to another uid.
-          sudo -u smoke -H env -u XDG_RUNTIME_DIR xvfb-run -a dbus-run-session -- /opt/vzt-appdir/AppRun >"$LOG" 2>&1 &
+          sudo -u smoke -H env -u XDG_RUNTIME_DIR xvfb-run -a dbus-run-session -- /opt/vzt-extract/squashfs-root/AppRun >"$LOG" 2>&1 &
           sleep 12
           if pgrep -u smoke -f vzt-flow-desktop >/dev/null; then
             echo "App still running after 12s as non-root user: OK"
@@ -424,10 +430,7 @@ jobs:
             echo "::error::AppImage died within 12s when launched as a non-root user"
             echo "----- captured output -----"
             cat "$LOG"
-            echo "----- path permissions -----"
-            ls -ld /opt /opt/vzt-appdir; ls -l /opt/vzt-appdir/AppRun
-            namei -l /opt/vzt-appdir/AppRun || true
-            sudo -u smoke test -x /opt/vzt-appdir/AppRun && echo "smoke can exec AppRun" || echo "smoke CANNOT exec AppRun"
+            namei -l /opt/vzt-extract/squashfs-root/AppRun || true
           fi
           sudo pkill -u smoke || true
           exit $RC
