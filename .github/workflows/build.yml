@@ -376,6 +376,13 @@ jobs:
         working-directory: apps/desktop
         run: cargo tauri build --target x86_64-unknown-linux-gnu
 
+      - name: Embed AppImage update information + generate .zsync
+        # Tauri has no update-info knob: repack the built AppImage with a pinned
+        # appimagetool (-u), renaming it to the dot form GitHub publishes so the
+        # embedded zsync name matches the release asset. Runs BEFORE the gates so
+        # the permission / glibc / smoke steps check the FINAL file.
+        run: scripts/ci/linux-appimage-updateinfo.sh target/x86_64-unknown-linux-gnu/release/bundle/appimage
+
       - name: Verify AppImage permissions
         # Inspect the modes STORED in the squashfs (unsquashfs -ll), not an
         # --appimage-extract tree: extraction as a normal user rewrites directory
@@ -489,7 +496,7 @@ jobs:
           # was invoked from apps/desktop.
           mkdir -p ci-artifacts
           find target/x86_64-unknown-linux-gnu/release/bundle \
-            \( -name '*.deb' -o -name '*.AppImage' \) -exec cp {} ci-artifacts/ \;
+            \( -name '*.deb' -o -name '*.AppImage' -o -name '*.AppImage.zsync' \) -exec cp {} ci-artifacts/ \;
           echo "Linux bundle artifacts (name + size):"
           ls -la ci-artifacts
           if [ -z "$(ls -A ci-artifacts)" ]; then

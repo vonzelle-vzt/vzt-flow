@@ -141,6 +141,25 @@ gh run download <run-id> --name vzt-flow-linux-x64-bundles --dir ./vzt-flow-linu
 Then `sudo apt-get install -y ./vzt-flow-linux/*.deb`, or `chmod +x
 ./vzt-flow-linux/*.AppImage && ./vzt-flow-linux/*.AppImage`.
 
+### Updating the AppImage in place
+
+Release AppImages (`VZT.Flow_<version>_amd64.AppImage`) embed
+[AppImageUpdate](https://github.com/AppImageCommunity/AppImageUpdate)
+information and ship a matching `VZT.Flow_<version>_amd64.AppImage.zsync` next
+to them on the Releases page. To update, download `appimageupdatetool` and run
+it on your existing file; it fetches only the changed blocks:
+
+```bash
+./appimageupdatetool-x86_64.AppImage VZT.Flow_*_amd64.AppImage
+```
+
+The embedded string (check with `./VZT.Flow_*_amd64.AppImage
+--appimage-updateinformation`) is
+`gh-releases-zsync|vonzelle-vzt|vzt-flow|latest|VZT.Flow_*_amd64.AppImage.zsync`.
+CI repacks Tauri's AppImage with a pinned `appimagetool` to add this
+(`scripts/ci/linux-appimage-updateinfo.sh`); the runtime is unchanged (already
+the type2 runtime), so `libfuse2` is still needed to run the AppImage.
+
 Tagged releases (`v*`) additionally ship a standalone CLI tarball
 (`vzt-flow-cli-linux-x86_64.tar.gz`: the `flow` binary + the MCP server),
 mirroring the macOS tarball layout.
