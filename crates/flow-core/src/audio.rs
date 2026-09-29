@@ -20,6 +20,49 @@ pub const TARGET_SAMPLE_RATE: u32 = 16_000;
 /// without a message per mic callback.
 const ROLLING_EMIT_MIN_SAMPLES: usize = TARGET_SAMPLE_RATE as usize / 4;
 
+/// **Test-only.** When set to an audio file path, every recording the audio
+/// worker starts streams that file (at real-time pace, then silence) instead
+/// of opening the microphone. Everything downstream — rolling cuts, the model
+/// manager, cleanup, paste — runs exactly as for a live mic.
+///
+/// Exists because the end-to-end long-dictation check cannot rely on a
+/// speaker-to-mic loop: the dev Mac's default input is a Bluetooth headset and
+/// its default output a virtual device, and re-routing a user's audio to run a
+/// test is not acceptable. Never set in production; unset costs one
+/// `var_os` per recording.
+pub const TEST_INPUT_WAV_ENV: &str = "VZT_FLOW_TEST_INPUT_WAV";
+
+/// Block size the test input feeder sends at, matching a typical CoreAudio
+/// input callback (20ms at 16 kHz).
+const TEST_FEED_BLOCK: usize = TARGET_SAMPLE_RATE as usize / 50;
+
+/// Streams `samples` (16 kHz mono) into `data_tx` on an absolute real-time
+/// schedule, then silence, until the receiver is dropped at the end of the
+/// recording. See [`TEST_INPUT_WAV_ENV`].
+fn spawn_test_input_feeder(samples: Vec<f32>, data_tx: mpsc::Sender<Vec<f32>>) {
+    std::thread::Builder::new()
+        .name("vzt-flow-test-input".into())
+        .spawn(move || {
+            let started = Instant::now();
+            let block_secs = TEST_FEED_BLOCK as f64 / TARGET_SAMPLE_RATE as f64;
+            let silence = vec![0.0f32; TEST_FEED_BLOCK];
+            let mut sent_blocks: u64 = 0;
+            let mut chunks = samples.chunks(TEST_FEED_BLOCK);
+            loop {
+                let block = chunks.next().map(|c| c.to_vec()).unwrap_or_else(|| silence.clone());
+                if data_tx.send(block).is_err() {
+                    return; // recording ended
+                }
+                sent_blocks += 1;
+                let due = started + Duration::from_secs_f64(sent_blocks as f64 * block_secs);
+                if let Some(wait) = due.checked_duration_since(Instant::now()) {
+                    std::thread::sleep(wait);
+                }
+            }
+        })
+        .expect("failed to spawn test input feeder thread");
+}
+
 /// Info about the default input device, used by `flow doctor`.
 pub struct InputDeviceInfo {
     pub name: String,
@@ -309,66 +352,27 @@ fn run_one_recording(
     handsfree_silence_secs: Option<f64>,
     rolling: bool,
 ) -> Result<()> {
-    let host = cpal::default_host();
-    let device = host
-        .default_input_device()
-        .context("no default input (microphone) device found")?;
-    let config = device
-        .default_input_config()
-        .context("failed to read default input config")?;
-
-    let sample_format = config.sample_format();
-    let stream_config: StreamConfig = config.into();
-    let in_rate = stream_config.sample_rate.0;
-    let in_channels = stream_config.channels as usize;
-
     let (data_tx, data_rx) = mpsc::channel::<Vec<f32>>();
 
     // Raised by cpal's error callback (runs on cpal's own thread) when the
     // input device faults mid-stream — device unplugged, sample-format change,
     // etc. The capture loop polls it and treats it as a clean fault stop.
     let device_lost = Arc::new(AtomicBool::new(false));
-    let err_flag = device_lost.clone();
-    let err_fn = move |err| {
-        eprintln!("audio input stream error: {err}");
-        err_flag.store(true, Ordering::SeqCst);
+
+    let test_input = std::env::var_os(TEST_INPUT_WAV_ENV).filter(|v| !v.is_empty());
+    let (in_rate, in_channels, stream) = if let Some(path) = test_input {
+        let (samples, _) = load_audio_file_as_f32(std::path::Path::new(&path))?;
+        eprintln!(
+            "[vzt-flow] TEST INPUT: streaming {} ({:.1}s) instead of the microphone",
+            std::path::Path::new(&path).display(),
+            samples.len() as f64 / TARGET_SAMPLE_RATE as f64
+        );
+        spawn_test_input_feeder(samples, data_tx);
+        (TARGET_SAMPLE_RATE, 1usize, None)
+    } else {
+        let (rate, channels, s) = open_input_stream(data_tx, device_lost.clone())?;
+        (rate, channels, Some(s))
     };
-
-    let stream = match sample_format {
-        SampleFormat::F32 => device.build_input_stream(
-            &stream_config,
-            move |data: &[f32], _| {
-                let _ = data_tx.send(data.to_vec());
-            },
-            err_fn,
-            None,
-        ),
-        SampleFormat::I16 => device.build_input_stream(
-            &stream_config,
-            move |data: &[i16], _| {
-                let converted: Vec<f32> = data.iter().map(|&s| s as f32 / i16::MAX as f32).collect();
-                let _ = data_tx.send(converted);
-            },
-            err_fn,
-            None,
-        ),
-        SampleFormat::U16 => device.build_input_stream(
-            &stream_config,
-            move |data: &[u16], _| {
-                let converted: Vec<f32> = data
-                    .iter()
-                    .map(|&s| (s as f32 - u16::MAX as f32 / 2.0) / (u16::MAX as f32 / 2.0))
-                    .collect();
-                let _ = data_tx.send(converted);
-            },
-            err_fn,
-            None,
-        ),
-        other => anyhow::bail!("unsupported sample format: {other:?}"),
-    }
-    .context("failed to build input stream")?;
-
-    stream.play().context("failed to start input stream")?;
     let _ = reply_tx.send(AudioReply::Started);
 
     let mut raw_samples: Vec<f32> = Vec::new();
@@ -543,6 +547,71 @@ fn run_one_recording(
         auto_stopped_silence,
     });
     Ok(())
+}
+
+/// Opens the default input device as a cpal stream feeding `data_tx` with raw
+/// interleaved f32 at the device's native rate. Returns `(sample_rate,
+/// channels, stream)`; the stream is playing on return. `device_lost` is
+/// raised from cpal's error callback on a mid-stream device fault.
+fn open_input_stream(
+    data_tx: mpsc::Sender<Vec<f32>>,
+    device_lost: Arc<AtomicBool>,
+) -> Result<(u32, usize, cpal::Stream)> {
+    let host = cpal::default_host();
+    let device = host
+        .default_input_device()
+        .context("no default input (microphone) device found")?;
+    let config = device
+        .default_input_config()
+        .context("failed to read default input config")?;
+
+    let sample_format = config.sample_format();
+    let stream_config: StreamConfig = config.into();
+    let in_rate = stream_config.sample_rate.0;
+    let in_channels = stream_config.channels as usize;
+
+    let err_flag = device_lost;
+    let err_fn = move |err| {
+        eprintln!("audio input stream error: {err}");
+        err_flag.store(true, Ordering::SeqCst);
+    };
+
+    let stream = match sample_format {
+        SampleFormat::F32 => device.build_input_stream(
+            &stream_config,
+            move |data: &[f32], _| {
+                let _ = data_tx.send(data.to_vec());
+            },
+            err_fn,
+            None,
+        ),
+        SampleFormat::I16 => device.build_input_stream(
+            &stream_config,
+            move |data: &[i16], _| {
+                let converted: Vec<f32> = data.iter().map(|&s| s as f32 / i16::MAX as f32).collect();
+                let _ = data_tx.send(converted);
+            },
+            err_fn,
+            None,
+        ),
+        SampleFormat::U16 => device.build_input_stream(
+            &stream_config,
+            move |data: &[u16], _| {
+                let converted: Vec<f32> = data
+                    .iter()
+                    .map(|&s| (s as f32 - u16::MAX as f32 / 2.0) / (u16::MAX as f32 / 2.0))
+                    .collect();
+                let _ = data_tx.send(converted);
+            },
+            err_fn,
+            None,
+        ),
+        other => anyhow::bail!("unsupported sample format: {other:?}"),
+    }
+    .context("failed to build input stream")?;
+
+    stream.play().context("failed to start input stream")?;
+    Ok((in_rate, in_channels, stream))
 }
 
 /// Loads an arbitrary audio file (wav directly via `hound`; anything else

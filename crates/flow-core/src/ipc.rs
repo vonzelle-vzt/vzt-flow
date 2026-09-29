@@ -30,6 +30,23 @@ fn default_history_n() -> usize {
     20
 }
 
+/// Margin a `listen` caller allows after the recording cap for the pipeline
+/// to finish: the rolling worker's worst no-progress window for a full 35s
+/// chunk (6 × 35 = 210s), its one-time model-load allowance (60s), and the
+/// cleanup deadline cap (20s), rounded up. Keep `mcp/src/index.ts`'s
+/// `LISTEN_PIPELINE_MARGIN_SECS` equal to this.
+pub const LISTEN_PIPELINE_MARGIN_SECS: u64 = 300;
+
+/// How long a `listen` caller (the daemon handler, `flow listen`) waits for
+/// the reply: the recording's cap plus [`LISTEN_PIPELINE_MARGIN_SECS`].
+/// `cap` is the per-request `max_secs`; `configured_cap` is the app's
+/// `max_handsfree_secs`, which is what a cap-less `listen` actually records
+/// for. (It used to assume 300s while the app recorded for up to 600s, so a
+/// long `listen` was abandoned by its caller mid-recording.)
+pub fn listen_wait_budget(cap: Option<u64>, configured_cap: u64) -> std::time::Duration {
+    std::time::Duration::from_secs(cap.unwrap_or(configured_cap).saturating_add(LISTEN_PIPELINE_MARGIN_SECS))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Request {
@@ -476,6 +493,25 @@ pub mod transport {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn listen_without_a_cap_waits_out_the_apps_own_600s_recording_cap() {
+        // The desktop records a cap-less `listen` for max_handsfree_secs
+        // (600 by default). The old budget assumed 300: the caller gave up
+        // at 360s while the app was still recording.
+        let budget = listen_wait_budget(None, 600);
+        assert!(budget.as_secs() > 600 + 60, "{budget:?}");
+        // ...and follows the configured cap, not a constant.
+        assert!(listen_wait_budget(None, 120).as_secs() < 600);
+    }
+
+    #[test]
+    fn listen_budget_covers_the_post_release_pipeline_worst_case() {
+        // Rolling no-progress window for a full 35s chunk (6 × 35 = 210s) plus
+        // the one-time model-load allowance (60s) plus the cleanup cap (20s).
+        let budget = listen_wait_budget(Some(120), 600);
+        assert!(budget.as_secs() >= 120 + 210 + 60 + 20, "{budget:?}");
+    }
 
     #[test]
     fn request_round_trips_status() {

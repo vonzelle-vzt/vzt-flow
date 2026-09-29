@@ -107,7 +107,17 @@ fn main() -> anyhow::Result<()> {
         } else {
             "ok"
         };
-        println!("[{:>3}] {:<8} in={:?}", i, verdict, truncate(&row.raw_text, 60));
+        // Word counts, so a content drop (a summary instead of a correction)
+        // is visible per row; `clean()`'s length guard turns one into a
+        // fallback, logged on stderr as "output has N words for a M-word input".
+        println!(
+            "[{:>3}] {:<8} words {}→{} in={:?}",
+            i,
+            verdict,
+            row.raw_text.split_whitespace().count(),
+            out.split_whitespace().count(),
+            truncate(&row.raw_text, 60)
+        );
         println!("            out={:?}", truncate(&out, 90));
         if let Some(expected) = &row.expect_clean {
             if expected.trim() != out.trim() {

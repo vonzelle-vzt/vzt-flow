@@ -319,6 +319,7 @@ Click the mic icon in the menu bar:
 | `Status: <idle/recording/…> · model <unloaded/loading…/loaded>` | Read-only status line |
 | Start/Stop dictation | Manual hands-free toggle — same effect as tapping the hotkey |
 | Copy last transcript | Puts the most recent dictation back on the clipboard |
+| Recover last recording | Enabled after a dictation came back incomplete or empty: its audio was saved to `~/.config/vzt-flow/recovery/last.wav` (one recording, kept on this Mac, replaced by the next one). Re-transcribes it in ≤35s chunks and puts the text on the clipboard |
 | Start/Stop meeting transcription (● recording) | Toggle a live meeting transcription (Zoom/Meet/Teams or any call). Stopping generates the summary and notifies "Transcript ready" |
 | Open meetings folder | Reveals `~/Documents/vzt-flow/meetings/` in Finder |
 | Meeting auto-detect ▸ Ask/Auto/Off | How VZT Flow reacts to a detected call (see below) |
@@ -794,17 +795,24 @@ on:**
 
 #### Checking logs
 
-- The desktop app is normally launched via Finder/Dock/menu bar with no
-  visible console. Launch it from a terminal instead to see its stderr
-  output live:
-  ```bash
-  /Applications/VZT\ Flow.app/Contents/MacOS/vzt-flow-desktop
-  # or, for a source build:
-  ./target/release/bundle/macos/VZT\ Flow.app/Contents/MacOS/vzt-flow-desktop
+- The desktop app writes its diagnostics to
+  `~/Library/Logs/VZT Flow/vzt-flow.log` however it was launched (rotated to
+  `vzt-flow.log.1` at launch once it passes 5 MB; `flow doctor` prints the
+  path). Every dictation leaves one line there, whatever happened to it:
   ```
-  This surfaces model load times, hotkey monitor status, daemon socket bind
-  status, cleanup fallback reasons, and every `[vzt-flow] ...` diagnostic
-  line the app prints.
+  [vzt-flow] 2026-09-29 14:02:11 dictation outcome=partial duration=70.1s chunks=3 failed_chunks=1 peak=0.412 speech=58.3s chars=812 audio_saved=true
+  ```
+  `outcome` is `pasted`, `partial`, `empty`, `clipboard`, `returned` (daemon
+  `listen`), `cancelled`, `failed` or `recovered`. The same file has model
+  load times, hotkey monitor status, daemon socket bind status, cleanup
+  fallback reasons and every other `[vzt-flow] ...` line.
+- To watch it live instead, launch from a terminal with
+  `VZT_FLOW_LOG_STDERR=1`, which keeps stderr on the terminal:
+  ```bash
+  VZT_FLOW_LOG_STDERR=1 /Applications/VZT\ Flow.app/Contents/MacOS/vzt-flow-desktop
+  # or, for a source build:
+  VZT_FLOW_LOG_STDERR=1 ./target/release/bundle/macos/VZT\ Flow.app/Contents/MacOS/vzt-flow-desktop
+  ```
 
 **Daemon socket looks stale / `flow status` says "not running" even though
 the app is open:**

@@ -229,24 +229,38 @@ pub(crate) fn plan_cut(remaining: &[f32], sample_rate: u32) -> (usize, CutKind) 
     let win_end = ((CUT_WINDOW_MAX_SECS * sample_rate as f32) as usize).min(remaining.len());
     let hard_cut = (CUT_WINDOW_MAX_SECS * sample_rate as f32) as usize;
 
-    let mut best_rms = f32::INFINITY;
-    let mut best_at = hard_cut;
+    match quietest_frame(remaining, frame, win_start, win_end) {
+        Some((at, energy)) if energy < SILENCE_RMS_THRESHOLD => (at, CutKind::Silence),
+        _ => (hard_cut, CutKind::Hard),
+    }
+}
 
-    let mut pos = win_start;
-    while pos + frame <= win_end {
-        let energy = rms(&remaining[pos..pos + frame]);
-        if energy < best_rms {
-            best_rms = energy;
-            best_at = pos + frame / 2; // cut in the middle of the quiet frame
+/// The midpoint of the lowest-RMS `frame`-sized frame starting in
+/// `[from, to)` (frames stepped from `from`; the first of equal minima wins),
+/// with its RMS. `None` when no whole frame fits.
+fn quietest_frame(samples: &[f32], frame: usize, from: usize, to: usize) -> Option<(usize, f32)> {
+    let to = to.min(samples.len());
+    let mut best: Option<(usize, f32)> = None;
+    let mut pos = from;
+    while pos + frame <= to {
+        let energy = rms(&samples[pos..pos + frame]);
+        if best.map_or(true, |(_, b)| energy < b) {
+            best = Some((pos + frame / 2, energy)); // cut in the middle of the quiet frame
         }
         pos += frame;
     }
+    best
+}
 
-    if best_rms < SILENCE_RMS_THRESHOLD {
-        (best_at, CutKind::Silence)
-    } else {
-        (hard_cut, CutKind::Hard)
-    }
+/// Where to split a chunk in two for a second attempt (the rolling path's
+/// re-split of an empty-but-speechy chunk): the quietest ~100ms frame in the
+/// middle half (25%–75%) of the chunk, so both halves are substantial and the
+/// cut is as likely as possible to fall between words.
+pub(crate) fn quietest_split(samples: &[f32], sample_rate: u32) -> usize {
+    let frame = ((FRAME_SECS * sample_rate as f32) as usize).max(1);
+    quietest_frame(samples, frame, samples.len() / 4, samples.len() * 3 / 4)
+        .map(|(at, _)| at)
+        .unwrap_or(samples.len() / 2)
 }
 
 /// Normalizes a single word for seam comparison: lowercased, non-alphanumeric
@@ -346,6 +360,25 @@ mod tests {
         let (cut, kind) = plan_cut(&samples, SAMPLE_RATE);
         assert_eq!(kind, CutKind::Hard);
         assert_eq!(cut, (CUT_WINDOW_MAX_SECS * SAMPLE_RATE as f32) as usize);
+    }
+
+    #[test]
+    fn quietest_split_uses_a_pause_in_the_middle_half_only() {
+        let sr = SAMPLE_RATE as f32;
+        let mut s = block(12.0, 0.3);
+        for x in &mut s[(5.9 * sr) as usize..(6.1 * sr) as usize] {
+            *x = 0.0;
+        }
+        let at = quietest_split(&s, SAMPLE_RATE) as f32 / sr;
+        assert!((at - 6.0).abs() < 0.15, "split at {at}s, expected the 6s pause");
+
+        // A pause at 1s is outside 25%–75%: never chosen, so neither half is a sliver.
+        let mut t = block(12.0, 0.3);
+        for x in &mut t[(0.9 * sr) as usize..(1.1 * sr) as usize] {
+            *x = 0.0;
+        }
+        let at = quietest_split(&t, SAMPLE_RATE) as f32 / sr;
+        assert!((3.0..=9.0).contains(&at), "split at {at}s");
     }
 
     #[test]

@@ -15,6 +15,14 @@ import { listMeetingFiles, meetingsDir, readMeetingTranscript } from "./meeting.
 
 const server = new McpServer({ name: "vzt-flow", version: "0.1.0" });
 
+/**
+ * Seconds a `listen` waits past its recording cap for the pipeline to finish.
+ * Must equal `LISTEN_PIPELINE_MARGIN_SECS` in crates/flow-core/src/ipc.rs: the
+ * daemon waits that long for its own reply, so a shorter margin here would
+ * give up on a long dictation the app is still delivering.
+ */
+const LISTEN_PIPELINE_MARGIN_SECS = 300;
+
 const NO_DAEMON_NO_CLI = (detail: string) =>
   `vzt-flow is not reachable: no daemon is running (start the VZT Flow desktop app) and the standalone ` +
   `\`flow\` CLI could not be run either (${detail}). Set VZT_FLOW_BIN to the \`flow\` binary path if it isn't ` +
@@ -44,7 +52,7 @@ server.registerTool(
   async ({ mode, max_seconds }) => {
     if (await isDaemonAlive()) {
       try {
-        const resp = await callDaemon({ cmd: "listen", mode, max_secs: max_seconds }, (max_seconds + 60) * 1000);
+        const resp = await callDaemon({ cmd: "listen", mode, max_secs: max_seconds }, (max_seconds + LISTEN_PIPELINE_MARGIN_SECS) * 1000);
         if (!resp.ok) {
           return { content: [{ type: "text", text: `vzt-flow error: ${resp.error ?? "unknown"}` }], isError: true };
         }
@@ -55,7 +63,7 @@ server.registerTool(
     }
 
     try {
-      const stdout = await runFlowCli(["listen", "--mode", mode, "--max-secs", String(max_seconds)], (max_seconds + 60) * 1000);
+      const stdout = await runFlowCli(["listen", "--mode", mode, "--max-secs", String(max_seconds)], (max_seconds + LISTEN_PIPELINE_MARGIN_SECS) * 1000);
       return { content: [{ type: "text", text: stdout.trim() }] };
     } catch (e) {
       return { content: [{ type: "text", text: NO_DAEMON_NO_CLI((e as Error).message) }], isError: true };

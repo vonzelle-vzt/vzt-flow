@@ -43,6 +43,15 @@ pub fn build_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     let status_item = MenuItem::with_id(app, "status", &status_label, false, None::<&str>)?;
     let toggle_item = MenuItem::with_id(app, "toggle_dictation", toggle_label, true, None::<&str>)?;
     let copy_item = MenuItem::with_id(app, "copy_last", "Copy last transcript", true, None::<&str>)?;
+    // Enabled once a dictation has left a recovery recording (an incomplete
+    // or empty transcript saves its audio — see `flow_core::recovery`).
+    let recover_item = MenuItem::with_id(
+        app,
+        "recover_last",
+        "Recover last recording",
+        flow_core::recovery::has_last_recording(),
+        None::<&str>,
+    )?;
 
     let meeting_toggle_item =
         MenuItem::with_id(app, "toggle_meeting", meeting_toggle_label, true, None::<&str>)?;
@@ -96,6 +105,7 @@ pub fn build_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
         .separator()
         .item(&toggle_item)
         .item(&copy_item)
+        .item(&recover_item)
         .separator()
         .item(&meeting_toggle_item)
         .item(&meeting_folder_item)
@@ -154,6 +164,11 @@ fn handle_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
         }
         "copy_last" => {
             copy_last_transcript(app, &state);
+        }
+        "recover_last" => {
+            if let Some(tx) = state.coordinator_tx.lock_or_recover().as_ref() {
+                let _ = tx.send(CoordinatorMsg::RecoverLastRecording);
+            }
         }
         "toggle_meeting" => {
             crate::meeting_ctl::toggle(app);

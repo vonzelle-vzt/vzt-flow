@@ -1,7 +1,7 @@
 //! Owns the (lazily loaded, idle-unloaded) transcriber on a dedicated
 //! thread so the tray/overlay never blocks on model load/inference.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -27,6 +27,15 @@ pub enum ModelCommand {
         samples: Vec<f32>,
         reply: mpsc::Sender<Result<Transcript, String>>,
     },
+    /// Load the model now if it isn't already, without transcribing anything.
+    /// Sent when a recording *starts* so the (minutes-long, on a loaded
+    /// machine) cold load overlaps with the user speaking instead of landing
+    /// on the first rolling chunk or the release tail. Emits the same
+    /// `Loading`/`Loaded`/`LoadFailed` events as a lazy load (the rolling
+    /// watchdog keys off them), refreshes the idle clock, and replies nothing.
+    /// A no-op when the model is already resident. Because the manager is a
+    /// serial queue, a later `TranscribeChunk` simply waits behind the load.
+    Warmup,
 }
 
 #[derive(Debug, Clone)]
@@ -38,6 +47,19 @@ pub enum ModelStatusEvent {
     Unloaded,
 }
 
+/// Loads a transcriber from a model directory, returning it with the wall
+/// time the load took. Injectable so the lifecycle can be tested without a
+/// real ONNX model.
+type Loader = Box<dyn FnMut(&Path) -> anyhow::Result<(Box<dyn Transcriber>, Duration)> + Send>;
+
+fn parakeet_loader() -> Loader {
+    Box::new(|dir| {
+        let m = ParakeetTranscriber::load(dir)?;
+        let t = m.load_time;
+        Ok((Box::new(m) as Box<dyn Transcriber>, t))
+    })
+}
+
 /// Spawns the model-lifecycle thread. Runs until `cmd_rx` disconnects.
 pub fn spawn(
     model_dir: PathBuf,
@@ -45,10 +67,46 @@ pub fn spawn(
     cmd_rx: mpsc::Receiver<ModelCommand>,
     status_tx: mpsc::Sender<ModelStatusEvent>,
 ) -> std::thread::JoinHandle<()> {
+    spawn_with(model_dir, idle_timeout, cmd_rx, status_tx, parakeet_loader())
+}
+
+/// Load into `model` if empty, emitting the lifecycle events. Shared by the
+/// lazy load on a transcription command and by `Warmup`, so both take the
+/// identical path.
+fn ensure_loaded(
+    model: &mut Option<Box<dyn Transcriber>>,
+    loader: &mut Loader,
+    model_dir: &Path,
+    status_tx: &mpsc::Sender<ModelStatusEvent>,
+) -> Result<(), String> {
+    if model.is_some() {
+        return Ok(());
+    }
+    let _ = status_tx.send(ModelStatusEvent::Loading);
+    match loader(model_dir) {
+        Ok((m, load_time)) => {
+            let _ = status_tx.send(ModelStatusEvent::Loaded { load_time });
+            *model = Some(m);
+            Ok(())
+        }
+        Err(e) => {
+            let _ = status_tx.send(ModelStatusEvent::LoadFailed(e.to_string()));
+            Err(e.to_string())
+        }
+    }
+}
+
+fn spawn_with(
+    model_dir: PathBuf,
+    idle_timeout: Duration,
+    cmd_rx: mpsc::Receiver<ModelCommand>,
+    status_tx: mpsc::Sender<ModelStatusEvent>,
+    mut loader: Loader,
+) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("vzt-flow-model-manager".into())
         .spawn(move || {
-            let mut model: Option<ParakeetTranscriber> = None;
+            let mut model: Option<Box<dyn Transcriber>> = None;
             let mut last_used = Instant::now();
 
             loop {
@@ -62,6 +120,22 @@ pub fn spawn(
                             ModelCommand::Transcribe { samples, audio_duration, reply } => {
                                 (samples, audio_duration, reply, false)
                             }
+                            ModelCommand::Warmup => {
+                                last_used = Instant::now();
+                                // Same load path, events and error handling as
+                                // the lazy load; nobody is waiting on a reply,
+                                // so a failure is only logged (the next real
+                                // transcription retries and surfaces it).
+                                if let Err(e) =
+                                    ensure_loaded(&mut model, &mut loader, &model_dir, &status_tx)
+                                {
+                                    eprintln!("[vzt-flow] model warm-up failed: {e}");
+                                }
+                                // A load can take minutes; don't let it count
+                                // against the idle clock.
+                                last_used = Instant::now();
+                                continue;
+                            }
                             ModelCommand::TranscribeChunk { samples, reply } => {
                                 let d = Duration::from_secs_f64(
                                     samples.len() as f64 / TARGET_SAMPLE_RATE as f64,
@@ -71,23 +145,11 @@ pub fn spawn(
                         };
 
                         last_used = Instant::now();
-                        if model.is_none() {
-                            let _ = status_tx.send(ModelStatusEvent::Loading);
-                            match ParakeetTranscriber::load(&model_dir) {
-                                Ok(m) => {
-                                    let _ = status_tx.send(ModelStatusEvent::Loaded {
-                                        load_time: m.load_time,
-                                    });
-                                    model = Some(m);
-                                }
-                                Err(e) => {
-                                    let _ = status_tx.send(ModelStatusEvent::LoadFailed(e.to_string()));
-                                    let _ = reply.send(Err(e.to_string()));
-                                    continue;
-                                }
-                            }
+                        if let Err(e) = ensure_loaded(&mut model, &mut loader, &model_dir, &status_tx) {
+                            let _ = reply.send(Err(e));
+                            continue;
                         }
-                        let transcriber = model.as_mut().expect("model just loaded or already present");
+                        let transcriber = model.as_mut().expect("model just loaded or already present").as_mut();
                         let started = Instant::now();
                         // A panic inside the ONNX inference path (bad tensor
                         // shape, allocator abort, etc.) must not take down this
@@ -146,4 +208,66 @@ pub fn spawn(
             }
         })
         .expect("failed to spawn model manager thread")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    struct Stub;
+    impl Transcriber for Stub {
+        fn transcribe(&mut self, _s: &[f32]) -> anyhow::Result<Transcript> {
+            Ok(Transcript { text: "ok".into(), segments: None })
+        }
+    }
+
+    fn harness() -> (
+        mpsc::Sender<ModelCommand>,
+        mpsc::Receiver<ModelStatusEvent>,
+        Arc<AtomicUsize>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let loads = Arc::new(AtomicUsize::new(0));
+        let l = loads.clone();
+        let loader: Loader = Box::new(move |_| {
+            l.fetch_add(1, Ordering::SeqCst);
+            Ok((Box::new(Stub) as Box<dyn Transcriber>, Duration::from_millis(1)))
+        });
+        let (tx, rx) = mpsc::channel();
+        let (stx, srx) = mpsc::channel();
+        let h = spawn_with(PathBuf::from("/nonexistent"), Duration::from_secs(60), rx, stx, loader);
+        (tx, srx, loads, h)
+    }
+
+    fn chunk(tx: &mpsc::Sender<ModelCommand>) {
+        let (rtx, rrx) = mpsc::channel();
+        tx.send(ModelCommand::TranscribeChunk { samples: vec![0.0; 1600], reply: rtx }).unwrap();
+        assert_eq!(rrx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap().text, "ok");
+    }
+
+    #[test]
+    fn warmup_loads_once_and_a_later_chunk_does_not_reload() {
+        let (tx, srx, loads, h) = harness();
+        tx.send(ModelCommand::Warmup).unwrap();
+        assert!(matches!(srx.recv_timeout(Duration::from_secs(5)), Ok(ModelStatusEvent::Loading)));
+        assert!(matches!(srx.recv_timeout(Duration::from_secs(5)), Ok(ModelStatusEvent::Loaded { .. })));
+        chunk(&tx);
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+        drop(tx);
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn warmup_on_a_loaded_model_does_not_reload() {
+        let (tx, _srx, loads, h) = harness();
+        chunk(&tx); // lazy load
+        tx.send(ModelCommand::Warmup).unwrap();
+        tx.send(ModelCommand::Warmup).unwrap();
+        chunk(&tx);
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+        drop(tx);
+        h.join().unwrap();
+    }
 }

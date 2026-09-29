@@ -132,6 +132,65 @@ fn ensure_loaded(
     }
 }
 
+/// Runs one cleanup on a worker thread raced against `timeout_ms`, and always
+/// joins that thread before returning (gotcha e: a detached llama.cpp thread
+/// can outlive the deadline holding a live Metal context).
+fn run_with_deadline(
+    p: Arc<dyn CleanupProvider>,
+    raw: String,
+    mode: Mode,
+    ctx: CleanupContext,
+    timeout_ms: u64,
+) -> CleanupResult {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (gen_tx, gen_rx) = mpsc::channel();
+    let raw_for_gen = raw.clone();
+    let cancel_for_gen = cancel.clone();
+    let handle = std::thread::spawn(move || {
+        let result = p.clean(&raw_for_gen, mode, &ctx, &cancel_for_gen);
+        let _ = gen_tx.send(result);
+    });
+
+    let (final_text, used_llm, log_msg) = match gen_rx.recv_timeout(Duration::from_millis(timeout_ms)) {
+        Ok(Ok(text)) if !text.trim().is_empty() => (text, true, format!("llm path won ({} mode)", mode.label())),
+        Ok(Ok(_empty)) => (
+            raw.clone(),
+            false,
+            "llm produced no usable output; falling back to raw".to_string(),
+        ),
+        Ok(Err(e)) => (raw.clone(), false, format!("generation failed ({e}); falling back to raw")),
+        Err(_) => {
+            // Deadline hit: ask the worker to stop and give it a short grace
+            // period to notice and answer, then unconditionally join below —
+            // never leave a live llama.cpp thread detached. A long input is
+            // cleaned in segments, so what comes back is complete text: the
+            // segments cleaned in time plus the rest raw (`clean()` never
+            // returns a truncated generation — see `CleanupProvider::clean`).
+            // Keep it; anything else falls back to raw as before.
+            cancel.store(true, Ordering::Relaxed);
+            match gen_rx.recv_timeout(CANCEL_GRACE) {
+                Ok(Ok(text)) if !text.trim().is_empty() => (
+                    text,
+                    true,
+                    format!("{timeout_ms}ms deadline hit; kept the segments cleaned in time, the rest raw"),
+                ),
+                _ => (
+                    raw.clone(),
+                    false,
+                    format!("{timeout_ms}ms deadline exceeded; cancelled generation and pasting raw"),
+                ),
+            }
+        }
+    };
+    eprintln!("[vzt-flow] cleanup: {log_msg}");
+    // Always wait for the OS thread to actually finish — whether it already
+    // sent its result (fast path, returns immediately) or was just cancelled
+    // (grace path, blocks until the in-flight decode call returns and the
+    // loop's next cancel-check fires).
+    let _ = handle.join();
+    CleanupResult { text: final_text, used_llm }
+}
+
 /// Spawns the cleanup-lifecycle thread. Runs until `cmd_rx` disconnects.
 pub fn spawn(
     model_path: PathBuf,
@@ -186,54 +245,8 @@ pub fn spawn(
                             continue;
                         };
 
-                        let cancel = Arc::new(AtomicBool::new(false));
-                        let (gen_tx, gen_rx) = mpsc::channel();
-                        let raw_for_gen = raw.clone();
-                        let cancel_for_gen = cancel.clone();
-                        let handle = std::thread::spawn(move || {
-                            let result = p.clean(&raw_for_gen, mode, &ctx, &cancel_for_gen);
-                            let _ = gen_tx.send(result);
-                        });
-
-                        let (final_text, used_llm, log_msg) =
-                            match gen_rx.recv_timeout(Duration::from_millis(timeout_ms)) {
-                                Ok(Ok(text)) if !text.trim().is_empty() => {
-                                    (text, true, format!("llm path won ({} mode)", mode.label()))
-                                }
-                                Ok(Ok(_empty)) => (
-                                    raw.clone(),
-                                    false,
-                                    "llm produced no usable output; falling back to raw".to_string(),
-                                ),
-                                Ok(Err(e)) => {
-                                    (raw.clone(), false, format!("generation failed ({e}); falling back to raw"))
-                                }
-                                Err(_) => {
-                                    // Deadline hit: ask the worker to stop, give it a
-                                    // short grace period to notice and exit on its own
-                                    // (it'll send its now-irrelevant result, which we
-                                    // discard), then unconditionally join below —
-                                    // never leave a live llama.cpp thread detached.
-                                    cancel.store(true, Ordering::Relaxed);
-                                    let _ = gen_rx.recv_timeout(CANCEL_GRACE);
-                                    (
-                                        raw.clone(),
-                                        false,
-                                        format!(
-                                            "{timeout_ms}ms deadline exceeded; cancelled generation and \
-                                             pasting raw"
-                                        ),
-                                    )
-                                }
-                            };
-                        eprintln!("[vzt-flow] cleanup: {log_msg}");
-                        // Always wait for the OS thread to actually finish —
-                        // whether it already sent its result (fast path,
-                        // returns immediately) or was just cancelled (grace
-                        // path, blocks until the in-flight decode call
-                        // returns and the loop's next cancel-check fires).
-                        let _ = handle.join();
-                        let _ = reply.send(CleanupResult { text: final_text, used_llm });
+                        let result = run_with_deadline(p, raw, mode, ctx, timeout_ms);
+                        let _ = reply.send(result);
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => {
                         if provider.is_some() && last_used.elapsed() >= idle_timeout {
@@ -281,6 +294,57 @@ mod tests {
     fn deadline_never_panics_on_pathological_input() {
         let cfg = Config::default();
         assert_eq!(cleanup_deadline_ms(usize::MAX, &cfg), cfg.cleanup_timeout_max_ms);
+    }
+
+    /// Stands in for segmented cleanup under a deadline: works until cancelled,
+    /// then returns a *complete* text — the segments it finished, cleaned, and
+    /// the rest raw (which is `clean()`'s contract after this change: it never
+    /// returns a generation truncated mid-way).
+    struct SegmentedUntilCancelled;
+    impl CleanupProvider for SegmentedUntilCancelled {
+        fn clean(&self, raw: &str, _m: Mode, _c: &CleanupContext, cancel: &AtomicBool) -> anyhow::Result<String> {
+            while !cancel.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Ok(format!("Cleaned first segment. {raw}"))
+        }
+    }
+
+    /// Returns nothing when cancelled — a single generation cut short.
+    struct EmptyWhenCancelled;
+    impl CleanupProvider for EmptyWhenCancelled {
+        fn clean(&self, _raw: &str, _m: Mode, _c: &CleanupContext, cancel: &AtomicBool) -> anyhow::Result<String> {
+            while !cancel.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Ok(String::new())
+        }
+    }
+
+    #[test]
+    fn segments_cleaned_before_the_deadline_are_kept() {
+        let r = run_with_deadline(
+            Arc::new(SegmentedUntilCancelled),
+            "rest of it raw".into(),
+            Mode::Clean,
+            CleanupContext::default(),
+            50,
+        );
+        assert!(r.used_llm, "the in-time segments were thrown away");
+        assert_eq!(r.text, "Cleaned first segment. rest of it raw");
+    }
+
+    #[test]
+    fn a_deadline_with_nothing_complete_still_pastes_raw() {
+        let r = run_with_deadline(
+            Arc::new(EmptyWhenCancelled),
+            "the raw words".into(),
+            Mode::Clean,
+            CleanupContext::default(),
+            50,
+        );
+        assert!(!r.used_llm);
+        assert_eq!(r.text, "the raw words");
     }
 
     #[test]
