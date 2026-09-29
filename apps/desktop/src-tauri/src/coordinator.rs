@@ -601,11 +601,13 @@ pub(crate) struct DictationMeta {
 }
 
 /// Whether a finished dictation's audio should be written to the recovery
-/// slot: anything short of a complete transcript of audible speech. An empty
-/// result only qualifies with real speech energy, so an accidental tap never
-/// overwrites a recording worth recovering (there is one slot).
+/// slot: anything short of a complete transcript of audible speech. There is
+/// one slot, so nothing that cannot hold words may overwrite it: never a
+/// take the mic delivered as silence, and an empty result only with real
+/// speech energy (so an accidental tap doesn't qualify either).
 fn should_save_recovery(transcript_empty: bool, meta: &DictationMeta) -> bool {
-    meta.partial || meta.failed_chunks > 0 || (transcript_empty && meta.stats.has_speech())
+    !meta.stats.mic_silent()
+        && (meta.partial || meta.failed_chunks > 0 || (transcript_empty && meta.stats.has_speech()))
 }
 
 /// For an empty final transcript: the overlay line to show *instead of*
@@ -2125,6 +2127,23 @@ mod tests {
         assert!(should_save_recovery(false, &failed));
         let empty_speech = DictationMeta { stats: speech_stats(), ..Default::default() };
         assert!(should_save_recovery(true, &empty_speech), "speech in, nothing out");
+    }
+
+    #[test]
+    fn a_silent_mic_never_overwrites_the_recovery_slot() {
+        // Found live: a watchdog trip on a take of digital silence counted as
+        // partial and replaced the previous (speech) recording in the one
+        // recovery slot with 20s of zeros.
+        let silent = AudioStats { peak: 0.0, speech_secs: 0.0, duration_secs: 20.0 };
+        for meta in [
+            DictationMeta { partial: true, failed_chunks: 1, stats: silent, ..Default::default() },
+            DictationMeta { failed_chunks: 1, stats: silent, ..Default::default() },
+        ] {
+            assert!(!should_save_recovery(true, &meta), "{meta:?}");
+        }
+        // A quiet-but-live mic still keeps a failed take.
+        let quiet = AudioStats { peak: 0.02, speech_secs: 0.5, duration_secs: 40.0 };
+        assert!(should_save_recovery(false, &DictationMeta { failed_chunks: 1, stats: quiet, ..Default::default() }));
     }
 
     #[test]
