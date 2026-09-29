@@ -79,6 +79,12 @@ pub trait CleanupProvider: Send + Sync {
     /// `cancel` is checked cooperatively (once per generated token) so a
     /// caller can abort a long-running generation from another thread by
     /// setting it — see the module docs on the timeout model.
+    ///
+    /// Contract: a non-empty result is always *complete* text — never a
+    /// generation truncated by `cancel` — so a caller may use a non-empty
+    /// result even when it arrives after the deadline (segmented cleanup
+    /// returns the segments it finished plus the rest raw). Empty means "no
+    /// usable output, fall back to raw".
     fn clean(&self, raw: &str, mode: Mode, ctx: &CleanupContext, cancel: &AtomicBool) -> Result<String>;
 }
 
@@ -187,12 +193,14 @@ mod llama_impl {
             Ok(Self { model, backend, chat_template, load_time: started.elapsed() })
         }
 
+        /// Returns the generation and whether it stopped because `cancel`
+        /// was set (i.e. the text is truncated).
         fn generate(
             &self,
             prompt_messages: &[(&str, String)],
             input_char_len: usize,
             cancel: &AtomicBool,
-        ) -> Result<String> {
+        ) -> Result<(String, bool)> {
             let messages: Vec<LlamaChatMessage> = prompt_messages
                 .iter()
                 .map(|(role, content)| LlamaChatMessage::new(role.to_string(), content.clone()))
@@ -214,7 +222,7 @@ mod llama_impl {
                 .str_to_token(&prompt, AddBos::Always)
                 .context("failed to tokenize prompt")?;
             if tokens.is_empty() {
-                return Ok(String::new());
+                return Ok((String::new(), false));
             }
 
             // If the prompt alone doesn't leave a safe budget for output,
@@ -228,7 +236,7 @@ mod llama_impl {
                     "[vzt-flow] cleanup: prompt is {prompt_tokens} tokens (context budget {CONTEXT_SIZE}); \
                      skipping cleanup and pasting the raw transcript rather than truncating it"
                 );
-                return Ok(String::new());
+                return Ok((String::new(), false));
             }
 
             // Size the output-token budget from the input length so long
@@ -248,6 +256,7 @@ mod llama_impl {
             let mut n_cur = batch.n_tokens();
             let mut decoder = encoding_rs::UTF_8.new_decoder();
             let mut output = String::new();
+            let mut cancelled = false;
 
             for _ in 0..max_new_tokens {
                 // Checked once per token (not mid-decode — llama.cpp gives
@@ -255,6 +264,7 @@ mod llama_impl {
                 // a timeout from the caller stops us within one token's
                 // worth of work instead of running to max_new_tokens.
                 if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    cancelled = true;
                     break;
                 }
                 let token = sampler.sample(&llama_ctx, batch.n_tokens() - 1);
@@ -274,7 +284,7 @@ mod llama_impl {
                 llama_ctx.decode(&mut batch).context("decode step failed")?;
             }
 
-            Ok(strip_think_block(&output))
+            Ok((strip_think_block(&output), cancelled))
         }
 
         /// Summarizes a meeting transcript into `## Summary` + `## Action
@@ -288,6 +298,24 @@ mod llama_impl {
             // Same Qwen3 `/no_think` suppression rationale as `clean`.
             let user = format!("{transcript} /no_think");
             self.generate(&[("system", system), ("user", user)], transcript.chars().count(), cancel)
+                .map(|(text, _)| text)
+        }
+
+        /// One cleanup generation for `text` (a whole short dictation, or one
+        /// segment of a long one), through [`accept_generation`].
+        fn clean_once(&self, text: &str, mode: Mode, ctx: &CleanupContext, cancel: &AtomicBool) -> Result<String> {
+            let system = build_system_prompt(mode, ctx);
+            // Qwen3's chat template enables its <think>...</think>
+            // reasoning mode by default; left on, the model spends the
+            // entire token budget reasoning out loud and never reaches the
+            // actual corrected text within the deadline. `/no_think` is
+            // Qwen3's own documented per-turn switch to suppress it — far
+            // cheaper than trying to parse past a (possibly truncated)
+            // thinking block.
+            let user = format!("{text} /no_think");
+            let (out, cancelled) =
+                self.generate(&[("system", system), ("user", user)], text.chars().count(), cancel)?;
+            Ok(accept_generation(text, out, &ctx.dictionary_terms, cancelled))
         }
     }
 
@@ -313,35 +341,15 @@ mod llama_impl {
             if mode == Mode::Raw {
                 return Ok(raw.to_string());
             }
-            let system = build_system_prompt(mode, ctx);
-            // Qwen3's chat template enables its <think>...</think>
-            // reasoning mode by default; left on, the model spends the
-            // entire token budget reasoning out loud and never reaches the
-            // actual corrected text within the deadline. `/no_think` is
-            // Qwen3's own documented per-turn switch to suppress it — far
-            // cheaper than trying to parse past a (possibly truncated)
-            // thinking block.
-            let user = format!("{raw} /no_think");
-            let out = self.generate(&[("system", system), ("user", user)], raw.chars().count(), cancel)?;
-
-            // The empty-input guard above is not enough: the model also
-            // recites the glossary for perfectly healthy input that simply
-            // has little to correct ("Merge.", an already-clean imperative).
-            // Measured on this machine's own history: 13 of 699 dictations
-            // (1.9%), and the speaker's words were lost outright each time.
-            // Same `Ok(String::new())` contract as the empty-input guard —
-            // every caller treats empty output as "no usable output" and
-            // falls back to the raw transcript, so one check here covers the
-            // desktop coordinator, the daemon/MCP path and `clean-test`
-            // without touching a single call site.
-            if is_glossary_echo(&out, &ctx.dictionary_terms) {
-                eprintln!(
-                    "[vzt-flow] cleanup: model echoed the dictionary instead of correcting the \
-                     transcript; discarding it and pasting the raw text"
-                );
-                return Ok(String::new());
-            }
-            Ok(out)
+            // Every generation — the whole input, or each segment of a long
+            // one — passes `accept_generation`: the glossary-echo guard (the
+            // empty-input check above is not enough; the model also recites
+            // the glossary for healthy input with little to correct — 13 of
+            // 699 real dictations), the output-length guard, and the
+            // deadline-truncation check. All return `Ok(String::new())` on
+            // rejection, the contract every caller already treats as "no
+            // usable output → raw", so no call site changes.
+            Ok(clean_in_segments(raw, mode, cancel, |text| self.clean_once(text, mode, ctx, cancel)))
         }
     }
 }
@@ -458,6 +466,180 @@ pub fn is_glossary_echo(out: &str, terms: &[String]) -> bool {
         .filter(|t| contains_term(&lower, &t.to_lowercase()))
         .count();
     matched >= MIN_ECHOED_TERMS && matched * 10 >= terms.len() * ECHO_TERM_RATIO_TENTHS
+}
+
+/// Inputs at or below this many words are never length-guarded: a short
+/// dictation's filler removal can legitimately halve it ("um, so, yes" → "Yes").
+pub const LENGTH_GUARD_MIN_WORDS: usize = 40;
+/// A cleanup keeping fewer than this fraction of a long input's words dropped
+/// content (summarized, truncated, or answered instead of corrected).
+pub const LENGTH_GUARD_MIN_RATIO: f64 = 0.75;
+/// ...and one exceeding this fraction added content.
+pub const LENGTH_GUARD_MAX_RATIO: f64 = 1.40;
+
+/// Whether `output` is implausibly shorter or longer than `input` for a
+/// correction pass. Cleanup only removes fillers and fixes grammar; a 1.7B
+/// model occasionally summarizes instead — measured in this machine's history:
+/// a 51-word dictation came back as the 9-word "TX3 / Create the design / Give
+/// me three more designs" (ratio 0.18), and a 61-word one lost a third of its
+/// sentences (0.62). Pure and platform-independent so it is unit-testable and
+/// reusable by the replay harness.
+pub fn output_length_out_of_bounds(input: &str, output: &str) -> bool {
+    let n_in = input.split_whitespace().count();
+    if n_in <= LENGTH_GUARD_MIN_WORDS {
+        return false;
+    }
+    let ratio = output.split_whitespace().count() as f64 / n_in as f64;
+    !(LENGTH_GUARD_MIN_RATIO..=LENGTH_GUARD_MAX_RATIO).contains(&ratio)
+}
+
+/// Inputs longer than this are cleaned in sentence-aligned segments.
+pub const SEGMENT_ABOVE_WORDS: usize = 120;
+/// A segment is closed once it reaches this many words...
+const SEGMENT_MIN_WORDS: usize = 80;
+/// ...and never grows past this many (an unpunctuated run-on is hard-split).
+const SEGMENT_MAX_WORDS: usize = 120;
+/// A final remainder shorter than this joins the previous segment.
+const SEGMENT_MIN_TAIL_WORDS: usize = 30;
+
+fn ends_sentence(word: &str) -> bool {
+    word.trim_end_matches(['"', '\'', ')', ']', '”', '’'])
+        .ends_with(['.', '!', '?'])
+}
+
+/// Splits a long transcript into segments of whole sentences, ~80–120 words
+/// each, so every LLM call sees a span a 1.7B model reliably corrects in full
+/// rather than one long input it is tempted to summarize. Input at or under
+/// [`SEGMENT_ABOVE_WORDS`] comes back as one segment, unchanged. Words are
+/// never added, dropped or reordered (whitespace is normalized to single
+/// spaces).
+pub fn split_into_segments(text: &str) -> Vec<String> {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    if words.len() <= SEGMENT_ABOVE_WORDS {
+        return vec![text.to_string()];
+    }
+    // Sentences, with any over-long one hard-split into ≤MAX pieces.
+    let mut pieces: Vec<&[&str]> = Vec::new();
+    let mut start = 0;
+    for (i, w) in words.iter().enumerate() {
+        if ends_sentence(w) || i + 1 == words.len() {
+            pieces.extend(words[start..=i].chunks(SEGMENT_MAX_WORDS));
+            start = i + 1;
+        }
+    }
+    let mut segments: Vec<Vec<&str>> = Vec::new();
+    let mut cur: Vec<&str> = Vec::new();
+    for p in pieces {
+        if !cur.is_empty() && cur.len() + p.len() > SEGMENT_MAX_WORDS {
+            segments.push(std::mem::take(&mut cur));
+        }
+        cur.extend_from_slice(p);
+        if cur.len() >= SEGMENT_MIN_WORDS {
+            segments.push(std::mem::take(&mut cur));
+        }
+    }
+    if !cur.is_empty() {
+        match segments.last_mut() {
+            Some(last) if cur.len() < SEGMENT_MIN_TAIL_WORDS => last.extend(cur),
+            _ => segments.push(cur),
+        }
+    }
+    segments.into_iter().map(|s| s.join(" ")).collect()
+}
+
+/// The acceptance checks every generation passes through before it may
+/// replace the speaker's words. Returns the text to use, or an empty string —
+/// the shared "no usable output → fall back to raw" contract (gotcha l), so
+/// every caller (desktop, daemon/MCP, `clean-test`) is covered with no
+/// call-site changes.
+///
+/// `cancelled`: generation stopped because the deadline set the cancel flag,
+/// so `out` is whatever was decoded so far — a sentence cut off mid-way.
+/// Never accept it. (Before segmented cleanup the manager discarded every
+/// post-deadline result anyway; now it keeps complete ones, so `clean()` must
+/// never hand back a truncated one.)
+pub fn accept_generation(raw: &str, out: String, terms: &[String], cancelled: bool) -> String {
+    if cancelled {
+        eprintln!("[vzt-flow] cleanup: generation was cut short by the deadline; discarding the partial output");
+        return String::new();
+    }
+    if is_glossary_echo(&out, terms) {
+        eprintln!(
+            "[vzt-flow] cleanup: model echoed the dictionary instead of correcting the \
+             transcript; discarding it and pasting the raw text"
+        );
+        return String::new();
+    }
+    if output_length_out_of_bounds(raw, &out) {
+        eprintln!(
+            "[vzt-flow] cleanup: output has {} words for a {}-word input (outside {:.0}%–{:.0}%) — \
+             the model likely dropped or invented content; discarding it and pasting the raw text",
+            out.split_whitespace().count(),
+            raw.split_whitespace().count(),
+            LENGTH_GUARD_MIN_RATIO * 100.0,
+            LENGTH_GUARD_MAX_RATIO * 100.0
+        );
+        return String::new();
+    }
+    out
+}
+
+/// Cleans `raw` through `clean_one`. Short input is one call; input over
+/// [`SEGMENT_ABOVE_WORDS`] is cleaned segment by segment ([`split_into_segments`]),
+/// sequentially, under the caller's single deadline: once `cancel` is set the
+/// remaining segments keep their raw words, and any segment whose cleanup is
+/// rejected or fails keeps its raw words too. So a long dictation can lose
+/// polish to the deadline, never content. Returns empty (→ raw fallback) when
+/// nothing at all was cleaned.
+pub fn clean_in_segments(
+    raw: &str,
+    mode: Mode,
+    cancel: &AtomicBool,
+    mut clean_one: impl FnMut(&str) -> Result<String>,
+) -> String {
+    let segments = split_into_segments(raw);
+    if segments.len() <= 1 {
+        return match clean_one(raw) {
+            Ok(t) if !t.trim().is_empty() => t,
+            Ok(_) => String::new(),
+            Err(e) => {
+                eprintln!("[vzt-flow] cleanup: generation failed ({e})");
+                String::new()
+            }
+        };
+    }
+    let mut out = Vec::with_capacity(segments.len());
+    let mut kept_raw = 0usize;
+    for (i, seg) in segments.iter().enumerate() {
+        let cleaned = if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            None
+        } else {
+            match clean_one(seg) {
+                Ok(t) if !t.trim().is_empty() => Some(t.trim().to_string()),
+                Ok(_) => None,
+                Err(e) => {
+                    eprintln!("[vzt-flow] cleanup: segment {}/{} failed ({e})", i + 1, segments.len());
+                    None
+                }
+            }
+        };
+        out.push(cleaned.unwrap_or_else(|| {
+            kept_raw += 1;
+            seg.clone()
+        }));
+    }
+    eprintln!(
+        "[vzt-flow] cleanup: {} words in {} segments; {} cleaned, {} kept raw",
+        raw.split_whitespace().count(),
+        segments.len(),
+        segments.len() - kept_raw,
+        kept_raw
+    );
+    if kept_raw == segments.len() {
+        return String::new();
+    }
+    // Polish restructures into paragraphs; keep segment boundaries as breaks.
+    out.join(if mode == Mode::Polish { "\n\n" } else { " " })
 }
 
 /// Builds the system-message instructions for a given mode/context. Kept as
@@ -917,5 +1099,126 @@ mod tests {
     fn prompt_fits_context_never_panics_on_pathological_input() {
         assert!(!prompt_fits_context(u32::MAX, CONTEXT_SIZE));
         assert!(!prompt_fits_context(CONTEXT_SIZE, 0));
+    }
+
+    // ---- B6: long-text cleanup cannot drop content ----
+
+    /// Verbatim raw text from history.jsonl (2026-07-15 21:49): 51 words.
+    const REAL_SUMMARIZED_RAW: &str = "Use this part of the logo just TX3 and then create the design we \
+        don't need to go elaborate like this like we see how all the other cards are I want to keep it \
+        simple like that and then give me three more designs that we can choose from so we can see \
+        what works best for the brand";
+
+    #[test]
+    fn a_cleanup_that_summarized_a_long_dictation_is_rejected() {
+        // What the model actually pasted for it (ratio 0.18).
+        let out = "TX3\n\nCreate the design\n\nGive me three more designs";
+        assert!(REAL_SUMMARIZED_RAW.split_whitespace().count() > LENGTH_GUARD_MIN_WORDS);
+        assert!(output_length_out_of_bounds(REAL_SUMMARIZED_RAW, out));
+        assert_eq!(accept_generation(REAL_SUMMARIZED_RAW, out.to_string(), &[], false), "");
+    }
+
+    fn words(n: usize, w: &str) -> String {
+        vec![w; n].join(" ")
+    }
+
+    #[test]
+    fn a_normal_filler_cleanup_of_a_long_dictation_is_accepted() {
+        // 60 words in, 10% fillers removed.
+        let raw = format!("{} um uh um uh um uh", words(54, "word"));
+        let out = format!("{}.", words(54, "word"));
+        assert!(!output_length_out_of_bounds(&raw, &out));
+        assert_eq!(accept_generation(&raw, out.clone(), &[], false), out);
+    }
+
+    #[test]
+    fn an_expanded_output_is_rejected() {
+        let raw = words(50, "word");
+        let out = words(71, "word"); // 142%
+        assert!(output_length_out_of_bounds(&raw, &out));
+        assert!(!output_length_out_of_bounds(&raw, &words(70, "word")), "140% is the inclusive edge");
+    }
+
+    #[test]
+    fn short_dictations_are_never_length_guarded() {
+        assert!(!output_length_out_of_bounds("um so yes please", "Yes."));
+        assert!(!output_length_out_of_bounds(&words(40, "w"), "w"));
+    }
+
+    #[test]
+    fn a_generation_cut_short_by_the_deadline_is_never_accepted() {
+        // The cancel flag stops generation mid-sentence and returns what was
+        // decoded so far. That truncated text must not pass as a cleanup.
+        let raw = "Please send the report to Dana before Friday.";
+        assert_eq!(accept_generation(raw, "Please send the".to_string(), &[], true), "");
+    }
+
+    /// 30 sentences of 10 words.
+    fn thirty_sentences() -> String {
+        (1..=30)
+            .map(|i| format!("Sentence number {i} has exactly ten words in it ok."))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    #[test]
+    fn long_input_splits_on_sentence_boundaries_into_80_to_120_word_segments() {
+        let text = thirty_sentences();
+        let segs = split_into_segments(&text);
+        assert!(segs.len() >= 3, "300 words must split: {}", segs.len());
+        for s in &segs {
+            let n = s.split_whitespace().count();
+            assert!((80..=120).contains(&n) || s == segs.last().unwrap(), "segment of {n} words");
+            assert!(s.trim_end().ends_with('.'), "segment must end on a sentence: {s:?}");
+        }
+        let rejoined: Vec<&str> = segs.iter().flat_map(|s| s.split_whitespace()).collect();
+        let original: Vec<&str> = text.split_whitespace().collect();
+        assert_eq!(rejoined, original, "segmentation must not add, drop or reorder a word");
+    }
+
+    #[test]
+    fn a_run_on_sentence_with_no_punctuation_is_still_bounded() {
+        let text = words(300, "and");
+        let segs = split_into_segments(&text);
+        assert!(segs.iter().all(|s| s.split_whitespace().count() <= 120));
+        assert_eq!(segs.iter().map(|s| s.split_whitespace().count()).sum::<usize>(), 300);
+    }
+
+    #[test]
+    fn inputs_at_or_under_the_threshold_are_one_segment() {
+        let t = words(120, "w");
+        assert_eq!(split_into_segments(&t), vec![t.clone()]);
+    }
+
+    #[test]
+    fn a_segment_the_model_mangles_keeps_its_raw_words_and_the_rest_are_cleaned() {
+        let raw = thirty_sentences();
+        let cancel = AtomicBool::new(false);
+        let mut n = 0;
+        let out = clean_in_segments(&raw, Mode::Clean, &cancel, |seg| {
+            n += 1;
+            if n == 2 {
+                Ok(String::new()) // this segment's generation was rejected
+            } else {
+                Ok(seg.replace("ok.", "OK."))
+            }
+        });
+        let segs = split_into_segments(&raw);
+        assert!(n >= 3);
+        assert!(out.contains(&segs[1]), "segment 2 must survive verbatim");
+        assert!(out.contains("OK."), "the other segments must still be cleaned");
+        assert_eq!(out.split_whitespace().count(), raw.split_whitespace().count());
+    }
+
+    #[test]
+    fn segments_after_the_deadline_fall_back_to_raw_instead_of_being_lost() {
+        let raw = thirty_sentences();
+        let cancel = AtomicBool::new(false);
+        let out = clean_in_segments(&raw, Mode::Clean, &cancel, |seg| {
+            cancel.store(true, std::sync::atomic::Ordering::Relaxed); // deadline hits during seg 1
+            Ok(seg.replace("ok.", "OK."))
+        });
+        assert_eq!(out.split_whitespace().count(), raw.split_whitespace().count());
+        assert!(out.ends_with("in it ok."), "later segments must be raw, not dropped: {out}");
     }
 }
