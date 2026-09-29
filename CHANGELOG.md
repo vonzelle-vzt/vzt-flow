@@ -59,6 +59,8 @@ disappeared.
 - `flow listen` and the daemon waited 300 seconds even though the app records
   for up to 600; they now follow the app's own limit.
 
+**Linux AppImage failed to start for non-root users** (`AppRun.wrapped: Permission denied`); now built with correct permissions, verified in CI by a permission gate and a non-root launch smoke test. The AppImage requires glibc 2.39 (Ubuntu 24.04+); this is now documented.
+
 ## [0.3.5] — 2026-08-02
 
 **Dictation sometimes pasted your dictionary instead of what you said.** You
