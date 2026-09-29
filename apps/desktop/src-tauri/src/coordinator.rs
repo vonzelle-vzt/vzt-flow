@@ -1681,6 +1681,10 @@ fn finish_with(app: &AppHandle, message: Option<String>) {
             }
         }
         state.is_recording.store(false, Ordering::Relaxed);
+        // The menu was last built while Done ("Status: Done", "Stop
+        // dictation"); rebuild it for Idle, which also enables "Recover last
+        // recording" once a recording was saved.
+        tray::refresh_menu(&app2);
         std::thread::sleep(linger.saturating_sub(idle_after));
         if *state.dictation_state.lock_or_recover() == DictationState::Idle {
             overlay::hide_overlay(&app2);

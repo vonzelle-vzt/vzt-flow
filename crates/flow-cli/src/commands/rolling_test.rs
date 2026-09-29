@@ -106,7 +106,12 @@ pub fn run(file: &Path, speed: f64, skip_batch: bool) -> Result<()> {
                 println!("  chunk {n:>2} transcribed at recording-offset {off:>6.2}s  ({} chars)", chunk_text.chars().count());
                 chunk_completions.push((n, off));
             }
-            Ok(RollingOutput::Final { raw_text, .. }) => {
+            Ok(RollingOutput::Final { raw_text, chunks, failed_chunks, partial, stats, .. }) => {
+                println!(
+                    "  final: chunks={chunks} failed_chunks={failed_chunks} partial={partial} \
+                     peak={:.3} speech={:.1}s",
+                    stats.peak, stats.speech_secs
+                );
                 break (raw_text, release_instant.elapsed().as_secs_f64());
             }
             Ok(RollingOutput::Late { .. }) => {}
