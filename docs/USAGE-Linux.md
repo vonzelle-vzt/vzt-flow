@@ -13,7 +13,7 @@
 > **Status: EXPERIMENTAL — compiles and is CI-tested, never run on real Linux
 > hardware.** The Linux build is compiled *and* unit-tested by CI
 > (`.github/workflows/build.yml`'s `linux` job runs `cargo test --release
-> --workspace` and `cargo tauri build` on `ubuntu-latest` for every push/PR to
+> --workspace` and `cargo tauri build` on `ubuntu-22.04` for every push/PR to
 > `main`, producing a `.deb` and an `.AppImage`), but all development happens
 > on a macOS machine. Everything below is either verified directly against the
 > code / a crate's source (marked as such) or an honest "this is what the code
@@ -72,9 +72,11 @@ security-model constraint, not a bug we can paper over.
 
 ## Runtime dependencies
 
-**Minimum glibc 2.39** — the `.deb` and `.AppImage` are built on Ubuntu 24.04 (the
-bundled onnxruntime needs glibc 2.38+ to link), so you need glibc 2.39 or newer,
-e.g. Ubuntu 24.04+, Debian 13+, Fedora 40+. Older distros (Ubuntu 22.04, Debian 12) are not supported.
+**Minimum glibc 2.35** — Ubuntu 22.04+, Debian 12+, Fedora 36+. The `.deb` and
+`.AppImage` are built on Ubuntu 22.04 and link Microsoft's official onnxruntime
+1.24.2 shared library, which is bundled (`usr/lib/libonnxruntime.so.1` in the
+AppImage, `/usr/lib/vzt-flow/` in the `.deb`, `lib/` in the CLI tarball). CI
+fails the build if anything bundled needs glibc > 2.35 or GLIBCXX > 3.4.30.
 
 The desktop app is a Tauri 2 (WebKitGTK) menu-bar app. On a fresh desktop
 install you need:
@@ -154,6 +156,13 @@ sudo apt-get install -y \
 cargo build --release -p flow-cli
 ./target/release/flow doctor
 ./target/release/flow models download parakeet-v3
+
+# Optional on glibc >= 2.38 (ort-sys downloads its own onnxruntime). On older
+# systems (Ubuntu 22.04) fetch Microsoft's official build first; this exports
+# ORT_LIB_PATH / ORT_PREFER_DYNAMIC_LINK / LD_LIBRARY_PATH for CI, so locally set
+# them yourself from the extracted tarball's lib/ dir. It also stages the .so for the .deb.
+scripts/ci/linux-onnxruntime.sh
+export ORT_LIB_PATH=/tmp/onnxruntime/lib ORT_PREFER_DYNAMIC_LINK=1 LD_LIBRARY_PATH=/tmp/onnxruntime/lib
 
 cd apps/desktop && npm install && cargo install tauri-cli --version "^2"
 cargo tauri build --target x86_64-unknown-linux-gnu

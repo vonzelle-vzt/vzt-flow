@@ -249,6 +249,14 @@ install_linux() {
   fi
   log "installing flow CLI to $cli_dest"
   install -m 0755 "$cli_src/bin/flow" "$cli_dest/flow"
+  # flow links Microsoft's onnxruntime dynamically; its rpath is
+  # $ORIGIN/../lib and $ORIGIN/../lib/vzt-flow, i.e. next to the bin dir.
+  if [ -d "$cli_src/lib" ]; then
+    local lib_dest
+    lib_dest="$(dirname "$cli_dest")/lib/vzt-flow"
+    mkdir -p "$lib_dest"
+    install -m 0644 "$cli_src"/lib/libonnxruntime.so* "$lib_dest/"
+  fi
   if [[ ":$PATH:" != *":$cli_dest:"* ]]; then
     warn "$cli_dest is not on your PATH — add this to your shell profile:"
     warn "  export PATH=\"$cli_dest:\$PATH\""

@@ -6,6 +6,12 @@ versioning](https://semver.org/). Numbers quoted below were measured on this
 repo's dev hardware (M5 MacBook Air) unless noted — see `README.md` /
 `docs/PRD.md` for the full methodology.
 
+## Unreleased
+
+Linux AppImage/.deb now run on Ubuntu 22.04 and other glibc 2.35 systems (built
+on Ubuntu 22.04, links Microsoft's official onnxruntime 1.24.2 shared library,
+which is bundled).
+
 ## [0.3.6] — 2026-09-29
 
 **Dictations over about a minute could vanish after you let go.** You would
