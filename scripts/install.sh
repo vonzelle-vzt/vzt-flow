@@ -222,6 +222,11 @@ install_linux() {
       # apt-get resolves the runtime deps (webkit2gtk, libayatana-appindicator,
       # alsa) from the package's control file; dpkg -i + apt-get -f is the
       # fallback if the direct-file install form isn't supported.
+      # Refresh the package index first: with a stale index those deps
+      # resolve to versions the mirror has already dropped (404) and the
+      # whole install fails. Best-effort — an offline/partial update should
+      # not stop us from trying with what's cached.
+      sudo apt-get update || warn "apt-get update failed; trying the install with the cached package index"
       sudo apt-get install -y "$bundle" \
         || { sudo dpkg -i "$bundle" || true; sudo apt-get -f install -y; }
     else
@@ -242,11 +247,16 @@ install_linux() {
   cli_src="$(find "$WORKDIR" -maxdepth 1 -type d -name 'vzt-flow-cli-*' | head -n1)"
   [ -n "$cli_src" ] || die "CLI tarball did not contain the expected vzt-flow-cli-* directory"
 
+  # flow finds libonnxruntime via rpath $ORIGIN/../lib/vzt-flow, so the bin
+  # dir and its sibling lib dir must both be writable. /usr/local/bin can be
+  # writable while /usr/local/lib is not (seen on CI runners) — then use
+  # ~/.local for both rather than splitting them.
   local cli_dest="/usr/local/bin"
-  if [ ! -w "$cli_dest" ] 2>/dev/null; then
+  local cli_libroot="/usr/local/lib"
+  if [ ! -w "$cli_dest" ] || { [ -d "$cli_src/lib" ] && [ ! -w "$cli_libroot" ]; }; then
     cli_dest="$HOME/.local/bin"
-    mkdir -p "$cli_dest"
   fi
+  mkdir -p "$cli_dest"
   log "installing flow CLI to $cli_dest"
   install -m 0755 "$cli_src/bin/flow" "$cli_dest/flow"
   # flow links Microsoft's onnxruntime dynamically; its rpath is
