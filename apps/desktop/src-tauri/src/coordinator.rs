@@ -618,6 +618,14 @@ fn empty_result_message(final_text: &str, meta: &DictationMeta) -> Option<String
     }
     Some(if meta.stats.mic_silent() {
         "Mic was silent — check your input".to_string()
+    } else if meta.partial {
+        // The watchdog gave up before any chunk finished (e.g. a cold model
+        // load on a loaded machine): the words may still arrive as `Late`.
+        if meta.audio_saved {
+            "Transcription slow — audio saved".to_string()
+        } else {
+            "Transcription slow".to_string()
+        }
     } else if meta.audio_saved {
         "No speech recognized — audio saved".to_string()
     } else {
@@ -2167,6 +2175,15 @@ mod tests {
         assert_eq!(empty_result_message("", &silent).as_deref(), Some("Mic was silent — check your input"));
         let quiet = DictationMeta { stats: AudioStats { peak: 0.03, speech_secs: 0.0, duration_secs: 4.0 }, ..Default::default() };
         assert_eq!(empty_result_message("", &quiet).as_deref(), Some("No speech recognized"));
+    }
+
+    #[test]
+    fn a_watchdog_trip_before_any_chunk_finished_is_not_called_no_speech() {
+        // Measured live: a cold model took 544s to load under load, the
+        // watchdog tripped with 0 of 3 chunks done, and the text arrived
+        // later as Late. "No speech recognized" would be false there.
+        let m = DictationMeta { partial: true, failed_chunks: 3, stats: speech_stats(), audio_saved: true, ..Default::default() };
+        assert_eq!(empty_result_message("", &m).as_deref(), Some("Transcription slow — audio saved"));
     }
 
     #[test]
