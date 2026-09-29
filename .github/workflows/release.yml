@@ -899,6 +899,13 @@ jobs:
       - name: Build flow CLI (release)
         run: cargo build --release --target x86_64-unknown-linux-gnu -p flow-cli
 
+      - name: Embed AppImage update information + generate .zsync
+        # Tauri has no update-info knob: repack the built AppImage with a pinned
+        # appimagetool (-u), renaming it to the dot form GitHub publishes so the
+        # embedded zsync name matches the release asset. Runs BEFORE the gates so
+        # the permission / glibc / smoke steps check the FINAL file.
+        run: scripts/ci/linux-appimage-updateinfo.sh target/x86_64-unknown-linux-gnu/release/bundle/appimage
+
       - name: Verify AppImage permissions
         # Inspect the modes STORED in the squashfs (unsquashfs -ll), not an
         # --appimage-extract tree: extraction as a normal user rewrites directory
@@ -1008,7 +1015,7 @@ jobs:
         run: |
           mkdir -p out
           find target/x86_64-unknown-linux-gnu/release/bundle \
-            \( -name '*.deb' -o -name '*.AppImage' \) -exec cp {} out/ \;
+            \( -name '*.deb' -o -name '*.AppImage' -o -name '*.AppImage.zsync' \) -exec cp {} out/ \;
           echo "Linux bundle artifacts (name + size):"
           ls -la out
           if [ -z "$(ls -A out)" ]; then
@@ -1067,7 +1074,7 @@ jobs:
         run: |
           mkdir -p out
           find dl -type f \( -name '*.dmg' -o -name '*.tar.gz' -o -name '*.msi' -o -name '*.exe' \
-            -o -name '*.deb' -o -name '*.AppImage' \) \
+            -o -name '*.deb' -o -name '*.AppImage' -o -name '*.zsync' \) \
             -exec cp {} out/ \;
           ls -la out
 

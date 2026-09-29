@@ -6,6 +6,10 @@ versioning](https://semver.org/). Numbers quoted below were measured on this
 repo's dev hardware (M5 MacBook Air) unless noted — see `README.md` /
 `docs/PRD.md` for the full methodology.
 
+## Unreleased
+
+Linux AppImage now embeds update information and ships a .zsync, so AppImageUpdate can update it in place.
+
 ## [0.3.7] — 2026-09-29
 
 Linux AppImage/.deb now run on Ubuntu 22.04 and other glibc 2.35 systems (built
