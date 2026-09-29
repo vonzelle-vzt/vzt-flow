@@ -837,9 +837,10 @@ jobs:
   # hardware; X11 full, Wayland degraded). Ships a .deb, an .AppImage, and a
   # standalone CLI tarball (flow binary + MCP server) mirroring the macOS one.
   linux:
-    # glibc 2.35 baseline so the AppImage runs on Ubuntu 22.04 / Debian 12; GitHub
-    # retires this image 2027-04-17 -- move to an ubuntu:22.04 container job before then.
-    runs-on: ubuntu-22.04
+    # Do NOT pin ubuntu-22.04 here: the prebuilt onnxruntime that ort-sys downloads
+    # references glibc 2.38 symbols (__isoc23_strtol*), so linking fails on glibc 2.35
+    # (verified in CI, PR #31). The AppImage therefore needs glibc 2.39 (Ubuntu 24.04+).
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

@@ -13,7 +13,7 @@
 > **Status: EXPERIMENTAL — compiles and is CI-tested, never run on real Linux
 > hardware.** The Linux build is compiled *and* unit-tested by CI
 > (`.github/workflows/build.yml`'s `linux` job runs `cargo test --release
-> --workspace` and `cargo tauri build` on `ubuntu-22.04` for every push/PR to
+> --workspace` and `cargo tauri build` on `ubuntu-latest` for every push/PR to
 > `main`, producing a `.deb` and an `.AppImage`), but all development happens
 > on a macOS machine. Everything below is either verified directly against the
 > code / a crate's source (marked as such) or an honest "this is what the code
@@ -72,8 +72,9 @@ security-model constraint, not a bug we can paper over.
 
 ## Runtime dependencies
 
-**Minimum glibc 2.35** — the `.deb` and `.AppImage` are built on Ubuntu 22.04, so
-you need glibc 2.35 or newer, e.g. Ubuntu 22.04+, Debian 12+, Fedora 36+.
+**Minimum glibc 2.39** — the `.deb` and `.AppImage` are built on Ubuntu 24.04 (the
+bundled onnxruntime needs glibc 2.38+ to link), so you need glibc 2.39 or newer,
+e.g. Ubuntu 24.04+, Debian 13+, Fedora 40+. Older distros (Ubuntu 22.04, Debian 12) are not supported.
 
 The desktop app is a Tauri 2 (WebKitGTK) menu-bar app. On a fresh desktop
 install you need:

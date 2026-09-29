@@ -8,7 +8,7 @@ repo's dev hardware (M5 MacBook Air) unless noted — see `README.md` /
 
 ## [Unreleased]
 
-**Linux AppImage failed to start for non-root users** (`AppRun.wrapped: Permission denied`); now built with correct permissions, verified in CI by a permission gate and a non-root launch smoke test. AppImage now targets glibc 2.35.
+**Linux AppImage failed to start for non-root users** (`AppRun.wrapped: Permission denied`); now built with correct permissions, verified in CI by a permission gate and a non-root launch smoke test. The AppImage requires glibc 2.39 (Ubuntu 24.04+); this is now documented.
 
 ## [0.3.5] — 2026-08-02
 
