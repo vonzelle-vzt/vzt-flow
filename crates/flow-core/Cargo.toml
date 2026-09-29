@@ -9,7 +9,7 @@ license.workspace = true
 # (`ort-coreml`) is macOS-only and added below via the target-specific
 # section, which Cargo unions into this same feature set at resolve time.
 transcribe-rs = { version = "0.3", features = ["onnx"] }
-cpal = "0.15"
+cpal = "0.18"
 hound = "3.5"
 dirs = "5"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
